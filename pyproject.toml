@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "change-delivery"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "filelock>=3.18,<4",
+  "pydantic>=2.11,<3",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<7",
+]
+
+[project.scripts]
+change-delivery = "change_delivery.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/change_delivery"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
