@@ -74,8 +74,6 @@ def test_complete_happy_path_is_allowed_without_stage_skips() -> None:
         (RunState.ACCEPTANCE_TESTING, RunState.ENVIRONMENT_PREEMPTED),
         (RunState.ENVIRONMENT_PREEMPTED, RunState.DEPLOYING_TEST),
         (RunState.INTERNAL_REVIEW, RunState.REVIEW_DECISION_REQUIRED),
-        (RunState.REVIEW_DECISION_REQUIRED, RunState.INTERNAL_REVIEW),
-        (RunState.BLOCKED, RunState.IMPLEMENTING),
     ],
 )
 def test_repair_and_interruption_recovery_transitions(
@@ -148,3 +146,111 @@ def test_assert_transition_rejects_bare_string_instead_of_kind_collection() -> N
             RunState.AWAITING_DESIGN_APPROVAL,
             "ci_passed",
         )
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (RunState.BLOCKED, RunState.IMPLEMENTING),
+        (RunState.REVIEW_DECISION_REQUIRED, RunState.INTERNAL_REVIEW),
+    ],
+)
+def test_interruption_recovery_requires_source_provenance(
+    current: RunState,
+    target: RunState,
+) -> None:
+    with pytest.raises(ValueError, match="缺少中断来源"):
+        assert_transition(current, target, ())
+
+
+@pytest.mark.parametrize(
+    ("current", "target", "source"),
+    [
+        (RunState.BLOCKED, RunState.LOCAL_VALIDATION, RunState.IMPLEMENTING),
+        (
+            RunState.REVIEW_DECISION_REQUIRED,
+            RunState.INTERNAL_REVIEW,
+            RunState.LOCAL_VALIDATION,
+        ),
+    ],
+)
+def test_interruption_recovery_rejects_target_other_than_source(
+    current: RunState,
+    target: RunState,
+    source: RunState,
+) -> None:
+    with pytest.raises(ValueError, match="恢复目标不匹配"):
+        assert_transition(current, target, (), interrupted_from=source)
+
+
+@pytest.mark.parametrize(
+    ("current", "source"),
+    [
+        (RunState.BLOCKED, RunState.IMPLEMENTING),
+        (RunState.REVIEW_DECISION_REQUIRED, RunState.INTERNAL_REVIEW),
+    ],
+)
+def test_interruption_recovery_accepts_matching_active_source(
+    current: RunState,
+    source: RunState,
+) -> None:
+    assert_transition(current, source, (), interrupted_from=source)
+
+
+@pytest.mark.parametrize(
+    "invalid_source",
+    [
+        RunState.BLOCKED,
+        RunState.REVIEW_DECISION_REQUIRED,
+        RunState.ENVIRONMENT_PREEMPTED,
+        RunState.COMPLETED,
+        RunState.CANCELLED,
+        RunState.FAILED_TERMINAL,
+    ],
+)
+def test_interrupted_from_must_be_normal_non_terminal_active_state(
+    invalid_source: RunState,
+) -> None:
+    with pytest.raises(ValueError, match="中断来源"):
+        assert_transition(
+            RunState.BLOCKED,
+            RunState.IMPLEMENTING,
+            (),
+            interrupted_from=invalid_source,
+        )
+
+
+def test_early_interruption_source_cannot_jump_to_ready_to_merge() -> None:
+    with pytest.raises(ValueError, match="恢复目标不匹配"):
+        assert_transition(
+            RunState.BLOCKED,
+            RunState.READY_TO_MERGE,
+            READY_TO_MERGE_EVIDENCE,
+            interrupted_from=RunState.IMPLEMENTING,
+        )
+
+
+def test_blocked_self_transition_is_idempotently_allowed() -> None:
+    assert_transition(RunState.BLOCKED, RunState.BLOCKED, ())
+
+
+def test_review_decision_may_become_blocked_without_recovery_provenance() -> None:
+    assert_transition(
+        RunState.REVIEW_DECISION_REQUIRED,
+        RunState.BLOCKED,
+        (),
+    )
+
+
+def test_recovery_does_not_modify_evidence_input() -> None:
+    evidence = ["review_context"]
+    before = evidence.copy()
+
+    assert_transition(
+        RunState.BLOCKED,
+        RunState.IMPLEMENTING,
+        evidence,
+        interrupted_from=RunState.IMPLEMENTING,
+    )
+
+    assert evidence == before

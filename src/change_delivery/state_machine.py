@@ -46,7 +46,9 @@ _TERMINAL_STATES = frozenset(
         RunState.FAILED_TERMINAL,
     }
 )
-_ACTIVE_STATES = frozenset(_HAPPY_PATH[1:-1])
+_NORMAL_ACTIVE_STATES = frozenset(
+    (*_HAPPY_PATH[:-1], RunState.FIXING_CI_REVIEW)
+)
 _DECISION_STATES = frozenset(
     {
         RunState.AWAITING_DESIGN_APPROVAL,
@@ -90,7 +92,8 @@ def _build_transitions() -> Mapping[RunState, frozenset[RunState]]:
     for state in _DECISION_STATES:
         transitions[state].add(RunState.REVIEW_DECISION_REQUIRED)
     transitions[RunState.REVIEW_DECISION_REQUIRED].update(_DECISION_STATES)
-    transitions[RunState.BLOCKED].update(_ACTIVE_STATES)
+    transitions[RunState.BLOCKED].update(_NORMAL_ACTIVE_STATES)
+    transitions[RunState.BLOCKED].add(RunState.BLOCKED)
 
     for state in RunState:
         if state in _TERMINAL_STATES:
@@ -126,9 +129,30 @@ def assert_transition(
     current: RunState,
     target: RunState,
     evidence_kinds: Iterable[str],
+    *,
+    interrupted_from: RunState | None = None,
 ) -> None:
+    if (
+        interrupted_from is not None
+        and interrupted_from not in _NORMAL_ACTIVE_STATES
+    ):
+        raise ValueError("中断来源必须是非终态正常活跃状态")
+
     if target not in ALLOWED_TRANSITIONS[current]:
         raise ValueError(f"非法状态迁移：{current.value} -> {target.value}")
+
+    if (
+        current
+        in {RunState.BLOCKED, RunState.REVIEW_DECISION_REQUIRED}
+        and target in _NORMAL_ACTIVE_STATES
+    ):
+        if interrupted_from is None:
+            raise ValueError("缺少中断来源")
+        if target is not interrupted_from:
+            raise ValueError(
+                "恢复目标不匹配："
+                f"期望 {interrupted_from.value}，实际 {target.value}"
+            )
 
     evidence = _normalize_evidence_kinds(evidence_kinds)
     if target is RunState.READY_TO_MERGE:
