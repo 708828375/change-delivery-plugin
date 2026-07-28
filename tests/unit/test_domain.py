@@ -76,20 +76,52 @@ def test_command_spec_rejects_script_executables(executable: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "argument",
+    "args",
     [
-        "first\nsecond",
-        "git status; git clean",
-        "first && second",
-        "first || second",
-        "first | second",
-        "result > output.txt",
-        "tool < input.txt",
+        ("first\nsecond",),
+        ("first\rsecond",),
     ],
 )
-def test_command_spec_rejects_shell_control_in_each_argument(argument: str) -> None:
+def test_command_spec_rejects_newlines_in_arguments(args: tuple[str, ...]) -> None:
     data = valid_command_data()
-    data["args"] = ["-m", "pytest", argument]
+    data["args"] = args
+
+    with pytest.raises(ValidationError):
+        CommandSpec.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("-k", "foo|bar"),
+        ("--expression", "a;b"),
+        ("literal", "a>b"),
+    ],
+)
+def test_command_spec_accepts_literal_shell_characters_in_argv(
+    args: tuple[str, ...],
+) -> None:
+    data = valid_command_data()
+    data["args"] = args
+
+    spec = CommandSpec.model_validate(data)
+
+    assert spec.args == args
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("-Command", "InVoKe-ExPrEsSiOn"),
+        ("cmd", "/C", "echo"),
+        ("cmd /c echo",),
+    ],
+)
+def test_command_spec_rejects_shell_invocation_arguments(
+    args: tuple[str, ...],
+) -> None:
+    data = valid_command_data()
+    data["args"] = args
 
     with pytest.raises(ValidationError):
         CommandSpec.model_validate(data)

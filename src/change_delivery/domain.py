@@ -72,13 +72,30 @@ class CommandSpec(FrozenModel):
 
     @field_validator("args")
     @classmethod
-    def reject_shell_control_arguments(
+    def reject_shell_invocation_arguments(
         cls,
         args: tuple[str, ...],
     ) -> tuple[str, ...]:
-        forbidden = ("\r", "\n", ";", "&&", "||", "|", ">", "<")
-        if any(token in argument for argument in args for token in forbidden):
-            raise ValueError("参数中禁止换行或 Shell 控制符")
+        normalized = tuple(argument.strip().casefold() for argument in args)
+        has_newline = any(
+            "\r" in argument or "\n" in argument for argument in args
+        )
+        has_invoke_expression = "invoke-expression" in normalized
+        has_split_cmd = any(
+            command in {"cmd", "cmd.exe"} and option == "/c"
+            for command, option in zip(normalized, normalized[1:])
+        )
+        has_inline_cmd = any(
+            re.search(r"(?i)(?:^|\s)cmd(?:\.exe)?\s+/c(?:\s|$)", argument)
+            for argument in args
+        )
+        if (
+            has_newline
+            or has_invoke_expression
+            or has_split_cmd
+            or has_inline_cmd
+        ):
+            raise ValueError("参数中禁止换行或 Shell 调用组合")
         return args
 
     @field_validator("workdir")
