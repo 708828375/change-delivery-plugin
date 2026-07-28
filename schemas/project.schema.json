@@ -1,0 +1,116 @@
+{
+  "$defs": {
+    "CommandSpec": {
+      "properties": {
+        "executable": {
+          "minLength": 1,
+          "title": "Executable",
+          "type": "string"
+        },
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Args",
+          "type": "array"
+        },
+        "workdir": {
+          "format": "path",
+          "title": "Workdir",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 300,
+          "maximum": 7200,
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        },
+        "env_names": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Env Names",
+          "type": "array"
+        }
+      },
+      "required": [
+        "executable",
+        "workdir"
+      ],
+      "title": "CommandSpec",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "project_id": {
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}$",
+      "title": "Project Id",
+      "type": "string"
+    },
+    "repo_path": {
+      "format": "path",
+      "title": "Repo Path",
+      "type": "string"
+    },
+    "remote": {
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "title": "Remote",
+      "type": "string"
+    },
+    "base_branch": {
+      "title": "Base Branch",
+      "type": "string"
+    },
+    "test_branch": {
+      "title": "Test Branch",
+      "type": "string"
+    },
+    "github_repository": {
+      "pattern": "^[^/]+/[^/]+$",
+      "title": "Github Repository",
+      "type": "string"
+    },
+    "version_endpoint": {
+      "title": "Version Endpoint",
+      "type": "string"
+    },
+    "version_sha_field": {
+      "title": "Version Sha Field",
+      "type": "string"
+    },
+    "required_pre_pr_checks": {
+      "items": {
+        "$ref": "#/$defs/CommandSpec"
+      },
+      "minItems": 1,
+      "title": "Required Pre Pr Checks",
+      "type": "array"
+    },
+    "credentials": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Credentials",
+      "type": "array"
+    },
+    "production_enabled": {
+      "default": false,
+      "title": "Production Enabled",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "project_id",
+    "repo_path",
+    "remote",
+    "base_branch",
+    "test_branch",
+    "github_repository",
+    "version_endpoint",
+    "version_sha_field",
+    "required_pre_pr_checks"
+  ],
+  "title": "ProjectConfig",
+  "type": "object"
+}
