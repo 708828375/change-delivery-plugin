@@ -14,6 +14,7 @@ from change_delivery.process import (
     ProcessLaunchError,
     ProcessResult,
     ProcessRunner,
+    ProcessStartError,
     ProcessTimeoutError,
 )
 
@@ -119,6 +120,89 @@ def test_runner_uses_direct_argv_isolated_env_and_redacts_output(
     assert result.stdout == "value=***\nAuthorization: Bearer ***"
     assert result.stderr == "Cookie: ***"
     assert result.duration_ms == 25
+
+
+def test_runner_uses_minimal_base_environment_and_never_inherits_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UNREQUESTED_SECRET", "parent-unrequested")
+    monkeypatch.setenv("GH_TOKEN", "parent-gh")
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-openai")
+    monkeypatch.setenv("USERPROFILE", "C:/sensitive-profile")
+    monkeypatch.setenv("HOME", "C:/sensitive-home")
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = ProcessRunner(
+        lambda names: {"DELIVERY_TEST_SECRET": "explicit-secret"},
+    )
+
+    runner.run(command_spec(tmp_path))
+
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["DELIVERY_TEST_SECRET"] == "explicit-secret"
+    assert "UNREQUESTED_SECRET" not in child_env
+    assert "GH_TOKEN" not in child_env
+    assert "OPENAI_API_KEY" not in child_env
+    assert "USERPROFILE" not in child_env
+    assert "HOME" not in child_env
+    allowed = (
+        {"systemroot", "windir", "path", "pathext", "temp", "tmp"}
+        if os.name == "nt"
+        else {"path", "lang", "lc_all", "lc_ctype", "tmpdir"}
+    )
+    assert {name.casefold() for name in child_env} <= (
+        allowed | {"delivery_test_secret"}
+    )
+
+
+def test_missing_provider_value_does_not_fall_back_to_parent_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "parent-path-must-not-fallback")
+    monkeypatch.setenv("HOME", "parent-home-must-not-fallback")
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = ProcessRunner(lambda names: {})
+
+    runner.run(command_spec(tmp_path, env_names=("PATH", "HOME")))
+
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert "PATH" not in child_env
+    assert "HOME" not in child_env
+
+
+def test_sensitive_home_can_only_enter_through_explicit_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = ProcessRunner(lambda names: {"HOME": "C:/explicit-home"})
+
+    runner.run(command_spec(tmp_path, env_names=("HOME",)))
+
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["HOME"] == "C:/explicit-home"
 
 
 def test_runner_executes_real_python_child_and_returns_nonzero(
@@ -232,6 +316,50 @@ def test_launch_error_does_not_expose_secret_or_environment(
     assert secret not in repr(caught.value)
     assert secret not in repr(caught.value.__context__)
     assert caught.value.command_id
+
+
+@pytest.mark.parametrize("failure_kind", ["timeout", "start"])
+def test_safe_process_errors_have_no_raw_chain_or_sensitive_traceback_locals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    secret = f"{failure_kind}-deep-secret"
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if failure_kind == "timeout":
+            raise subprocess.TimeoutExpired(
+                cmd=[sys.executable, secret],
+                timeout=12,
+                output=f"partial {secret}",
+                stderr=f"api_key={secret}",
+            )
+        raise OSError(f"start failed with {secret}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = ProcessRunner(
+        lambda names: {"DELIVERY_TEST_SECRET": secret},
+        start_time_ns=lambda: 123,
+    )
+    expected_error = (
+        ProcessTimeoutError
+        if failure_kind == "timeout"
+        else ProcessStartError
+    )
+
+    with pytest.raises(expected_error) as caught:
+        runner.run(command_spec(tmp_path, args=("-c", secret)))
+
+    error = caught.value
+    assert error.__context__ is None
+    assert error.__cause__ is None
+    assert secret not in repr(error)
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code.co_filename.endswith("change_delivery\\process.py"):
+            assert secret not in repr(frame.f_locals)
+        traceback = traceback.tb_next
 
 
 def test_runner_validates_requested_environment_name_even_when_missing(

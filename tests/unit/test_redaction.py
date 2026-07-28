@@ -22,6 +22,11 @@ def test_redacts_literal_regex_characters_and_unicode() -> None:
     [
         ("Authorization: Bearer abc.def", "Authorization: Bearer ***"),
         ("authorization: bearer abc", "authorization: bearer ***"),
+        ("Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic ***"),
+        (
+            "INFO Authorization: Bearer abc status=200 trace_id=trace-1",
+            "INFO Authorization: Bearer *** status=200 trace_id=trace-1",
+        ),
         ("password=hunter2", "password=***"),
         ("PASSWORD = hunter2", "PASSWORD = ***"),
         ("token=abc", "token=***"),
@@ -91,6 +96,57 @@ def test_redacts_non_line_start_headers_across_multiple_lines() -> None:
         "[access] Cookie: ***\r\n"
         "safe"
     )
+
+
+def test_cookie_redaction_preserves_following_structured_log_fields() -> None:
+    text = (
+        "INFO Cookie: session=one; preference=two "
+        "status=200 trace_id=trace-1\r\nsafe"
+    )
+
+    assert redact_text(text, {}) == (
+        "INFO Cookie: *** status=200 trace_id=trace-1\r\nsafe"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "?access_token=access-secret&status=ok",
+            "?access_token=***&status=ok",
+        ),
+        (
+            "refresh_token=refresh-secret&next=one",
+            "refresh_token=***&next=one",
+        ),
+        ("API_KEY=key-secret", "API_KEY=***"),
+        ("client_secret=client-secret", "client_secret=***"),
+        (
+            '{"access_token": "json-secret", "status": "ok"}',
+            '{"access_token": "***", "status": "ok"}',
+        ),
+        (
+            '{"REFRESH_TOKEN":"refresh","api_key":"key","client_secret":"client"}',
+            '{"REFRESH_TOKEN":"***","api_key":"***","client_secret":"***"}',
+        ),
+        (
+            r'{"api_key":"escaped-\"-secret","status":"ok"}',
+            r'{"api_key":"***","status":"ok"}',
+        ),
+    ],
+)
+def test_redacts_sensitive_query_form_and_json_fields(
+    text: str,
+    expected: str,
+) -> None:
+    assert redact_text(text, {}) == expected
+
+
+def test_cookie_field_named_status_remains_inside_redacted_header() -> None:
+    text = "Cookie: session=one; status=cookie-value status=200"
+
+    assert redact_text(text, {}) == "Cookie: *** status=200"
 
 
 def test_redaction_preserves_crlf_line_boundaries() -> None:
