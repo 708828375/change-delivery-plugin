@@ -1,6 +1,7 @@
 {
   "$defs": {
     "CommandSpec": {
+      "additionalProperties": false,
       "properties": {
         "executable": {
           "minLength": 1,
@@ -42,6 +43,7 @@
       "type": "object"
     }
   },
+  "additionalProperties": false,
   "properties": {
     "project_id": {
       "pattern": "^[a-z0-9][a-z0-9-]{1,62}$",
@@ -59,10 +61,12 @@
       "type": "string"
     },
     "base_branch": {
+      "minLength": 1,
       "title": "Base Branch",
       "type": "string"
     },
     "test_branch": {
+      "minLength": 1,
       "title": "Test Branch",
       "type": "string"
     },
@@ -72,10 +76,13 @@
       "type": "string"
     },
     "version_endpoint": {
+      "format": "uri",
+      "pattern": "^https://[^/]",
       "title": "Version Endpoint",
       "type": "string"
     },
     "version_sha_field": {
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*$",
       "title": "Version Sha Field",
       "type": "string"
     },

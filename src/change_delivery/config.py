@@ -13,7 +13,7 @@ def load_project_config(path: Path) -> LoadedProjectConfig:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
         config = ProjectConfig.model_validate(raw)
-    except (OSError, yaml.YAMLError, ValidationError) as exc:
+    except (OSError, UnicodeError, yaml.YAMLError, ValidationError) as exc:
         raise ConfigurationError(f"项目配置无效：{path}") from exc
 
     if config.production_enabled:
