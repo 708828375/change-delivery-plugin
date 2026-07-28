@@ -1,8 +1,31 @@
 from enum import StrEnum
 from pathlib import Path
 import re
+from typing import Self
 
-from pydantic import AnyUrl, BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    AnyUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+BRANCH_PATTERN = (
+    r"^[^-./\x00-\x20\x7f~^:?*\[\\]"
+    r"(?:[^\x00-\x20\x7f~^:?*\[\\]*"
+    r"[^/.\x00-\x20\x7f~^:?*\[\\])?$"
+)
+WINDOWS_ABSOLUTE_PATH_PATTERN = (
+    r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)"
+)
+
+
+def executable_basename(executable: str) -> str:
+    basename = re.split(r"[\\/]", executable)[-1].casefold()
+    return basename[:-4] if basename.endswith(".exe") else basename
 
 
 class RunState(StrEnum):
@@ -40,7 +63,9 @@ class CommandSpec(FrozenModel):
 
     executable: str = Field(min_length=1)
     args: tuple[str, ...] = Field(default_factory=tuple)
-    workdir: Path
+    workdir: Path = Field(
+        json_schema_extra={"pattern": WINDOWS_ABSOLUTE_PATH_PATTERN}
+    )
     timeout_seconds: int = Field(default=300, ge=1, le=7200)
     env_names: tuple[str, ...] = Field(default_factory=tuple)
 
@@ -48,9 +73,7 @@ class CommandSpec(FrozenModel):
     @classmethod
     def reject_shell_or_script_executable(cls, executable: str) -> str:
         basename = re.split(r"[\\/]", executable)[-1].casefold()
-        executable_name = (
-            basename[:-4] if basename.endswith(".exe") else basename
-        )
+        executable_name = executable_basename(executable)
         forbidden_names = {
             "powershell",
             "pwsh",
@@ -72,39 +95,12 @@ class CommandSpec(FrozenModel):
 
     @field_validator("args")
     @classmethod
-    def reject_shell_invocation_arguments(
+    def reject_multiline_arguments(
         cls,
         args: tuple[str, ...],
     ) -> tuple[str, ...]:
-        normalized = tuple(argument.strip().casefold() for argument in args)
-        has_newline = any(
-            "\r" in argument or "\n" in argument for argument in args
-        )
-        has_invoke_expression = any(
-            re.match(r"^invoke-expression(?:\s|$)", argument)
-            for argument in normalized
-        )
-        has_split_cmd = any(
-            command in {"cmd", "cmd.exe"} and option == "/c"
-            for command, option in zip(normalized, normalized[1:])
-        )
-        has_inline_cmd = any(
-            re.search(r"(?i)(?:^|\s)cmd(?:\.exe)?\s+/c(?:\s|$)", argument)
-            for argument in args
-        )
-        joined = " ".join(args)
-        has_dangerous_command = re.search(
-            r"(?i)(?:;\s+rm|&&\s+rm|\|\s+remove-item)(?:\s|$)",
-            joined,
-        )
-        if (
-            has_newline
-            or has_invoke_expression
-            or has_split_cmd
-            or has_inline_cmd
-            or has_dangerous_command
-        ):
-            raise ValueError("参数中禁止换行或 Shell 调用组合")
+        if any("\r" in argument or "\n" in argument for argument in args):
+            raise ValueError("参数中禁止换行")
         return args
 
     @field_validator("workdir")
@@ -118,10 +114,12 @@ class CommandSpec(FrozenModel):
 class ProjectConfig(FrozenModel):
 
     project_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{1,62}$")
-    repo_path: Path
+    repo_path: Path = Field(
+        json_schema_extra={"pattern": WINDOWS_ABSOLUTE_PATH_PATTERN}
+    )
     remote: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
-    base_branch: str = Field(min_length=1)
-    test_branch: str = Field(min_length=1)
+    base_branch: str = Field(pattern=BRANCH_PATTERN)
+    test_branch: str = Field(pattern=BRANCH_PATTERN)
     github_repository: str = Field(pattern=r"^[^/]+/[^/]+$")
     version_endpoint: str = Field(
         pattern=r"^https://[^/]",
@@ -145,15 +143,20 @@ class ProjectConfig(FrozenModel):
     @classmethod
     def reject_invalid_branch_names(cls, branch: str) -> str:
         if (
-            branch.startswith("-")
-            or " " in branch
-            or ".." in branch
+            ".." in branch
             or "@{" in branch
-            or "\\" in branch
-            or any(ord(character) < 32 or ord(character) == 127 for character in branch)
+            or "//" in branch
+            or branch.endswith(".lock")
         ):
             raise ValueError("分支名称无效")
         return branch
+
+    @field_validator("version_endpoint", mode="before")
+    @classmethod
+    def normalize_https_scheme(cls, endpoint: object) -> object:
+        if isinstance(endpoint, str) and re.match(r"(?i)^https://", endpoint):
+            return f"https://{endpoint[8:]}"
+        return endpoint
 
     @field_validator("version_endpoint")
     @classmethod
@@ -162,6 +165,24 @@ class ProjectConfig(FrozenModel):
         if parsed.scheme.casefold() != "https" or not parsed.host:
             raise ValueError("版本接口必须是 HTTPS URL")
         return endpoint
+
+    @model_validator(mode="after")
+    def require_validation_profile_checks(self) -> Self:
+        direct_tools = {"pytest", "ruff", "mypy"}
+        python_tools = {"python", "python3", "py"}
+        python_modules = {"pytest", "ruff", "mypy", "compileall"}
+        for check in self.required_pre_pr_checks:
+            executable = executable_basename(check.executable)
+            is_direct_tool = executable in direct_tools
+            is_python_module = (
+                executable in python_tools
+                and len(check.args) >= 2
+                and check.args[0] == "-m"
+                and check.args[1] in python_modules
+            )
+            if not is_direct_tool and not is_python_module:
+                raise ValueError("项目预检命令不属于第一版验证工具白名单")
+        return self
 
 
 class LoadedProjectConfig(FrozenModel):

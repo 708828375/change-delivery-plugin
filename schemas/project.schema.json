@@ -17,6 +17,7 @@
         },
         "workdir": {
           "format": "path",
+          "pattern": "^(?:[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/]+[\\\\/][^\\\\/]+)",
           "title": "Workdir",
           "type": "string"
         },
@@ -52,6 +53,7 @@
     },
     "repo_path": {
       "format": "path",
+      "pattern": "^(?:[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/]+[\\\\/][^\\\\/]+)",
       "title": "Repo Path",
       "type": "string"
     },
@@ -61,12 +63,12 @@
       "type": "string"
     },
     "base_branch": {
-      "minLength": 1,
+      "pattern": "^[^-./\\x00-\\x20\\x7f~^:?*\\[\\\\](?:[^\\x00-\\x20\\x7f~^:?*\\[\\\\]*[^/.\\x00-\\x20\\x7f~^:?*\\[\\\\])?$",
       "title": "Base Branch",
       "type": "string"
     },
     "test_branch": {
-      "minLength": 1,
+      "pattern": "^[^-./\\x00-\\x20\\x7f~^:?*\\[\\\\](?:[^\\x00-\\x20\\x7f~^:?*\\[\\\\]*[^/.\\x00-\\x20\\x7f~^:?*\\[\\\\])?$",
       "title": "Test Branch",
       "type": "string"
     },

@@ -96,6 +96,9 @@ def test_command_spec_rejects_newlines_in_arguments(args: tuple[str, ...]) -> No
         ("-k", "foo|bar"),
         ("--expression", "a;b"),
         ("literal", "a>b"),
+        ("cmd /c echo",),
+        ("value;rm x",),
+        ("foo|Remove-Item x",),
     ],
 )
 def test_command_spec_accepts_literal_shell_characters_in_argv(
@@ -107,32 +110,6 @@ def test_command_spec_accepts_literal_shell_characters_in_argv(
     spec = CommandSpec.model_validate(data)
 
     assert spec.args == args
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        ("-Command", "InVoKe-ExPrEsSiOn"),
-        ("Invoke-Expression Get-Date",),
-        ("iNvOkE-eXpReSsIoN\tGet-Date",),
-        ("cmd", "/C", "echo"),
-        ("cmd /c echo",),
-        ("git status; rm x",),
-        ("build && rm x",),
-        ("value | Remove-Item x",),
-        (";", "rm", "x"),
-        ("&&", "rm", "x"),
-        ("|", "Remove-Item", "x"),
-    ],
-)
-def test_command_spec_rejects_shell_invocation_arguments(
-    args: tuple[str, ...],
-) -> None:
-    data = valid_command_data()
-    data["args"] = args
-
-    with pytest.raises(ValidationError):
-        CommandSpec.model_validate(data)
 
 
 def test_command_spec_accepts_regular_pytest_arguments() -> None:
@@ -179,6 +156,16 @@ def test_project_config_rejects_relative_repo_path() -> None:
         ("test_branch", "feature@{next"),
         ("base_branch", r"feature\next"),
         ("test_branch", "feature\nnext"),
+        ("base_branch", "feature~next"),
+        ("test_branch", "feature^next"),
+        ("base_branch", "feature:next"),
+        ("test_branch", "feature?next"),
+        ("base_branch", "feature*next"),
+        ("test_branch", "feature[next"),
+        ("base_branch", "feature//next"),
+        ("test_branch", "feature/"),
+        ("base_branch", "feature."),
+        ("test_branch", "feature.lock"),
     ],
 )
 def test_project_config_rejects_invalid_branches(field: str, branch: str) -> None:
@@ -187,6 +174,20 @@ def test_project_config_rejects_invalid_branches(field: str, branch: str) -> Non
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(data)
+
+
+def test_project_schema_exposes_branch_and_absolute_path_patterns() -> None:
+    schema = ProjectConfig.model_json_schema()
+    properties = schema["properties"]
+    command_properties = schema["$defs"]["CommandSpec"]["properties"]
+
+    assert properties["base_branch"]["pattern"]
+    assert (
+        properties["base_branch"]["pattern"]
+        == properties["test_branch"]["pattern"]
+    )
+    assert properties["repo_path"]["pattern"]
+    assert command_properties["workdir"]["pattern"]
 
 
 @pytest.mark.parametrize(
@@ -200,6 +201,74 @@ def test_project_config_rejects_invalid_branches(field: str, branch: str) -> Non
 def test_project_config_requires_https_version_url(endpoint: str) -> None:
     data = valid_project_data()
     data["version_endpoint"] = endpoint
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
+
+
+def test_project_config_normalizes_uppercase_https_scheme() -> None:
+    data = valid_project_data()
+    data["version_endpoint"] = "HTTPS://example.test/version"
+
+    config = ProjectConfig.model_validate(data)
+
+    assert config.version_endpoint == "https://example.test/version"
+
+
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        ("pytest", ("tests",)),
+        (r"C:\venv\Scripts\ruff.exe", ("check", ".")),
+        ("/usr/bin/mypy", ("src",)),
+        ("python", ("-m", "pytest", "tests")),
+        ("python3", ("-m", "ruff", "check", ".")),
+        ("py", ("-m", "mypy", "src")),
+        ("python", ("-m", "compileall", "src")),
+    ],
+)
+def test_project_config_accepts_validation_profile_commands(
+    executable: str,
+    args: tuple[str, ...],
+) -> None:
+    data = valid_project_data()
+    data["required_pre_pr_checks"] = [
+        {
+            "executable": executable,
+            "args": args,
+            "workdir": Path("C:/repo"),
+        }
+    ]
+
+    config = ProjectConfig.model_validate(data)
+
+    assert config.required_pre_pr_checks[0].args == args
+
+
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        ("python", ("-c", "print('unsafe')")),
+        ("python", ("script.py",)),
+        ("git", ("clean", "-fd")),
+        ("gh", ("pr", "create")),
+        ("codex", ("exec", "task")),
+        ("node", ("script.js",)),
+        ("coverage", ("run", "-m", "pytest")),
+    ],
+)
+def test_project_config_rejects_commands_outside_validation_profile(
+    executable: str,
+    args: tuple[str, ...],
+) -> None:
+    data = valid_project_data()
+    data["required_pre_pr_checks"] = [
+        {
+            "executable": executable,
+            "args": args,
+            "workdir": Path("C:/repo"),
+        }
+    ]
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(data)
