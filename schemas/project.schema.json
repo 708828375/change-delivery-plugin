@@ -17,7 +17,9 @@
         },
         "args": {
           "items": {
-            "pattern": "^[^\\r\\n]*$",
+            "not": {
+              "pattern": "[\\r\\n]"
+            },
             "type": "string"
           },
           "title": "Args",
@@ -194,7 +196,10 @@
                     ],
                     "type": "array"
                   }
-                }
+                },
+                "required": [
+                  "args"
+                ]
               },
               {
                 "properties": {

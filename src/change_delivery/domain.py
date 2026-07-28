@@ -84,6 +84,7 @@ VALIDATION_PROFILE_SCHEMA = {
             }
         },
         {
+            "required": ["args"],
             "properties": {
                 "executable": {"pattern": RUFF_EXECUTABLE_PATTERN},
                 "args": safe_args_schema(
@@ -238,7 +239,10 @@ class CommandSpec(FrozenModel):
     args: tuple[str, ...] = Field(
         default_factory=tuple,
         json_schema_extra={
-            "items": {"type": "string", "pattern": r"^[^\r\n]*$"}
+            "items": {
+                "type": "string",
+                "not": {"pattern": r"[\r\n]"},
+            }
         },
     )
     workdir: Path = Field(

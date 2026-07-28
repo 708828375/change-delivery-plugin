@@ -334,12 +334,29 @@ def test_project_config_rejects_commands_outside_validation_profile(
         project_schema_validator().validate(schema_data)
 
 
+def test_project_schema_rejects_ruff_without_args() -> None:
+    schema_data = valid_project_json_data()
+    schema_data["required_pre_pr_checks"] = [
+        {
+            "executable": "ruff",
+            "workdir": "C:/repo",
+        }
+    ]
+
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
+
+
 @pytest.mark.parametrize(
     ("executable", "args"),
     [
         ("powershell", ("Get-Date",)),
         ("tools/check.ps1", ()),
         ("python", ("first\nsecond",)),
+        ("python", ("\n",)),
+        ("python", ("trailing\n",)),
+        ("python", ("\r",)),
+        ("python", ("trailing\r",)),
     ],
 )
 def test_command_spec_schema_rejects_runtime_security_violations(
