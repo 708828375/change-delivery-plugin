@@ -259,7 +259,7 @@ def test_project_config_normalizes_uppercase_https_scheme() -> None:
     ("executable", "args"),
     [
         ("pytest", ("tests",)),
-        (r"C:\venv\Scripts\ruff.exe", ("check", ".", "--no-fix")),
+        (r"C:\venv\Scripts\ruff.exe", ("check", "--no-fix", ".")),
         ("/usr/bin/mypy", ("src",)),
         ("python", ("-m", "pytest", "tests")),
         ("python3", ("-m", "ruff", "check", ".", "--no-fix")),
@@ -313,6 +313,11 @@ def test_project_config_accepts_validation_profile_commands(
         ("ruff", ("check", ".", "--config", "fix=true")),
         ("python", ("-m", "ruff", "check", ".")),
         ("ruff", ("check", ".", "--fix")),
+        ("ruff", ("check", ".", "--", "--no-fix")),
+        (
+            "python",
+            ("-m", "ruff", "check", ".", "--", "--no-fix"),
+        ),
         ("ruff", ("check", ".", "--fix-only", "--no-fix")),
         (
             "python",

@@ -188,7 +188,7 @@
                     "minItems": 1,
                     "not": {
                       "contains": {
-                        "pattern": "^--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?$",
+                        "pattern": "^(?:--|--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?)$",
                         "type": "string"
                       }
                     },
@@ -257,7 +257,7 @@
                     "minItems": 3,
                     "not": {
                       "contains": {
-                        "pattern": "^--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?$",
+                        "pattern": "^(?:--|--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?)$",
                         "type": "string"
                       }
                     },

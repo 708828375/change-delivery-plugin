@@ -57,7 +57,7 @@ MYPY_EXECUTABLE_PATTERN = executable_schema_pattern("mypy")
 PYTHON_EXECUTABLE_PATTERN = executable_schema_pattern("python", "python3", "py")
 PYTEST_UNSAFE_ARGUMENT_PATTERN = r"^(?:--cache-clear|--basetemp(?:=.*)?)$"
 RUFF_UNSAFE_ARGUMENT_PATTERN = (
-    r"^--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?$"
+    r"^(?:--|--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?)$"
 )
 MYPY_UNSAFE_ARGUMENT_PATTERN = r"^--install-types(?:=.*)?$"
 
