@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 import getpass
 import hashlib
@@ -10,8 +12,9 @@ import hmac
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import (
     ConfigDict,
@@ -32,23 +35,35 @@ DEFAULT_ALLOWED_SIDE_EFFECTS = (
     "review_fix_loop",
 )
 
-_Value = TypeVar("_Value")
+REQUIRED_ARTIFACT_NAMES = (
+    "requirement.md",
+    "design.md",
+    "implementation-plan.md",
+)
 
 
-class FrozenDict(dict[str, _Value]):
-    """A JSON-friendly mapping that cannot be mutated after construction."""
+class FrozenMapping(Mapping[str, str]):
+    """A small immutable mapping backed only by an ordered tuple."""
 
-    def _immutable(self, *args: object, **kwargs: object) -> None:
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Mapping[str, str]) -> None:
+        object.__setattr__(self, "_items", tuple(sorted(values.items())))
+
+    def __getitem__(self, key: str) -> str:
+        for name, digest in self._items:
+            if name == key:
+                return digest
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (name for name, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __setattr__(self, name: str, value: object) -> None:
         raise TypeError("approval artifact hashes are immutable")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    clear = _immutable
-    pop = _immutable
-    popitem = _immutable
-    setdefault = _immutable
-    update = _immutable
-    __ior__ = _immutable
 
 
 class ApprovalSnapshot(FrozenModel):
@@ -67,12 +82,12 @@ class ApprovalSnapshot(FrozenModel):
     base_sha: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
     test_branch: str = Field(min_length=1)
     automation_limit: RunState = RunState.READY_TO_MERGE
-    artifact_hashes: FrozenDict[str]
+    artifact_hashes: FrozenMapping
     approved_user: str = Field(min_length=1)
     approved_at: datetime
     allowed_side_effects: tuple[str, ...] = DEFAULT_ALLOWED_SIDE_EFFECTS
 
-    @field_validator("run_id", "project_id", "config_hash", "base_branch",
+    @field_validator("run_id", "project_id", "base_branch",
                      "test_branch", "approved_user")
     @classmethod
     def reject_whitespace_only(cls, value: str) -> str:
@@ -80,15 +95,23 @@ class ApprovalSnapshot(FrozenModel):
             raise ValueError("approval identifiers cannot be blank")
         return value
 
+    @field_validator("config_hash")
+    @classmethod
+    def validate_config_hash(cls, value: str) -> str:
+        if not value.strip() or any(ord(character) < 32 or ord(character) == 127
+                                    for character in value):
+            raise ValueError("config_hash cannot be blank or contain controls")
+        return value
+
     @field_validator("artifact_hashes", mode="before")
     @classmethod
     def freeze_and_validate_hashes(
         cls,
         value: object,
-    ) -> FrozenDict[str]:
+    ) -> FrozenMapping:
         if not isinstance(value, Mapping):
             raise ValueError("artifact_hashes must be a mapping")
-        frozen = FrozenDict(
+        frozen = FrozenMapping(
             {
                 str(name): str(digest)
                 for name, digest in value.items()
@@ -96,6 +119,8 @@ class ApprovalSnapshot(FrozenModel):
         )
         if not frozen:
             raise ValueError("artifact_hashes cannot be empty")
+        if set(frozen) != set(REQUIRED_ARTIFACT_NAMES):
+            raise ValueError("artifact_hashes must contain the canonical artifacts")
         if any(
             not name
             or Path(name).name != name
@@ -109,7 +134,7 @@ class ApprovalSnapshot(FrozenModel):
     @classmethod
     def require_utc_timestamp(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
-            return value.replace(tzinfo=timezone.utc)
+            raise ValueError("approved_at must include a timezone")
         return value.astimezone(timezone.utc)
 
     @field_validator("allowed_side_effects")
@@ -122,7 +147,7 @@ class ApprovalSnapshot(FrozenModel):
     @field_serializer("artifact_hashes")
     def serialize_artifact_hashes(
         self,
-        value: FrozenDict[str],
+        value: FrozenMapping,
     ) -> dict[str, str]:
         return dict(value)
 
@@ -138,30 +163,131 @@ def _is_sha256(value: str) -> bool:
     )
 
 
-def _normalize_files(files: Iterable[str | os.PathLike[str]]) -> tuple[Path, ...]:
+def _is_reparse_point(path: Path) -> bool:
+    metadata = path.lstat()
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return path.is_symlink() or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _windows_name_key(name: str) -> str:
+    return name.rstrip(" .").casefold()
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _stable_signature(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _normalize_files(
+    files: Iterable[str | os.PathLike[str]],
+) -> tuple[tuple[str, Path, os.stat_result], ...]:
     paths = tuple(Path(file) for file in files)
-    if not paths:
-        raise ValueError("artifact files cannot be empty")
+    if len(paths) != len(REQUIRED_ARTIFACT_NAMES):
+        raise ValueError("approval requires exactly three artifact files")
+
     names = [path.name for path in paths]
-    if any(not name for name in names) or len(names) != len(set(names)):
-        raise ValueError("artifact file names must be non-empty and unique")
-    return paths
+    normalized_names = [_windows_name_key(name) for name in names]
+    if len(normalized_names) != len(set(normalized_names)):
+        raise ValueError("artifact file names collide under Windows rules")
+    if set(names) != set(REQUIRED_ARTIFACT_NAMES):
+        raise ValueError("artifact files must use the three canonical names")
+
+    normalized: dict[str, tuple[Path, os.stat_result]] = {}
+    parent: Path | None = None
+    identities: set[tuple[int, int]] = set()
+    for path in paths:
+        try:
+            if _is_reparse_point(path):
+                raise ValueError(f"artifact cannot be a link or reparse point: {path.name}")
+            resolved = path.resolve(strict=True)
+            metadata = resolved.stat()
+            source_metadata = path.lstat()
+        except FileNotFoundError as error:
+            raise ValueError(f"artifact file is missing: {path.name}") from error
+        except OSError as error:
+            raise OSError(f"cannot inspect artifact file: {path.name}") from error
+        if _stat_identity(source_metadata) != _stat_identity(metadata):
+            raise ValueError(f"artifact identity changed or resolves through a link: {path.name}")
+        resolved_parent = resolved.parent
+        if parent is None:
+            parent = resolved_parent
+        elif resolved_parent != parent:
+            raise ValueError("artifact files must be in the same directory")
+        identity = _stat_identity(metadata)
+        if identity in identities:
+            raise ValueError("artifact files resolve to the same identity")
+        identities.add(identity)
+        normalized[path.name] = (resolved, metadata)
+    return tuple(
+        (name, *normalized[name])
+        for name in REQUIRED_ARTIFACT_NAMES
+    )
+
+
+def _read_stable_bytes(path: Path, expected: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            before = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or _stat_identity(before) != _stat_identity(expected)
+            ):
+                raise OSError(f"artifact identity changed before read: {path.name}")
+            contents = handle.read()
+            after = os.fstat(handle.fileno())
+    except OSError as error:
+        if "artifact" in str(error):
+            raise
+        raise OSError(f"cannot read artifact file: {path.name}") from error
+
+    try:
+        current = path.stat()
+    except OSError as error:
+        raise OSError(f"artifact changed during read: {path.name}") from error
+    if (
+        _stable_signature(before) != _stable_signature(after)
+        or _stable_signature(after) != _stable_signature(current)
+        or len(contents) != after.st_size
+    ):
+        raise OSError(f"artifact changed during read: {path.name}")
+    return contents
 
 
 def _hash_files(
     files: Iterable[str | os.PathLike[str]],
-) -> FrozenDict[str]:
-    paths = _normalize_files(files)
+) -> FrozenMapping:
+    artifacts = _normalize_files(files)
     hashes: dict[str, str] = {}
-    for path in paths:
-        try:
-            if not path.is_file():
-                raise ValueError(f"artifact file is missing or not a file: {path.name}")
-            contents = path.read_bytes()
-        except OSError as error:
-            raise OSError(f"cannot read artifact file: {path.name}") from error
-        hashes[path.name] = hashlib.sha256(contents).hexdigest()
-    return FrozenDict(hashes)
+    for name, path, metadata in artifacts:
+        contents = _read_stable_bytes(path, metadata)
+        hashes[name] = hashlib.sha256(contents).hexdigest()
+    return FrozenMapping(hashes)
+
+
+def _trusted_username() -> str:
+    if os.name == "nt":
+        buffer = ctypes.create_unicode_buffer(257)
+        size = wintypes.DWORD(len(buffer))
+        get_username = ctypes.windll.advapi32.GetUserNameW
+        if not get_username(buffer, ctypes.byref(size)):
+            raise OSError(ctypes.get_last_error(), "GetUserNameW failed")
+        return buffer.value
+    return getpass.getuser()
 
 
 def build_approval(
@@ -174,12 +300,18 @@ def build_approval(
     test_branch: str,
     files: Iterable[str | os.PathLike[str]],
     approved_user: str | None = None,
+    user_provider: Callable[[], str] | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ApprovalSnapshot:
     """Hash every artifact before constructing one complete approval snapshot."""
 
     artifact_hashes = _hash_files(files)
     now = (clock or (lambda: datetime.now(timezone.utc)))()
+    trusted_user = (user_provider or _trusted_username)()
+    if not trusted_user.strip():
+        raise ValueError("trusted approved_user cannot be blank")
+    if approved_user is not None and approved_user != trusted_user:
+        raise ValueError("approved_user does not match the trusted current user")
     return ApprovalSnapshot(
         run_id=run_id,
         project_id=project_id,
@@ -188,7 +320,7 @@ def build_approval(
         base_sha=base_sha,
         test_branch=test_branch,
         artifact_hashes=artifact_hashes,
-        approved_user=approved_user or getpass.getuser(),
+        approved_user=trusted_user,
         approved_at=now,
     )
 
@@ -202,23 +334,32 @@ def verify_approval(
 
     try:
         current_hashes = _hash_files(files)
-    except (OSError, ValueError, TypeError):
-        return False
-    if not hmac.compare_digest(approval.config_hash, config_hash):
-        return False
-    if set(current_hashes) != set(approval.artifact_hashes):
-        return False
-    return all(
-        hmac.compare_digest(
-            approval.artifact_hashes[name],
-            current_hashes[name],
+        if not isinstance(config_hash, str):
+            return False
+        if not hmac.compare_digest(
+            approval.config_hash.encode("utf-8"),
+            config_hash.encode("utf-8"),
+        ):
+            return False
+        if set(current_hashes) != set(approval.artifact_hashes):
+            return False
+        return all(
+            hmac.compare_digest(
+                approval.artifact_hashes[name],
+                current_hashes[name],
+            )
+            for name in approval.artifact_hashes
         )
-        for name in approval.artifact_hashes
-    )
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return False
 
 
 def _atomic_replace(source: Path, target: Path) -> None:
     source.replace(target)
+
+
+def _remove_temporary(path: Path) -> None:
+    path.unlink()
 
 
 def save_approval(path: str | os.PathLike[str], approval: ApprovalSnapshot) -> None:
@@ -233,6 +374,7 @@ def save_approval(path: str | os.PathLike[str], approval: ApprovalSnapshot) -> N
         separators=(",", ":"),
     ) + "\n"
     temporary_path: Path | None = None
+    primary_error: BaseException | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -249,12 +391,21 @@ def save_approval(path: str | os.PathLike[str], approval: ApprovalSnapshot) -> N
             os.fsync(temporary.fileno())
         _atomic_replace(temporary_path, destination)
         temporary_path = None
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         if temporary_path is not None:
             try:
-                temporary_path.unlink()
+                _remove_temporary(temporary_path)
             except FileNotFoundError:
                 pass
+            except OSError as cleanup_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    f"temporary approval cleanup failed: {cleanup_error}"
+                )
 
 
 def load_approval(path: str | os.PathLike[str]) -> ApprovalSnapshot:
