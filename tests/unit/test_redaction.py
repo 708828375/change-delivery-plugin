@@ -51,6 +51,48 @@ def test_redacts_multiline_headers_and_entire_cookie_value() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "INFO request Authorization: Bearer line-secret",
+            "INFO request Authorization: Bearer ***",
+        ),
+        (
+            "[http] AUTHORIZATION: BEARER structured-secret",
+            "[http] AUTHORIZATION: BEARER ***",
+        ),
+        (
+            "INFO response Cookie: session=one; preference=two",
+            "INFO response Cookie: ***",
+        ),
+        (
+            '{"level":"debug"} cOoKiE: session=case-secret; second=hidden',
+            '{"level":"debug"} cOoKiE: ***',
+        ),
+    ],
+)
+def test_redacts_headers_after_log_or_structured_prefix(
+    text: str,
+    expected: str,
+) -> None:
+    assert redact_text(text, {}) == expected
+
+
+def test_redacts_non_line_start_headers_across_multiple_lines() -> None:
+    text = (
+        "INFO first Authorization: Bearer first-secret\n"
+        "[access] Cookie: session=second-secret; preference=dark\r\n"
+        "safe"
+    )
+
+    assert redact_text(text, {}) == (
+        "INFO first Authorization: Bearer ***\n"
+        "[access] Cookie: ***\r\n"
+        "safe"
+    )
+
+
 def test_redaction_preserves_crlf_line_boundaries() -> None:
     text = "Cookie: first=one; second=two\r\nsafe"
 

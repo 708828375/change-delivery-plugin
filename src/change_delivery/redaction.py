@@ -3,12 +3,12 @@ import re
 
 
 _AUTHORIZATION_BEARER = re.compile(
-    r"^([ \t]*authorization[ \t]*:[ \t]*bearer[ \t]+)[^\r\n]*",
-    flags=re.IGNORECASE | re.MULTILINE,
+    r"(\bauthorization[ \t]*:[ \t]*bearer[ \t]+)[^\r\n]*",
+    flags=re.IGNORECASE,
 )
 _COOKIE = re.compile(
-    r"^([ \t]*cookie[ \t]*:[ \t]*)[^\r\n]*",
-    flags=re.IGNORECASE | re.MULTILINE,
+    r"(\bcookie[ \t]*:[ \t]*)[^\r\n]*",
+    flags=re.IGNORECASE,
 )
 _NAMED_CREDENTIAL = re.compile(
     r"\b(password|token)([ \t]*=[ \t]*)"
