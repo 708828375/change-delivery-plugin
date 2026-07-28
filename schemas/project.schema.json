@@ -4,12 +4,20 @@
       "additionalProperties": false,
       "properties": {
         "executable": {
+          "allOf": [
+            {
+              "not": {
+                "pattern": "(?:^|[\\\\/])(?:(?:[Pp][Oo][Ww][Ee][Rr][Ss][Hh][Ee][Ll][Ll]|[Pp][Ww][Ss][Hh]|[Cc][Mm][Dd]|[Bb][Aa][Ss][Hh]|[Ss][Hh]|[Ww][Ss][Ll]|[Rr][Mm]|[Rr][Ee][Mm][Oo][Vv][Ee]-[Ii][Tt][Ee][Mm]|[Rr][Mm][Dd][Ii][Rr])(?:\\.[Ee][Xx][Ee])?|[^\\\\/]+\\.(?:[Pp][Ss]1|[Bb][Aa][Tt]|[Cc][Mm][Dd]|[Ss][Hh]))$"
+              }
+            }
+          ],
           "minLength": 1,
           "title": "Executable",
           "type": "string"
         },
         "args": {
           "items": {
+            "pattern": "^[^\\r\\n]*$",
             "type": "string"
           },
           "title": "Args",
@@ -63,23 +71,77 @@
       "type": "string"
     },
     "base_branch": {
+      "allOf": [
+        {
+          "not": {
+            "const": "@"
+          }
+        },
+        {
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        {
+          "not": {
+            "pattern": "@\\{"
+          }
+        },
+        {
+          "not": {
+            "pattern": "\\.$"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|/)[^/]*\\.lock(?:/|$)"
+          }
+        }
+      ],
       "pattern": "^[^-./\\x00-\\x20\\x7f~^:?*\\[\\\\](?:[^\\x00-\\x20\\x7f~^:?*\\[\\\\/]|/[^.\\x00-\\x20\\x7f~^:?*\\[\\\\/])*$",
       "title": "Base Branch",
       "type": "string"
     },
     "test_branch": {
+      "allOf": [
+        {
+          "not": {
+            "const": "@"
+          }
+        },
+        {
+          "not": {
+            "pattern": "\\.\\."
+          }
+        },
+        {
+          "not": {
+            "pattern": "@\\{"
+          }
+        },
+        {
+          "not": {
+            "pattern": "\\.$"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|/)[^/]*\\.lock(?:/|$)"
+          }
+        }
+      ],
       "pattern": "^[^-./\\x00-\\x20\\x7f~^:?*\\[\\\\](?:[^\\x00-\\x20\\x7f~^:?*\\[\\\\/]|/[^.\\x00-\\x20\\x7f~^:?*\\[\\\\/])*$",
       "title": "Test Branch",
       "type": "string"
     },
     "github_repository": {
-      "pattern": "^[^/]+/[^/]+$",
+      "pattern": "^[^\\s/\\x00-\\x1f\\x7f]+/[^\\s/\\x00-\\x1f\\x7f]+$",
       "title": "Github Repository",
       "type": "string"
     },
     "version_endpoint": {
       "format": "uri",
-      "pattern": "^https://[^/]",
+      "pattern": "^[Hh][Tt][Tt][Pp][Ss]://[^/]",
       "title": "Version Endpoint",
       "type": "string"
     },
@@ -90,7 +152,166 @@
     },
     "required_pre_pr_checks": {
       "items": {
-        "$ref": "#/$defs/CommandSpec"
+        "allOf": [
+          {
+            "$ref": "#/$defs/CommandSpec"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Pp][Yy][Tt][Ee][Ss][Tt])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "not": {
+                      "contains": {
+                        "pattern": "^(?:--cache-clear|--basetemp(?:=.*)?)$",
+                        "type": "string"
+                      }
+                    },
+                    "type": "array"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Rr][Uu][Ff][Ff])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "minItems": 1,
+                    "not": {
+                      "contains": {
+                        "pattern": "^--(?:fix|unsafe-fixes|add-noqa)(?:=.*)?$",
+                        "type": "string"
+                      }
+                    },
+                    "prefixItems": [
+                      {
+                        "const": "check"
+                      }
+                    ],
+                    "type": "array"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Mm][Yy][Pp][Yy])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "not": {
+                      "contains": {
+                        "pattern": "^--install-types(?:=.*)?$",
+                        "type": "string"
+                      }
+                    },
+                    "type": "array"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Pp][Yy][Tt][Hh][Oo][Nn]|[Pp][Yy][Tt][Hh][Oo][Nn][33]|[Pp][Yy])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "minItems": 2,
+                    "not": {
+                      "contains": {
+                        "pattern": "^(?:--cache-clear|--basetemp(?:=.*)?)$",
+                        "type": "string"
+                      }
+                    },
+                    "prefixItems": [
+                      {
+                        "const": "-m"
+                      },
+                      {
+                        "const": "pytest"
+                      }
+                    ],
+                    "type": "array"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Pp][Yy][Tt][Hh][Oo][Nn]|[Pp][Yy][Tt][Hh][Oo][Nn][33]|[Pp][Yy])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "minItems": 3,
+                    "not": {
+                      "contains": {
+                        "pattern": "^--(?:fix|unsafe-fixes|add-noqa)(?:=.*)?$",
+                        "type": "string"
+                      }
+                    },
+                    "prefixItems": [
+                      {
+                        "const": "-m"
+                      },
+                      {
+                        "const": "ruff"
+                      },
+                      {
+                        "const": "check"
+                      }
+                    ],
+                    "type": "array"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Pp][Yy][Tt][Hh][Oo][Nn]|[Pp][Yy][Tt][Hh][Oo][Nn][33]|[Pp][Yy])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "minItems": 2,
+                    "not": {
+                      "contains": {
+                        "pattern": "^--install-types(?:=.*)?$",
+                        "type": "string"
+                      }
+                    },
+                    "prefixItems": [
+                      {
+                        "const": "-m"
+                      },
+                      {
+                        "const": "mypy"
+                      }
+                    ],
+                    "type": "array"
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "executable": {
+                    "pattern": "(?:^|[\\\\/])(?:[Pp][Yy][Tt][Hh][Oo][Nn]|[Pp][Yy][Tt][Hh][Oo][Nn][33]|[Pp][Yy])(?:\\.[Ee][Xx][Ee])?$"
+                  },
+                  "args": {
+                    "minItems": 2,
+                    "prefixItems": [
+                      {
+                        "const": "-m"
+                      },
+                      {
+                        "const": "compileall"
+                      }
+                    ],
+                    "type": "array"
+                  }
+                }
+              }
+            ]
+          }
+        ]
       },
       "minItems": 1,
       "title": "Required Pre Pr Checks",

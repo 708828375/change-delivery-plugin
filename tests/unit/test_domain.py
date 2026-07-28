@@ -1,6 +1,9 @@
+import json
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import ValidationError
 
 from change_delivery.domain import (
@@ -31,6 +34,14 @@ def valid_project_data() -> dict[str, object]:
         "version_sha_field": "data.git_sha",
         "required_pre_pr_checks": [valid_command_data()],
     }
+
+
+def valid_project_json_data() -> dict[str, object]:
+    return ProjectConfig.model_validate(valid_project_data()).model_dump(mode="json")
+
+
+def project_schema_validator() -> Draft202012Validator:
+    return Draft202012Validator(ProjectConfig.model_json_schema())
 
 
 @pytest.mark.parametrize(
@@ -168,6 +179,7 @@ def test_project_config_rejects_relative_repo_path() -> None:
         ("test_branch", "feature.lock"),
         ("base_branch", "feature/.hidden"),
         ("test_branch", "foo/bar.lock/baz"),
+        ("base_branch", "@"),
     ],
 )
 def test_project_config_rejects_invalid_branches(field: str, branch: str) -> None:
@@ -176,6 +188,11 @@ def test_project_config_rejects_invalid_branches(field: str, branch: str) -> Non
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(data)
+
+    schema_data = valid_project_json_data()
+    schema_data[field] = branch
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
 
 
 def test_project_config_accepts_uppercase_lock_component() -> None:
@@ -224,6 +241,9 @@ def test_project_config_normalizes_uppercase_https_scheme() -> None:
     config = ProjectConfig.model_validate(data)
 
     assert config.version_endpoint == "https://example.test/version"
+    schema_data = valid_project_json_data()
+    schema_data["version_endpoint"] = "HTTPS://example.test/version"
+    project_schema_validator().validate(schema_data)
 
 
 @pytest.mark.parametrize(
@@ -254,6 +274,15 @@ def test_project_config_accepts_validation_profile_commands(
     config = ProjectConfig.model_validate(data)
 
     assert config.required_pre_pr_checks[0].args == args
+    schema_data = valid_project_json_data()
+    schema_data["required_pre_pr_checks"] = [
+        {
+            "executable": executable,
+            "args": list(args),
+            "workdir": "C:/repo",
+        }
+    ]
+    project_schema_validator().validate(schema_data)
 
 
 @pytest.mark.parametrize(
@@ -266,6 +295,15 @@ def test_project_config_accepts_validation_profile_commands(
         ("codex", ("exec", "task")),
         ("node", ("script.js",)),
         ("coverage", ("run", "-m", "pytest")),
+        ("ruff", ("format", ".")),
+        ("ruff", ("check", ".", "--fix")),
+        ("python", ("-m", "ruff", "check", ".", "--unsafe-fixes")),
+        ("ruff", ("check", ".", "--add-noqa")),
+        ("mypy", ("--install-types", "src")),
+        ("python", ("-m", "mypy", "--install-types=yes", "src")),
+        ("pytest", ("--cache-clear", "tests")),
+        ("python", ("-m", "pytest", "--basetemp", "C:/tmp")),
+        ("pytest", ("--basetemp=C:/tmp", "tests")),
     ],
 )
 def test_project_config_rejects_commands_outside_validation_profile(
@@ -283,6 +321,78 @@ def test_project_config_rejects_commands_outside_validation_profile(
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(data)
+
+    schema_data = valid_project_json_data()
+    schema_data["required_pre_pr_checks"] = [
+        {
+            "executable": executable,
+            "args": list(args),
+            "workdir": "C:/repo",
+        }
+    ]
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
+
+
+@pytest.mark.parametrize(
+    ("executable", "args"),
+    [
+        ("powershell", ("Get-Date",)),
+        ("tools/check.ps1", ()),
+        ("python", ("first\nsecond",)),
+    ],
+)
+def test_command_spec_schema_rejects_runtime_security_violations(
+    executable: str,
+    args: tuple[str, ...],
+) -> None:
+    data = {
+        "executable": executable,
+        "args": list(args),
+        "workdir": "C:/repo",
+    }
+    command_schema = ProjectConfig.model_json_schema()["$defs"]["CommandSpec"]
+
+    with pytest.raises(ValidationError):
+        CommandSpec.model_validate(data)
+    with pytest.raises(JSONSchemaValidationError):
+        Draft202012Validator(command_schema).validate(data)
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "owner with-space/repo",
+        "owner/repo with-space",
+        "owner\tname/repo",
+        "owner/repo\nname",
+    ],
+)
+def test_github_repository_rejects_whitespace_and_control(
+    repository: str,
+) -> None:
+    data = valid_project_data()
+    data["github_repository"] = repository
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
+
+    schema_data = valid_project_json_data()
+    schema_data["github_repository"] = repository
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
+
+
+def test_project_schema_is_valid_draft_2020_12() -> None:
+    Draft202012Validator.check_schema(ProjectConfig.model_json_schema())
+
+
+def test_committed_project_schema_matches_model() -> None:
+    schema_path = Path(__file__).parents[2] / "schemas" / "project.schema.json"
+
+    assert json.loads(schema_path.read_text(encoding="utf-8")) == (
+        ProjectConfig.model_json_schema()
+    )
 
 
 @pytest.mark.parametrize(
