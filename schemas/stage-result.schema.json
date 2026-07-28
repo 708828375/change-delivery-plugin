@@ -1,0 +1,137 @@
+{
+  "$defs": {
+    "EvidenceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "pattern": "^[a-z0-9][a-z0-9._:-]{0,127}$",
+          "title": "Evidence Id",
+          "type": "string"
+        },
+        "kind": {
+          "pattern": "^[a-z0-9][a-z0-9._:-]{0,127}$",
+          "title": "Kind",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "kind",
+        "sha256"
+      ],
+      "title": "EvidenceRef",
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "severity": {
+          "enum": [
+            "critical",
+            "important",
+            "minor"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "title": "Title",
+          "type": "string"
+        },
+        "evidence": {
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "title": "Evidence",
+          "type": "string"
+        },
+        "actionable": {
+          "title": "Actionable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "severity",
+        "title",
+        "evidence",
+        "actionable"
+      ],
+      "title": "Finding",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "passed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "passed",
+        "failed",
+        "blocked"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "summary": {
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "title": "Summary",
+      "type": "string"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/EvidenceRef"
+      },
+      "title": "Evidence",
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "title": "Findings",
+      "type": "array"
+    },
+    "next_action": {
+      "minLength": 1,
+      "pattern": ".*\\S.*",
+      "title": "Next Action",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "evidence",
+    "findings",
+    "next_action"
+  ],
+  "title": "StageResult",
+  "type": "object"
+}

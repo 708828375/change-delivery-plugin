@@ -3,7 +3,7 @@ from enum import StrEnum
 import json
 from pathlib import Path
 import re
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import (
     AnyUrl,
@@ -237,6 +237,76 @@ class RunState(StrEnum):
 
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+EVIDENCE_IDENTIFIER_PATTERN = r"^[a-z0-9][a-z0-9._:-]{0,127}$"
+SHA256_PATTERN = r"^[0-9a-f]{64}$"
+NON_BLANK_PATTERN = r".*\S.*"
+
+
+def add_stage_result_schema_constraints(schema: dict[str, object]) -> None:
+    schema["allOf"] = [
+        {
+            "if": {
+                "properties": {"status": {"const": "passed"}},
+                "required": ["status"],
+            },
+            "then": {
+                "properties": {
+                    "evidence": {
+                        "minItems": 1,
+                    }
+                }
+            },
+        }
+    ]
+
+
+class EvidenceRef(FrozenModel):
+    evidence_id: str = Field(pattern=EVIDENCE_IDENTIFIER_PATTERN)
+    kind: str = Field(pattern=EVIDENCE_IDENTIFIER_PATTERN)
+    sha256: str = Field(pattern=SHA256_PATTERN)
+
+
+class Finding(FrozenModel):
+    severity: Literal["critical", "important", "minor"]
+    title: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
+    evidence: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
+    actionable: bool
+
+    @field_validator("title", "evidence")
+    @classmethod
+    def require_non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("文本不能为空")
+        return value
+
+
+class StageResult(FrozenModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        json_schema_extra=add_stage_result_schema_constraints,
+    )
+
+    status: Literal["passed", "failed", "blocked"]
+    summary: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
+    evidence: tuple[EvidenceRef, ...]
+    findings: tuple[Finding, ...]
+    next_action: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
+
+    @field_validator("summary", "next_action")
+    @classmethod
+    def require_non_blank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("文本不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def require_evidence_for_pass(self) -> Self:
+        if self.status == "passed" and not self.evidence:
+            raise ValueError("通过状态必须包含证据")
+        return self
 
 
 class RunRecord(FrozenModel):
