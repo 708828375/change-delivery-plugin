@@ -84,9 +84,9 @@ class RunRepository:
     def transition(
         self,
         run_id: str,
-        *,
         expected: RunState,
         target: RunState,
+        event_type: str,
         evidence_ids: tuple[str, ...] = (),
     ) -> EventRecord:
         timestamp = utc_now()
@@ -118,7 +118,7 @@ class RunRepository:
                 (
                     event_id,
                     run_id,
-                    "STATE_TRANSITION",
+                    event_type,
                     current.value,
                     target.value,
                     json.dumps(evidence_ids, ensure_ascii=False),

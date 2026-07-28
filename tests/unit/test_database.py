@@ -137,12 +137,14 @@ def test_transition_updates_state_and_appends_json_evidence_event(
 
     event = repository.transition(
         "run-1",
-        expected=RunState.DRAFT,
-        target=RunState.APPROVED,
-        evidence_ids=("evidence-2", "evidence-1"),
+        RunState.DRAFT,
+        RunState.APPROVED,
+        "DESIGN_REQUESTED",
+        ("evidence-2", "evidence-1"),
     )
 
     assert repository.get_run("run-1").state is RunState.APPROVED
+    assert event.event_type == "DESIGN_REQUESTED"
     assert event.from_state is RunState.DRAFT
     assert event.to_state is RunState.APPROVED
     assert event.evidence_ids == ("evidence-2", "evidence-1")
@@ -157,6 +159,7 @@ def test_stale_transition_changes_nothing(repository: RunRepository) -> None:
             "run-1",
             expected=RunState.APPROVED,
             target=RunState.IMPLEMENTING,
+            event_type="IMPLEMENTATION_STARTED",
         )
 
     assert repository.get_run("run-1").state is RunState.DRAFT
@@ -171,6 +174,7 @@ def test_transition_of_missing_run_raises_key_error(
             "missing",
             expected=RunState.DRAFT,
             target=RunState.APPROVED,
+            event_type="DESIGN_APPROVED",
         )
 
 
@@ -187,6 +191,7 @@ def test_event_insert_failure_rolls_back_run_update(
         "run-1",
         expected=RunState.DRAFT,
         target=RunState.APPROVED,
+        event_type="DESIGN_APPROVED",
     )
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -194,6 +199,7 @@ def test_event_insert_failure_rolls_back_run_update(
             "run-1",
             expected=RunState.APPROVED,
             target=RunState.IMPLEMENTING,
+            event_type="IMPLEMENTATION_STARTED",
         )
 
     assert repository.get_run("run-1").state is RunState.APPROVED
@@ -216,7 +222,12 @@ def test_active_runs_exclude_terminal_states_and_are_stably_sorted(
         "failed": RunState.FAILED_TERMINAL,
     }
     for run_id, state in terminal_states.items():
-        repository.transition(run_id, expected=RunState.DRAFT, target=state)
+        repository.transition(
+            run_id,
+            expected=RunState.DRAFT,
+            target=state,
+            event_type="RUN_TERMINATED",
+        )
 
     assert [run.run_id for run in repository.list_active_runs()] == ["a", "b"]
 
