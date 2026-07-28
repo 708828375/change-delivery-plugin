@@ -2,19 +2,57 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+import math
 from typing import Any
 
 from change_delivery.domain import EvidenceRef
 
 
+_MAX_CANONICAL_DEPTH = 64
+
+
+def _validate_canonical_json(
+    value: Any,
+    ancestors: set[int],
+    depth: int,
+) -> None:
+    if depth > _MAX_CANONICAL_DEPTH:
+        raise ValueError("canonical JSON 嵌套过深")
+    if value is None or type(value) in {bool, int, str}:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("canonical JSON 浮点数必须有限")
+        return
+    if type(value) in {list, tuple}:
+        identity = id(value)
+        if identity in ancestors:
+            raise ValueError("canonical JSON 禁止循环引用")
+        ancestors.add(identity)
+        try:
+            for item in value:
+                _validate_canonical_json(item, ancestors, depth + 1)
+        finally:
+            ancestors.remove(identity)
+        return
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise TypeError("canonical JSON 对象键必须是字符串")
+        identity = id(value)
+        if identity in ancestors:
+            raise ValueError("canonical JSON 禁止循环引用")
+        ancestors.add(identity)
+        try:
+            for item in value.values():
+                _validate_canonical_json(item, ancestors, depth + 1)
+        finally:
+            ancestors.remove(identity)
+        return
+    raise TypeError(f"不支持的 canonical JSON 类型：{type(value).__name__}")
+
+
 def _payload_bytes(payload: Any) -> bytes:
-    if isinstance(payload, bytes):
-        return payload
-    if isinstance(payload, (bytearray, memoryview)):
-        return bytes(payload)
-    if isinstance(payload, Path):
-        return payload.read_bytes()
+    _validate_canonical_json(payload, set(), 0)
     canonical = json.dumps(
         payload,
         allow_nan=False,

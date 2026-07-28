@@ -6,6 +6,7 @@ from types import MappingProxyType
 import pytest
 
 from change_delivery.domain import RunState
+from change_delivery.domain import EvidenceRef
 from change_delivery.state_machine import (
     ALLOWED_TRANSITIONS,
     READY_TO_MERGE_EVIDENCE,
@@ -33,6 +34,14 @@ HAPPY_PATH = (
     RunState.CLEANING_LOCAL,
     RunState.COMPLETED,
 )
+APPROVAL_SHA = "a" * 64
+APPROVAL_EVIDENCE = (
+    EvidenceRef(
+        evidence_id="approval-1",
+        kind="explicit_approval",
+        sha256=APPROVAL_SHA,
+    ),
+)
 
 
 def test_transition_table_is_deeply_immutable_and_covers_every_state() -> None:
@@ -55,7 +64,15 @@ def test_terminal_states_have_no_outgoing_transitions(state: RunState) -> None:
 def test_complete_happy_path_is_allowed_without_stage_skips() -> None:
     for current, target in pairwise(HAPPY_PATH):
         evidence = READY_TO_MERGE_EVIDENCE if target is RunState.READY_TO_MERGE else ()
-        assert_transition(current, target, evidence)
+        kwargs = (
+            {
+                "evidence_refs": APPROVAL_EVIDENCE,
+                "approval_snapshot_sha256": APPROVAL_SHA,
+            }
+            if target is RunState.APPROVED
+            else {}
+        )
+        assert_transition(current, target, evidence, **kwargs)
 
     with pytest.raises(ValueError, match="非法状态迁移"):
         assert_transition(RunState.DRAFT, RunState.IMPLEMENTING, ())
@@ -254,3 +271,112 @@ def test_recovery_does_not_modify_evidence_input() -> None:
     )
 
     assert evidence == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("current", "DRAFT"),
+        ("target", "READY_TO_MERGE"),
+        ("interrupted_from", "IMPLEMENTING"),
+    ],
+)
+def test_assert_transition_rejects_string_state_values(
+    field: str,
+    value: str,
+) -> None:
+    arguments: dict[str, object] = {
+        "current": RunState.DRAFT,
+        "target": RunState.AWAITING_DESIGN_APPROVAL,
+        "evidence_kinds": (),
+    }
+    arguments[field] = value
+
+    with pytest.raises(TypeError, match="RunState"):
+        assert_transition(**arguments)  # type: ignore[arg-type]
+
+
+def test_string_ready_to_merge_cannot_bypass_evidence_gate() -> None:
+    with pytest.raises(TypeError, match="RunState"):
+        assert_transition(
+            RunState.MONITORING_CI_REVIEW,
+            "READY_TO_MERGE",  # type: ignore[arg-type]
+            (),
+        )
+
+
+def test_approved_requires_explicit_approval_reference_not_only_kind() -> None:
+    with pytest.raises(ValueError, match="缺少批准门禁"):
+        assert_transition(
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.APPROVED,
+            ("explicit_approval",),
+            approval_snapshot_sha256=APPROVAL_SHA,
+        )
+
+
+@pytest.mark.parametrize("snapshot_sha", [None, "", "A" * 64, "a" * 63])
+def test_approved_requires_strict_expected_snapshot_sha(
+    snapshot_sha: str | None,
+) -> None:
+    with pytest.raises(ValueError, match="缺少批准门禁"):
+        assert_transition(
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.APPROVED,
+            (),
+            evidence_refs=APPROVAL_EVIDENCE,
+            approval_snapshot_sha256=snapshot_sha,
+        )
+
+
+def test_approved_rejects_approval_reference_for_other_snapshot() -> None:
+    with pytest.raises(ValueError, match="批准快照不匹配"):
+        assert_transition(
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.APPROVED,
+            (),
+            evidence_refs=APPROVAL_EVIDENCE,
+            approval_snapshot_sha256="b" * 64,
+        )
+
+
+def test_approved_accepts_matching_explicit_approval_snapshot() -> None:
+    assert_transition(
+        RunState.AWAITING_DESIGN_APPROVAL,
+        RunState.APPROVED,
+        (),
+        evidence_refs=APPROVAL_EVIDENCE,
+        approval_snapshot_sha256=APPROVAL_SHA,
+    )
+
+
+def test_approved_does_not_modify_evidence_reference_input() -> None:
+    references = list(APPROVAL_EVIDENCE)
+    before = references.copy()
+
+    assert_transition(
+        RunState.AWAITING_DESIGN_APPROVAL,
+        RunState.APPROVED,
+        (),
+        evidence_refs=references,
+        approval_snapshot_sha256=APPROVAL_SHA,
+    )
+
+    assert references == before
+
+
+def test_approved_rejects_constructed_reference_with_empty_evidence_id() -> None:
+    invalid_reference = EvidenceRef.model_construct(
+        evidence_id="",
+        kind="explicit_approval",
+        sha256=APPROVAL_SHA,
+    )
+
+    with pytest.raises(ValueError, match="证据引用"):
+        assert_transition(
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.APPROVED,
+            (),
+            evidence_refs=(invalid_reference,),
+            approval_snapshot_sha256=APPROVAL_SHA,
+        )

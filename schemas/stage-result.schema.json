@@ -86,6 +86,44 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "passed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "findings": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "severity": {
+                    "enum": [
+                      "critical",
+                      "important"
+                    ]
+                  },
+                  "actionable": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "severity",
+                  "actionable"
+                ],
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "properties": {

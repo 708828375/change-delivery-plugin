@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
+from hmac import compare_digest
 from itertools import pairwise
 from types import MappingProxyType
 
-from change_delivery.domain import EVIDENCE_IDENTIFIER_PATTERN, RunState
+from change_delivery.domain import (
+    EVIDENCE_IDENTIFIER_PATTERN,
+    SHA256_PATTERN,
+    EvidenceRef,
+    RunState,
+)
 
 
 READY_TO_MERGE_EVIDENCE = frozenset(
@@ -111,11 +117,14 @@ def _build_transitions() -> Mapping[RunState, frozenset[RunState]]:
 
 ALLOWED_TRANSITIONS = _build_transitions()
 _EVIDENCE_KIND = re.compile(EVIDENCE_IDENTIFIER_PATTERN)
+_SHA256 = re.compile(SHA256_PATTERN)
 
 
 def _normalize_evidence_kinds(
     evidence_kinds: Iterable[str],
 ) -> frozenset[str]:
+    if isinstance(evidence_kinds, str):
+        raise ValueError("证据 kind 必须以集合形式提供")
     normalized = frozenset(evidence_kinds)
     if any(
         not isinstance(kind, str) or _EVIDENCE_KIND.fullmatch(kind) is None
@@ -125,13 +134,46 @@ def _normalize_evidence_kinds(
     return normalized
 
 
+def _normalize_evidence_refs(
+    evidence_refs: Iterable[EvidenceRef],
+) -> tuple[EvidenceRef, ...]:
+    if isinstance(evidence_refs, (str, bytes)):
+        raise TypeError("evidence_refs 必须包含 EvidenceRef")
+    normalized = tuple(evidence_refs)
+    if any(not isinstance(reference, EvidenceRef) for reference in normalized):
+        raise TypeError("evidence_refs 必须包含 EvidenceRef")
+    if any(
+        type(reference.evidence_id) is not str
+        or type(reference.kind) is not str
+        or type(reference.sha256) is not str
+        or _EVIDENCE_KIND.fullmatch(reference.evidence_id) is None
+        or _EVIDENCE_KIND.fullmatch(reference.kind) is None
+        or _SHA256.fullmatch(reference.sha256) is None
+        for reference in normalized
+    ):
+        raise ValueError("证据引用字段无效")
+    return normalized
+
+
 def assert_transition(
     current: RunState,
     target: RunState,
     evidence_kinds: Iterable[str],
     *,
     interrupted_from: RunState | None = None,
+    evidence_refs: Iterable[EvidenceRef] = (),
+    approval_snapshot_sha256: str | None = None,
 ) -> None:
+    if not isinstance(current, RunState):
+        raise TypeError("current 必须是 RunState")
+    if not isinstance(target, RunState):
+        raise TypeError("target 必须是 RunState")
+    if interrupted_from is not None and not isinstance(
+        interrupted_from,
+        RunState,
+    ):
+        raise TypeError("interrupted_from 必须是 RunState")
+
     if (
         interrupted_from is not None
         and interrupted_from not in _NORMAL_ACTIVE_STATES
@@ -155,6 +197,28 @@ def assert_transition(
             )
 
     evidence = _normalize_evidence_kinds(evidence_kinds)
+    references = _normalize_evidence_refs(evidence_refs)
+    if target is RunState.APPROVED:
+        approval_references = tuple(
+            reference
+            for reference in references
+            if reference.kind == "explicit_approval"
+        )
+        if (
+            not isinstance(approval_snapshot_sha256, str)
+            or _SHA256.fullmatch(approval_snapshot_sha256) is None
+            or not approval_references
+        ):
+            raise ValueError("缺少批准门禁")
+        if not any(
+            compare_digest(
+                reference.sha256,
+                approval_snapshot_sha256,
+            )
+            for reference in approval_references
+        ):
+            raise ValueError("批准快照不匹配")
+
     if target is RunState.READY_TO_MERGE:
         missing = READY_TO_MERGE_EVIDENCE - evidence
         if missing:

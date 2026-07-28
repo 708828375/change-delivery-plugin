@@ -53,24 +53,41 @@ def test_canonical_json_hash_changes_with_semantics() -> None:
     assert sha256_payload({"count": 1}) != sha256_payload({"count": 2})
 
 
-def test_bytes_hash_is_deterministic() -> None:
-    assert sha256_payload(b"same") == sha256_payload(bytearray(b"same"))
-
-
-def test_file_hash_reads_contents_without_exposing_path(tmp_path: Path) -> None:
-    evidence_file = tmp_path / "secret-name.log"
-    evidence_file.write_bytes(b"stable contents")
-
-    reference = build_evidence_ref("acceptance-1", "acceptance_passed", evidence_file)
-
-    assert reference.sha256 == sha256_payload(b"stable contents")
-    assert str(evidence_file) not in reference.model_dump_json()
-
-
-@pytest.mark.parametrize("payload", [{"value": object()}, {"value": math.nan}])
-def test_hash_rejects_non_canonical_json(payload: object) -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"value": object()},
+        {"value": math.nan},
+        {"value": math.inf},
+        {"value": -math.inf},
+        {1: "x"},
+        b"bytes",
+        bytearray(b"bytes"),
+        Path("C:/absolute/secret.txt"),
+    ],
+)
+def test_hash_rejects_values_outside_canonical_json(payload: object) -> None:
     with pytest.raises((TypeError, ValueError)):
         sha256_payload(payload)
+
+
+def test_hash_rejects_self_referential_container() -> None:
+    payload: list[object] = []
+    payload.append(payload)
+
+    with pytest.raises(ValueError, match="循环"):
+        sha256_payload(payload)
+
+
+def test_tuple_and_list_have_same_canonical_json_semantics() -> None:
+    assert sha256_payload(("one", 2, True)) == sha256_payload(["one", 2, True])
+
+
+def test_non_string_mapping_key_cannot_collide_with_string_key() -> None:
+    with pytest.raises(TypeError, match="字符串"):
+        sha256_payload({1: "x"})
+
+    assert len(sha256_payload({"1": "x"})) == 64
 
 
 def test_build_evidence_ref_contains_only_identity_kind_and_hash() -> None:
@@ -191,3 +208,54 @@ def test_schema_and_runtime_accept_and_reject_same_examples() -> None:
             StageResult.model_validate(data)
         with pytest.raises(JSONSchemaValidationError):
             stage_schema_validator().validate(data)
+
+
+@pytest.mark.parametrize("severity", ["critical", "important"])
+def test_passed_stage_rejects_actionable_serious_finding_in_runtime_and_schema(
+    severity: str,
+) -> None:
+    data = valid_stage_data()
+    data["findings"] = [
+        {
+            "severity": severity,
+            "title": "必须处理",
+            "evidence": "审查证据",
+            "actionable": True,
+        }
+    ]
+
+    with pytest.raises(ValidationError):
+        StageResult.model_validate(data)
+    with pytest.raises(JSONSchemaValidationError):
+        stage_schema_validator().validate(data)
+
+
+def test_passed_stage_allows_actionable_minor_finding() -> None:
+    data = valid_stage_data()
+    data["findings"] = [
+        {
+            "severity": "minor",
+            "title": "后续优化",
+            "evidence": "审查证据",
+            "actionable": True,
+        }
+    ]
+
+    result = StageResult.model_validate(data)
+    stage_schema_validator().validate(result.model_dump(mode="json"))
+
+
+def test_failed_stage_allows_actionable_critical_finding() -> None:
+    data = valid_stage_data()
+    data["status"] = "failed"
+    data["findings"] = [
+        {
+            "severity": "critical",
+            "title": "阻断问题",
+            "evidence": "审查证据",
+            "actionable": True,
+        }
+    ]
+
+    result = StageResult.model_validate(data)
+    stage_schema_validator().validate(result.model_dump(mode="json"))

@@ -258,7 +258,31 @@ def add_stage_result_schema_constraints(schema: dict[str, object]) -> None:
                     }
                 }
             },
-        }
+        },
+        {
+            "if": {
+                "properties": {"status": {"const": "passed"}},
+                "required": ["status"],
+            },
+            "then": {
+                "properties": {
+                    "findings": {
+                        "not": {
+                            "contains": {
+                                "type": "object",
+                                "properties": {
+                                    "severity": {
+                                        "enum": ["critical", "important"]
+                                    },
+                                    "actionable": {"const": True},
+                                },
+                                "required": ["severity", "actionable"],
+                            }
+                        }
+                    }
+                }
+            },
+        },
     ]
 
 
@@ -306,6 +330,12 @@ class StageResult(FrozenModel):
     def require_evidence_for_pass(self) -> Self:
         if self.status == "passed" and not self.evidence:
             raise ValueError("通过状态必须包含证据")
+        if self.status == "passed" and any(
+            finding.actionable
+            and finding.severity in {"critical", "important"}
+            for finding in self.findings
+        ):
+            raise ValueError("通过状态不能包含待处理的严重问题")
         return self
 
 
