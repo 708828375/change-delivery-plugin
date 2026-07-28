@@ -166,6 +166,8 @@ def test_project_config_rejects_relative_repo_path() -> None:
         ("test_branch", "feature/"),
         ("base_branch", "feature."),
         ("test_branch", "feature.lock"),
+        ("base_branch", "feature/.hidden"),
+        ("test_branch", "foo/bar.lock/baz"),
     ],
 )
 def test_project_config_rejects_invalid_branches(field: str, branch: str) -> None:
@@ -174,6 +176,15 @@ def test_project_config_rejects_invalid_branches(field: str, branch: str) -> Non
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(data)
+
+
+def test_project_config_accepts_uppercase_lock_component() -> None:
+    data = valid_project_data()
+    data["base_branch"] = "foo/bar.LOCK/baz"
+
+    config = ProjectConfig.model_validate(data)
+
+    assert config.base_branch == "foo/bar.LOCK/baz"
 
 
 def test_project_schema_exposes_branch_and_absolute_path_patterns() -> None:

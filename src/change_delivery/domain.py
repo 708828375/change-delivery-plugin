@@ -15,8 +15,8 @@ from pydantic import (
 
 BRANCH_PATTERN = (
     r"^[^-./\x00-\x20\x7f~^:?*\[\\]"
-    r"(?:[^\x00-\x20\x7f~^:?*\[\\]*"
-    r"[^/.\x00-\x20\x7f~^:?*\[\\])?$"
+    r"(?:[^\x00-\x20\x7f~^:?*\[\\/]"
+    r"|/[^.\x00-\x20\x7f~^:?*\[\\/])*$"
 )
 WINDOWS_ABSOLUTE_PATH_PATTERN = (
     r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)"
@@ -146,7 +146,10 @@ class ProjectConfig(FrozenModel):
             ".." in branch
             or "@{" in branch
             or "//" in branch
-            or branch.endswith(".lock")
+            or branch.endswith(".")
+            or any(
+                component.endswith(".lock") for component in branch.split("/")
+            )
         ):
             raise ValueError("分支名称无效")
         return branch
