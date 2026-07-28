@@ -21,7 +21,12 @@ BRANCH_PATTERN = (
 WINDOWS_ABSOLUTE_PATH_PATTERN = (
     r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)"
 )
-HTTPS_URL_PATTERN = r"^[Hh][Tt][Tt][Pp][Ss]://[^/]"
+HTTPS_URL_PATTERN = (
+    r"^[Hh][Tt][Tt][Pp][Ss]://"
+    r"(?:[^/?#@\s]+@)?"
+    r"(?:\[[^/?#\s]+\]|[^/?#:@\s]+)"
+    r"(?::[0-9]+)?(?:[/?#]|$)"
+)
 GITHUB_REPOSITORY_PATTERN = (
     r"^[^\s/\x00-\x1f\x7f]+/[^\s/\x00-\x1f\x7f]+$"
 )
@@ -52,7 +57,7 @@ MYPY_EXECUTABLE_PATTERN = executable_schema_pattern("mypy")
 PYTHON_EXECUTABLE_PATTERN = executable_schema_pattern("python", "python3", "py")
 PYTEST_UNSAFE_ARGUMENT_PATTERN = r"^(?:--cache-clear|--basetemp(?:=.*)?)$"
 RUFF_UNSAFE_ARGUMENT_PATTERN = (
-    r"^--(?:fix|unsafe-fixes|add-noqa)(?:=.*)?$"
+    r"^--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?$"
 )
 MYPY_UNSAFE_ARGUMENT_PATTERN = r"^--install-types(?:=.*)?$"
 
@@ -60,12 +65,15 @@ MYPY_UNSAFE_ARGUMENT_PATTERN = r"^--install-types(?:=.*)?$"
 def safe_args_schema(
     *,
     prefix: tuple[str, ...] = (),
+    required_argument: str | None = None,
     unsafe_pattern: str | None = None,
 ) -> dict[str, object]:
     schema: dict[str, object] = {"type": "array"}
     if prefix:
         schema["prefixItems"] = [{"const": item} for item in prefix]
         schema["minItems"] = len(prefix)
+    if required_argument:
+        schema["contains"] = {"const": required_argument}
     if unsafe_pattern:
         schema["not"] = {
             "contains": {"type": "string", "pattern": unsafe_pattern}
@@ -89,6 +97,7 @@ VALIDATION_PROFILE_SCHEMA = {
                 "executable": {"pattern": RUFF_EXECUTABLE_PATTERN},
                 "args": safe_args_schema(
                     prefix=("check",),
+                    required_argument="--no-fix",
                     unsafe_pattern=RUFF_UNSAFE_ARGUMENT_PATTERN,
                 ),
             }
@@ -115,6 +124,7 @@ VALIDATION_PROFILE_SCHEMA = {
                 "executable": {"pattern": PYTHON_EXECUTABLE_PATTERN},
                 "args": safe_args_schema(
                     prefix=("-m", "ruff", "check"),
+                    required_argument="--no-fix",
                     unsafe_pattern=RUFF_UNSAFE_ARGUMENT_PATTERN,
                 ),
             }
@@ -176,6 +186,7 @@ def validation_arguments_are_safe(
         return (
             bool(arguments)
             and arguments[0] == "check"
+            and "--no-fix" in arguments
             and not any(
                 re.match(RUFF_UNSAFE_ARGUMENT_PATTERN, argument)
                 for argument in arguments

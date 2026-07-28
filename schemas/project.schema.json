@@ -143,7 +143,7 @@
     },
     "version_endpoint": {
       "format": "uri",
-      "pattern": "^[Hh][Tt][Tt][Pp][Ss]://[^/]",
+      "pattern": "^[Hh][Tt][Tt][Pp][Ss]://(?:[^/?#@\\s]+@)?(?:\\[[^/?#\\s]+\\]|[^/?#:@\\s]+)(?::[0-9]+)?(?:[/?#]|$)",
       "title": "Version Endpoint",
       "type": "string"
     },
@@ -182,10 +182,13 @@
                     "pattern": "(?:^|[\\\\/])(?:[Rr][Uu][Ff][Ff])(?:\\.[Ee][Xx][Ee])?$"
                   },
                   "args": {
+                    "contains": {
+                      "const": "--no-fix"
+                    },
                     "minItems": 1,
                     "not": {
                       "contains": {
-                        "pattern": "^--(?:fix|unsafe-fixes|add-noqa)(?:=.*)?$",
+                        "pattern": "^--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?$",
                         "type": "string"
                       }
                     },
@@ -248,10 +251,13 @@
                     "pattern": "(?:^|[\\\\/])(?:[Pp][Yy][Tt][Hh][Oo][Nn]|[Pp][Yy][Tt][Hh][Oo][Nn][33]|[Pp][Yy])(?:\\.[Ee][Xx][Ee])?$"
                   },
                   "args": {
+                    "contains": {
+                      "const": "--no-fix"
+                    },
                     "minItems": 3,
                     "not": {
                       "contains": {
-                        "pattern": "^--(?:fix|unsafe-fixes|add-noqa)(?:=.*)?$",
+                        "pattern": "^--(?:fix|fix-only|unsafe-fixes|add-noqa)(?:=.*)?$",
                         "type": "string"
                       }
                     },

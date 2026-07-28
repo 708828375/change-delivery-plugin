@@ -223,7 +223,11 @@ def test_project_schema_exposes_branch_and_absolute_path_patterns() -> None:
     [
         "http://example.test/version",
         "example.test/version",
+        "https://?query",
+        "https://#fragment",
         "https:///version",
+        "https://user@?query",
+        "https://:443/path",
     ],
 )
 def test_project_config_requires_https_version_url(endpoint: str) -> None:
@@ -232,6 +236,11 @@ def test_project_config_requires_https_version_url(endpoint: str) -> None:
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(data)
+
+    schema_data = valid_project_json_data()
+    schema_data["version_endpoint"] = endpoint
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
 
 
 def test_project_config_normalizes_uppercase_https_scheme() -> None:
@@ -250,10 +259,14 @@ def test_project_config_normalizes_uppercase_https_scheme() -> None:
     ("executable", "args"),
     [
         ("pytest", ("tests",)),
-        (r"C:\venv\Scripts\ruff.exe", ("check", ".")),
+        (r"C:\venv\Scripts\ruff.exe", ("check", ".", "--no-fix")),
         ("/usr/bin/mypy", ("src",)),
         ("python", ("-m", "pytest", "tests")),
-        ("python3", ("-m", "ruff", "check", ".")),
+        ("python3", ("-m", "ruff", "check", ".", "--no-fix")),
+        (
+            "ruff",
+            ("check", ".", "--config", "fix=true", "--no-fix"),
+        ),
         ("py", ("-m", "mypy", "src")),
         ("python", ("-m", "compileall", "src")),
     ],
@@ -296,7 +309,15 @@ def test_project_config_accepts_validation_profile_commands(
         ("node", ("script.js",)),
         ("coverage", ("run", "-m", "pytest")),
         ("ruff", ("format", ".")),
+        ("ruff", ("check", ".")),
+        ("ruff", ("check", ".", "--config", "fix=true")),
+        ("python", ("-m", "ruff", "check", ".")),
         ("ruff", ("check", ".", "--fix")),
+        ("ruff", ("check", ".", "--fix-only", "--no-fix")),
+        (
+            "python",
+            ("-m", "ruff", "check", ".", "--fix-only=true", "--no-fix"),
+        ),
         ("python", ("-m", "ruff", "check", ".", "--unsafe-fixes")),
         ("ruff", ("check", ".", "--add-noqa")),
         ("mypy", ("--install-types", "src")),
