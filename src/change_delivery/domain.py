@@ -1,4 +1,6 @@
+from datetime import datetime
 from enum import StrEnum
+import json
 from pathlib import Path
 import re
 from typing import Self
@@ -235,6 +237,50 @@ class RunState(StrEnum):
 
 class FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class RunRecord(FrozenModel):
+    run_id: str
+    project_id: str
+    config_hash: str
+    state: RunState
+    head_sha: str | None = None
+    pr_number: int | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class EventRecord(FrozenModel):
+    event_id: str
+    run_id: str
+    event_type: str
+    from_state: RunState
+    to_state: RunState
+    evidence_ids: tuple[str, ...]
+    created_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_evidence_json(cls, value: object) -> object:
+        if not isinstance(value, dict) or "evidence_json" not in value:
+            return value
+        data = dict(value)
+        if "evidence_ids" in data:
+            raise ValueError("evidence_json 和 evidence_ids 不能同时提供")
+        raw_evidence = data.pop("evidence_json")
+        if not isinstance(raw_evidence, str):
+            raise ValueError("evidence_json 必须是 JSON 字符串")
+        try:
+            evidence_ids = json.loads(raw_evidence)
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ValueError("evidence_json 不是有效 JSON") from error
+        if (
+            not isinstance(evidence_ids, list)
+            or any(not isinstance(item, str) for item in evidence_ids)
+        ):
+            raise ValueError("evidence_json 必须是字符串数组")
+        data["evidence_ids"] = tuple(evidence_ids)
+        return data
 
 
 class CommandSpec(FrozenModel):
