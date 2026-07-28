@@ -80,7 +80,10 @@ class CommandSpec(FrozenModel):
         has_newline = any(
             "\r" in argument or "\n" in argument for argument in args
         )
-        has_invoke_expression = "invoke-expression" in normalized
+        has_invoke_expression = any(
+            re.match(r"^invoke-expression(?:\s|$)", argument)
+            for argument in normalized
+        )
         has_split_cmd = any(
             command in {"cmd", "cmd.exe"} and option == "/c"
             for command, option in zip(normalized, normalized[1:])
@@ -89,11 +92,17 @@ class CommandSpec(FrozenModel):
             re.search(r"(?i)(?:^|\s)cmd(?:\.exe)?\s+/c(?:\s|$)", argument)
             for argument in args
         )
+        joined = " ".join(args)
+        has_dangerous_command = re.search(
+            r"(?i)(?:;\s+rm|&&\s+rm|\|\s+remove-item)(?:\s|$)",
+            joined,
+        )
         if (
             has_newline
             or has_invoke_expression
             or has_split_cmd
             or has_inline_cmd
+            or has_dangerous_command
         ):
             raise ValueError("参数中禁止换行或 Shell 调用组合")
         return args

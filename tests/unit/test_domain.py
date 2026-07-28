@@ -113,8 +113,16 @@ def test_command_spec_accepts_literal_shell_characters_in_argv(
     "args",
     [
         ("-Command", "InVoKe-ExPrEsSiOn"),
+        ("Invoke-Expression Get-Date",),
+        ("iNvOkE-eXpReSsIoN\tGet-Date",),
         ("cmd", "/C", "echo"),
         ("cmd /c echo",),
+        ("git status; rm x",),
+        ("build && rm x",),
+        ("value | Remove-Item x",),
+        (";", "rm", "x"),
+        ("&&", "rm", "x"),
+        ("|", "Remove-Item", "x"),
     ],
 )
 def test_command_spec_rejects_shell_invocation_arguments(
