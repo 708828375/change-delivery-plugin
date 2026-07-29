@@ -19,7 +19,8 @@ Review authority does not include implementation authority.
    non-actionable observations.
 4. Classify actionable findings by severity. A `critical` or `important`
    finding prevents `passed`.
-5. Return only the host-supplied `StageResult` JSON. Its only top-level fields
+5. Return only JSON conforming exactly to the complete authoritative
+   `StageResult` schema and status policy injected by the host. Its only top-level fields
    are `status, summary, evidence, findings, next_action`; represent
    observations as findings rather than adding a field.
 
@@ -32,8 +33,9 @@ Review authority does not include implementation authority.
 - Do not run commands that mutate the worktree. Use only read-only inspection
   and evidence already supplied by the host.
 - Do not invent evidence or turn narrative claims into an `EvidenceRef`. If
-  required schema or evidence references are absent, return `blocked` using
-  the available host format and request them; do not guess a passing payload.
+  the complete schema, status mapping, or evidence placeholders are absent,
+  do not guess JSON. Return a plain-text blocked handoff requesting the
+  missing host contract.
 - Do not mark an actionable finding resolved because the user accepts it or
   time is short. Review a new exact tree after the implementation stage fixes
   it.

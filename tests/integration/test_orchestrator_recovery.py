@@ -4,12 +4,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from io import StringIO
+import hashlib
 import json
 
 import pytest
 
 import change_delivery.cli as cli_module
 from change_delivery.approval import build_approval, save_approval
+from change_delivery.adapters.codex import CodexAdapter
 from change_delivery.adapters.github import PullRequestRef
 from change_delivery.database import Database
 from change_delivery.cli import CliServices, main
@@ -23,7 +25,7 @@ from change_delivery.domain import (
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessResult
 from change_delivery.repository import RunRepository
-from change_delivery.runtime import RuntimeStageExecutor
+from change_delivery.runtime import RuntimeAcceptancePort, RuntimeStageExecutor
 
 
 SHA = "a" * 40
@@ -375,6 +377,7 @@ def approve_fixture_run(fixture: Fixture) -> tuple[str, Path]:
     )
     approval_file = run_root / "approval.json"
     save_approval(approval_file, snapshot)
+    approval_hash = hashlib.sha256(approval_file.read_bytes()).hexdigest()
     services = CliServices(
         plugin_root=fixture.root,
         repository=fixture.repository,
@@ -386,6 +389,8 @@ def approve_fixture_run(fixture: Fixture) -> tuple[str, Path]:
             run_id,
             "--approval-file",
             str(approval_file),
+            "--confirm-hash",
+            approval_hash,
             "--json",
         ],
         services=services,
@@ -842,6 +847,126 @@ def test_runtime_codex_stage_replaces_untrusted_model_evidence(
     assert json.loads(evidence.payload_json)["artifact_hashes"]
     with pytest.raises(KeyError):
         fixture.repository.get_evidence("model-invented")
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_skill", "expected_role"),
+    [
+        ("implementation", "delivery-implement", "writer"),
+        ("internal_review", "delivery-review", "read_only"),
+        ("review_fix", "delivery-implement", "writer"),
+        (
+            "acceptance",
+            "project-test-acceptance",
+            "writer",
+        ),
+    ],
+)
+def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
+    fixture: Fixture,
+    stage: str,
+    expected_skill: str,
+    expected_role: str,
+) -> None:
+    run_id = fixture.create(RunState.IMPLEMENTING)
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+    captured: list[object] = []
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            captured.append(request)
+            return StageResult(
+                status="blocked",
+                summary="bounded handoff",
+                evidence=(),
+                findings=(),
+                next_action="host decides",
+            )
+
+    executor = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        codex_factory=lambda: FakeCodex(),
+    )
+
+    executor.execute(
+        stage,
+        fixture.repository.get_run(run_id),
+        config(fixture.root),
+        fixture.root / "runs" / run_id,
+    )
+
+    request = captured[0]
+    assert request.expected_skill == expected_skill  # type: ignore[attr-defined]
+    assert request.role == expected_role  # type: ignore[attr-defined]
+    assert json.loads(  # type: ignore[attr-defined]
+        request.result_schema_json
+    ) == StageResult.model_json_schema()
+    assert request.status_policy  # type: ignore[attr-defined]
+    prompt = CodexAdapter._render_prompt(request)  # type: ignore[arg-type]
+    assert f"${expected_skill}" in prompt
+    assert '"EvidenceRef"' in prompt
+    assert '"Finding"' in prompt
+    if stage == "acceptance":
+        assert "ENVIRONMENT_PREEMPTED=blocked" in prompt
+
+    source_root = Path(cli_module.__file__).resolve().parents[2]
+    registry = executor._skill_registry(source_root)
+    assert registry[expected_skill] == (
+        source_root / "skills" / expected_skill
+    ).resolve()
+
+
+def test_runtime_acceptance_port_preserves_blocked_stage_as_nonpassing_fact(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.ACCEPTANCE_TESTING)
+    run = fixture.repository.get_run(run_id)
+
+    class BlockedAcceptanceStage:
+        def execute(
+            self,
+            stage: str,
+            current_run: object,
+            project: object,
+            run_root: Path,
+        ) -> StageResult:
+            del project, run_root
+            assert stage == "acceptance"
+            reference = fixture.repository.register_evidence(
+                run_id,
+                f"codex-stage:{run_id}:acceptance:test",
+                "acceptance_result",
+                {
+                    "sha": current_run.head_sha,  # type: ignore[attr-defined]
+                    "passed": False,
+                    "stage": "acceptance",
+                },
+            )
+            return StageResult(
+                status="blocked",
+                summary="ENVIRONMENT_PREEMPTED",
+                evidence=(reference,),
+                findings=(),
+                next_action="reconcile_environment",
+            )
+
+    port = RuntimeAcceptancePort(
+        fixture.repository,
+        fixture.root,
+        BlockedAcceptanceStage(),  # type: ignore[arg-type]
+    )
+
+    result = port.execute(run, config(fixture.root))
+
+    assert result["passed"] is False
+    assert result["stage_status"] == "blocked"
+    assert port.query(run, config(fixture.root)) == {
+        "sha": SHA,
+        "passed": False,
+        "stage": "acceptance",
+    }
 
 
 def test_cli_release_is_disabled_and_has_no_side_effect(tmp_path: Path) -> None:
@@ -1712,6 +1837,154 @@ def test_cli_start_dry_run_creates_only_draft_artifacts(
     } == {"requirement.md", "design.md", "implementation-plan.md"}
 
 
+def test_cli_start_prepare_and_approve_lifecycle_is_hash_bound(
+    fixture: Fixture,
+) -> None:
+    requirement = fixture.root / "input.md"
+    requirement.write_text("# Requirement\n\nShip safely.", encoding="utf-8")
+
+    class DesignStage:
+        def execute(
+            self,
+            stage: str,
+            run: object,
+            project: object,
+            run_root: Path,
+            **_: object,
+        ) -> StageResult:
+            assert stage == "design"
+            (run_root / "design.md").write_text(
+                "# Design\n\nBounded design.",
+                encoding="utf-8",
+            )
+            (run_root / "implementation-plan.md").write_text(
+                "# Implementation Plan\n\n1. Test first.",
+                encoding="utf-8",
+            )
+            reference = fixture.repository.register_evidence(
+                run.run_id,  # type: ignore[attr-defined]
+                f"design:{run.run_id}",  # type: ignore[attr-defined]
+                "design_passed",
+                {"passed": True, "sha": SHA},
+            )
+            return StageResult(
+                status="passed",
+                summary="design ready",
+                evidence=(reference,),
+                findings=(),
+                next_action="prepare approval",
+            )
+
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        stage_executor=DesignStage(),
+    )
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        orchestrator=orchestrator,
+        base_sha_provider=lambda project: SHA,
+    )
+
+    started = StringIO()
+    assert main(
+        [
+            "start",
+            "--project",
+            "test-project",
+            "--requirement-file",
+            str(requirement),
+            "--json",
+        ],
+        services=services,
+        stdout=started,
+        stderr=StringIO(),
+    ) == 0
+    run_id = json.loads(started.getvalue())["run_id"]
+
+    assert main(
+        ["resume", run_id, "--json"],
+        services=services,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    ) == 0
+    assert (
+        fixture.repository.get_run(run_id).state
+        is RunState.AWAITING_DESIGN_APPROVAL
+    )
+
+    first, second = StringIO(), StringIO()
+    assert main(
+        ["prepare-approval", run_id, "--json"],
+        services=services,
+        stdout=first,
+        stderr=StringIO(),
+    ) == 0
+    events_after_first = fixture.repository.list_events(run_id)
+    approval_bytes = (
+        fixture.root / "runs" / run_id / "approval.json"
+    ).read_bytes()
+    assert main(
+        ["prepare-approval", run_id, "--json"],
+        services=services,
+        stdout=second,
+        stderr=StringIO(),
+    ) == 0
+    prepared = json.loads(first.getvalue())
+    assert json.loads(second.getvalue())["approval_sha256"] == prepared[
+        "approval_sha256"
+    ]
+    assert (
+        fixture.root / "runs" / run_id / "approval.json"
+    ).read_bytes() == approval_bytes
+    assert fixture.repository.list_events(run_id) == events_after_first
+    assert fixture.repository.get_run(run_id).state is RunState.AWAITING_DESIGN_APPROVAL
+
+    wrong_error = StringIO()
+    assert main(
+        [
+            "approve",
+            run_id,
+            "--approval-file",
+            prepared["approval_file"],
+            "--confirm-hash",
+            "0" * 64,
+            "--json",
+        ],
+        services=services,
+        stdout=StringIO(),
+        stderr=wrong_error,
+    ) != 0
+    assert fixture.repository.get_run(run_id).state is RunState.AWAITING_DESIGN_APPROVAL
+
+    approved = StringIO()
+    assert main(
+        [
+            "approve",
+            run_id,
+            "--approval-file",
+            prepared["approval_file"],
+            "--confirm-hash",
+            prepared["approval_sha256"],
+            "--json",
+        ],
+        services=services,
+        stdout=approved,
+        stderr=StringIO(),
+    ) == 0
+    run = fixture.repository.get_run(run_id)
+    assert run.state is RunState.APPROVED
+    assert run.head_sha == SHA
+    assert json.loads(approved.getvalue())["approval_sha256"] == prepared[
+        "approval_sha256"
+    ]
+
+
 def test_monitor_requires_all_six_gates_for_current_head(fixture: Fixture) -> None:
     run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
     with fixture.repository.database.transaction() as connection:
@@ -1838,6 +2111,7 @@ def test_cli_approve_binds_exact_file_and_event_atomically(
     )
     approval_file = run_root / "approval.json"
     save_approval(approval_file, snapshot)
+    approval_hash = hashlib.sha256(approval_file.read_bytes()).hexdigest()
     services = CliServices(
         plugin_root=fixture.root,
         repository=fixture.repository,
@@ -1851,6 +2125,8 @@ def test_cli_approve_binds_exact_file_and_event_atomically(
             run_id,
             "--approval-file",
             str(approval_file),
+            "--confirm-hash",
+            approval_hash,
             "--json",
         ],
         services=services,
@@ -1972,6 +2248,8 @@ def test_cli_approve_rejects_path_escape(fixture: Fixture) -> None:
             run_id,
             "--approval-file",
             str(outside),
+            "--confirm-hash",
+            "0" * 64,
             "--json",
         ],
         services=services,

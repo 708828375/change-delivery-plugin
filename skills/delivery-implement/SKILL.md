@@ -23,9 +23,14 @@ write concurrently.
 4. Run focused validation and inspect the diff. Leave authoritative
    state-machine evidence registration and required-check execution to the
    host orchestrator.
-5. Return only the host-supplied `StageResult` JSON. Use `blocked` when the
+5. Return only JSON conforming exactly to the complete authoritative
+   `StageResult` schema and status policy injected by the host. Use `blocked` when the
    approved artifacts conflict, the worktree is wrong, a required failing test
    cannot be established, or scope must change.
+
+If the host did not inject the complete schema, status mapping, and evidence
+placeholders, do not guess JSON and do not claim completion. Return a plain-text
+blocked handoff requesting the missing host contract.
 
 ## Hard boundaries
 

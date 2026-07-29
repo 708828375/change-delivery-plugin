@@ -15,17 +15,26 @@ these gates.
 2. Identify the project in the global registry. If it is not registered, do
    not edit the project or register it implicitly; produce only a dry-run
    onboarding report and request explicit registration.
-3. Collect requirement, constraints, success criteria, design, and
-   implementation plan. Before explicit approval, make no project writes.
-4. Present the exact approval scope. Use the CLI approval command only after
-   the user approves that scope; approval does not cover later scope growth.
-5. Advance or resume only through `python -m change_delivery ...`. Never
+3. Write the requirement to an absolute file, then start with
+   `python -m change_delivery start --project <project-id> --requirement-file <absolute-path> --json`.
+   Advance design with `python -m change_delivery resume <run-id> --json`.
+4. At `AWAITING_DESIGN_APPROVAL`, run
+   `python -m change_delivery prepare-approval <run-id> --json`. Present the
+   returned exact approval file, artifact scope, and `approval_sha256`. Pause
+   until the user explicitly confirms that hash.
+5. Only after confirmation, run
+   `python -m change_delivery approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json`.
+   A changed file or hash requires a new confirmation.
+6. Advance with `python -m change_delivery resume <run-id> --json`; inspect
+   with `python -m change_delivery status --run-id <run-id> --json` and allow
+   scheduled reconciliation only through `python -m change_delivery tick --json`.
+   Never
    emulate a transition, skip a state, or treat prose as state evidence.
-6. For an implementation stage, explicitly use `$delivery-implement`. For an
+7. For an implementation stage, explicitly use `$delivery-implement`. For an
    internal review stage, explicitly use `$delivery-review`. For ExampleProject
    acceptance, explicitly use `$project-test-acceptance`.
-7. Report blocks and evidence from the returned structured stage result.
-8. At `READY_TO_MERGE`, stop and report the PR and evidence. Do not merge,
+8. Report blocks and evidence from the returned structured stage result.
+9. At `READY_TO_MERGE`, stop and report the PR and evidence. Do not merge,
    release, or invent a later state, even when earlier authorization said to
    complete the whole delivery.
 

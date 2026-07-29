@@ -373,6 +373,17 @@ class StageResult(FrozenModel):
         return self
 
 
+def stage_result_schema_json() -> str:
+    """Return the one canonical compact schema injected into every stage."""
+
+    return json.dumps(
+        StageResult.model_json_schema(),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 class RunRecord(FrozenModel):
     run_id: str
     project_id: str

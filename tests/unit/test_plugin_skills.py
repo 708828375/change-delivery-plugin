@@ -32,6 +32,10 @@ def test_change_delivery_is_explicit_and_enforces_public_entry_gates() -> None:
         "Do not write the state database",
         "--force-with-lease",
         "production",
+        "prepare-approval <run-id> --json",
+        "approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json",
+        "resume <run-id> --json",
+        "status --run-id <run-id> --json",
     ):
         assert required in body
 
@@ -49,6 +53,8 @@ def test_delivery_implement_is_single_writer_tdd_and_worktree_scoped() -> None:
         "StageResult",
         "Do not commit",
         "Do not push",
+        "complete authoritative",
+        "plain-text",
     ):
         assert required in body
 
@@ -69,6 +75,8 @@ def test_delivery_review_is_read_only_and_returns_stage_result() -> None:
         "Do not invent evidence",
         "Do not modify",
         "Do not mark",
+        "complete authoritative",
+        "plain-text",
     ):
         assert required in body
 
@@ -93,6 +101,9 @@ def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:
         "exact resource IDs",
         "Do not write the database",
         "StageResult",
+        "status=blocked",
+        "complete authoritative",
+        "plain-text",
     ):
         assert required in body
     for required in (

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import UTC, datetime
 from uuid import uuid4
 
 from change_delivery.database import Database
+from change_delivery.approval import ApprovalSnapshot
 from change_delivery.domain import (
     EvidenceRecord,
     EvidenceRef,
@@ -724,6 +726,16 @@ class RunRepository:
         approval_sha256: str,
         evidence_id: str,
     ) -> EventRecord:
+        if re.fullmatch(r"[0-9a-f]{64}", approval_sha256) is None:
+            raise ValueError("approval SHA-256 is invalid")
+        snapshot = ApprovalSnapshot.model_validate(approval_payload)
+        if snapshot.run_id != run_id:
+            raise ValueError("approval run identity mismatch")
+        if (
+            snapshot.base_sha != snapshot.base_sha.lower()
+            or re.fullmatch(r"[0-9a-f]{40}", snapshot.base_sha) is None
+        ):
+            raise ValueError("approval base SHA is invalid")
         payload_json = json.dumps(
             approval_payload,
             ensure_ascii=False,
@@ -733,13 +745,7 @@ class RunRepository:
         )
         if sha256_payload(approval_payload) != approval_sha256:
             raise ValueError("approval file digest mismatch")
-        if (
-            not isinstance(approval_payload, dict)
-            or not isinstance(approval_payload.get("base_sha"), str)
-            or len(approval_payload["base_sha"]) != 40
-        ):
-            raise ValueError("approval base SHA is invalid")
-        base_sha = approval_payload["base_sha"].lower()
+        base_sha = snapshot.base_sha
         timestamp = utc_now()
         event_id = new_event_id()
         reference = EvidenceRef(
@@ -749,12 +755,55 @@ class RunRepository:
         )
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT state FROM runs WHERE run_id = ?",
+                """
+                SELECT state, project_id, config_hash, head_sha
+                FROM runs WHERE run_id = ?
+                """,
                 (run_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(run_id)
             current = RunState(row["state"])
+            if (
+                snapshot.project_id != row["project_id"]
+                or snapshot.config_hash != row["config_hash"]
+            ):
+                raise ValueError("approval project or config identity mismatch")
+            if current is RunState.APPROVED:
+                approval = connection.execute(
+                    "SELECT approval_json FROM approvals WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                evidence = connection.execute(
+                    "SELECT * FROM evidence WHERE evidence_id = ?",
+                    (evidence_id,),
+                ).fetchone()
+                events = connection.execute(
+                    """
+                    SELECT * FROM events
+                    WHERE run_id = ? AND event_type = 'DESIGN_APPROVED'
+                    ORDER BY created_at, event_id
+                    """,
+                    (run_id,),
+                ).fetchall()
+                matching_events = [
+                    event
+                    for event in events
+                    if json.loads(event["evidence_json"]) == [evidence_id]
+                ]
+                if (
+                    approval is None
+                    or approval["approval_json"] != payload_json
+                    or evidence is None
+                    or evidence["run_id"] != run_id
+                    or evidence["kind"] != "explicit_approval"
+                    or evidence["payload_json"] != payload_json
+                    or evidence["sha256"] != approval_sha256
+                    or row["head_sha"] != base_sha
+                    or len(matching_events) != 1
+                ):
+                    raise ValueError("approved run has a conflicting audit binding")
+                return EventRecord.model_validate(dict(matching_events[0]))
             assert_transition(
                 current,
                 RunState.APPROVED,
@@ -771,11 +820,16 @@ class RunRepository:
                 approval_sha256,
                 timestamp,
             )
+            existing_approval = connection.execute(
+                "SELECT approval_json FROM approvals WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if existing_approval is not None:
+                raise ValueError("approval row exists before approval transition")
             connection.execute(
                 """
                 INSERT INTO approvals (run_id, approval_json, approved_at)
                 VALUES (?, ?, ?)
-                ON CONFLICT(run_id) DO NOTHING
                 """,
                 (run_id, payload_json, timestamp),
             )

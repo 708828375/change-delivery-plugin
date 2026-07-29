@@ -21,12 +21,18 @@ and apply it to the approved acceptance scope.
    exact run prefix. Record every returned resource type and ID immediately.
 4. Execute only approved deterministic assertions. Recheck both SHA facts
    before and after consequential steps.
-5. If either SHA differs at any time, stop, report
-   `ENVIRONMENT_PREEMPTED`, and do not claim partial results as acceptance.
+5. If either SHA differs at any time, stop and map
+   `ENVIRONMENT_PREEMPTED` to `status=blocked`; do not claim partial results
+   as acceptance.
 6. Clean up only the exact resource IDs recorded by this run, through their
    public API. Verify deletion without widening the selector.
-7. Return only the host-supplied `StageResult` JSON. A pass must reference
-   authoritative SHA, assertion, and cleanup evidence.
+7. Return only JSON conforming exactly to the complete authoritative
+   `StageResult` schema and status policy injected by the host. A pass must
+   reference authoritative SHA, assertion, and cleanup evidence.
+
+If the host did not inject the complete schema, status mapping, and evidence
+placeholders, do not guess JSON. Return a plain-text blocked handoff requesting
+the missing host contract.
 
 ## Hard boundaries
 

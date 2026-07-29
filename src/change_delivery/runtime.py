@@ -17,6 +17,7 @@ from change_delivery.domain import (
     ProjectConfig,
     RunRecord,
     StageResult,
+    stage_result_schema_json,
 )
 from change_delivery.process import ProcessRunner
 from change_delivery.repository import RunRepository
@@ -24,9 +25,10 @@ from change_delivery.repository import RunRepository
 
 _STAGE_SKILLS = {
     "design": "writing-plans",
-    "implementation": "subagent-driven-development",
-    "internal_review": "requesting-code-review",
-    "review_fix": "receiving-code-review",
+    "implementation": "delivery-implement",
+    "internal_review": "delivery-review",
+    "review_fix": "delivery-implement",
+    "acceptance": "project-test-acceptance",
 }
 
 
@@ -102,6 +104,8 @@ class RuntimeStageExecutor:
                 "expand approved scope",
             ),
             expected_skill=_STAGE_SKILLS[stage],
+            result_schema_json=stage_result_schema_json(),
+            status_policy=self._status_policy(stage),
             role=(
                 "read_only"
                 if stage == "internal_review"
@@ -263,24 +267,12 @@ class RuntimeStageExecutor:
         return self._codex_adapter
 
     def _skill_registry(self, source_root: Path) -> dict[str, Path]:
-        profile = Path(os.environ.get("USERPROFILE", str(Path.home())))
         registry: dict[str, Path] = {}
         for name in set(_STAGE_SKILLS.values()):
-            candidates = (
-                source_root / "skills" / name,
-                profile / ".codex" / "skills" / name,
-            )
-            match = next(
-                (
-                    path.resolve()
-                    for path in candidates
-                    if (path / "SKILL.md").is_file()
-                ),
-                None,
-            )
-            if match is None:
+            source = source_root / "skills" / name
+            if not (source / "SKILL.md").is_file():
                 raise RuntimeError(f"approved Codex skill is unavailable: {name}")
-            registry[name] = match
+            registry[name] = source.resolve()
         return registry
 
     def _worktree(self, run_id: str) -> Path:
@@ -377,6 +369,10 @@ class RuntimeStageExecutor:
             "review_fix": (
                 "Apply only actionable CI and review fixes within approved scope."
             ),
+            "acceptance": (
+                "Verify ExampleProject test acceptance for the exact current head. "
+                "Use only approved public API data and exact cleanup."
+            ),
         }[stage]
 
     @staticmethod
@@ -389,23 +385,117 @@ class RuntimeStageExecutor:
                 "write design.md",
                 "write implementation-plan.md",
             )
+        if stage == "acceptance":
+            return (
+                "read registered test SHA facts",
+                "use approved public API temporary data",
+                "clean exact run-owned resource IDs",
+            )
         return ("edit worktree files", "run approved local commands")
+
+    @staticmethod
+    def _status_policy(stage: str) -> str:
+        if stage == "acceptance":
+            return (
+                "passed=all SHA-bound assertions and exact cleanup passed; "
+                "failed=an assertion or cleanup failed; "
+                "blocked=missing authority/dependency/schema or "
+                "ENVIRONMENT_PREEMPTED=blocked"
+            )
+        if stage == "internal_review":
+            return (
+                "passed=no actionable critical/important finding; "
+                "failed=actionable changes required; "
+                "blocked=missing tree/schema/evidence or a decision is required"
+            )
+        return (
+            "passed=approved stage work completed; "
+            "failed=stage work or validation failed; "
+            "blocked=missing authority/dependency/schema or scope conflict"
+        )
 
     @staticmethod
     def _approval_scope(stage: str, run_root: Path) -> str:
         if stage == "design":
             return "Draft artifacts only; explicit approval is still required."
-        parts = []
+        artifacts: dict[str, str] = {}
         for name in (
             "requirement.md",
             "design.md",
             "implementation-plan.md",
         ):
-            parts.append((run_root / name).read_text(encoding="utf-8"))
-        scope = "\n\n".join(parts)
+            artifacts[name] = (run_root / name).read_text(encoding="utf-8")
+        scope = json.dumps(
+            artifacts,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         if len(scope) > 20_000:
             raise ValueError("approved artifacts exceed Codex scope limit")
         return scope
+
+
+class RuntimeAcceptancePort:
+    """Reconcile SHA-bound acceptance facts produced by the acceptance Skill."""
+
+    def __init__(
+        self,
+        repository: RunRepository,
+        plugin_root: Path,
+        stage_executor: RuntimeStageExecutor,
+    ) -> None:
+        self._repository = repository
+        self._plugin_root = plugin_root.resolve()
+        self._stage_executor = stage_executor
+
+    def query(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> dict[str, object] | None:
+        del config
+        for evidence in reversed(self._repository.list_evidence(run.run_id)):
+            if evidence.kind not in {"acceptance_passed", "acceptance_result"}:
+                continue
+            try:
+                payload = json.loads(evidence.payload_json)
+            except json.JSONDecodeError:
+                return None
+            if (
+                type(payload) is dict
+                and payload.get("stage") == "acceptance"
+                and payload.get("sha") == run.head_sha
+                and type(payload.get("passed")) is bool
+            ):
+                return payload
+        return None
+
+    def execute(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> dict[str, object]:
+        run_root = self._plugin_root / "runs" / run.run_id
+        result = self._stage_executor.execute(
+            "acceptance",
+            run,
+            config,
+            run_root,
+        )
+        if len(result.evidence) != 1:
+            raise RuntimeError("acceptance result has no authoritative host evidence")
+        evidence = self._repository.get_evidence(
+            result.evidence[0].evidence_id
+        )
+        payload = json.loads(evidence.payload_json)
+        if type(payload) is not dict:
+            raise RuntimeError("acceptance evidence payload is invalid")
+        return {
+            **payload,
+            "stage_status": result.status,
+            "summary": result.summary,
+        }
 
 
 class RuntimeGitWorkspacePort:

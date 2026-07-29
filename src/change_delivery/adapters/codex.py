@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import contextmanager
+import hmac
 import json
 import os
 from pathlib import Path
@@ -15,9 +16,14 @@ from typing import Iterator, Literal
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator, ValidationError as SchemaValidationError
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
-from change_delivery.domain import CommandSpec, FrozenModel, StageResult
+from change_delivery.domain import (
+    CommandSpec,
+    FrozenModel,
+    StageResult,
+    stage_result_schema_json,
+)
 from change_delivery.errors import BlockedError
 from change_delivery.process import ProcessResult
 
@@ -67,6 +73,8 @@ class StageExecutionRequest(FrozenModel):
         max_length=256,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$",
     )
+    result_schema_json: str = Field(min_length=1, max_length=10_000)
+    status_policy: str = Field(min_length=1, max_length=4_000)
     role: Literal["read_only", "writer"]
     attempt: int = Field(ge=1)
     timeout_seconds: int = Field(default=7200, ge=1, le=7200)
@@ -77,6 +85,8 @@ class StageExecutionRequest(FrozenModel):
         "automation_limit",
         "allowed_actions",
         "forbidden_actions",
+        "result_schema_json",
+        "status_policy",
     )
     @classmethod
     def reject_control_characters(cls, value: object) -> object:
@@ -89,6 +99,15 @@ class StageExecutionRequest(FrozenModel):
         ):
             raise ValueError("stage request text contains invalid control characters")
         return value
+
+    @model_validator(mode="after")
+    def require_canonical_stage_schema(self) -> "StageExecutionRequest":
+        if not hmac.compare_digest(
+            self.result_schema_json,
+            stage_result_schema_json(),
+        ):
+            raise ValueError("stage result schema is not canonical")
+        return self
 
     @field_validator("worktree")
     @classmethod
@@ -426,6 +445,10 @@ class CodexAdapter:
             f"Approval scope: {request.approval_scope} | "
             f"Automation limit: {request.automation_limit} | "
             f"Expected skill: {request.expected_skill} | "
+            f"Invoke exactly: ${request.expected_skill} | "
+            f"Allowed status mapping: {request.status_policy} | "
+            f"Authoritative StageResult JSON Schema: "
+            f"{request.result_schema_json} | "
             f"Allowed actions: {allowed} | "
             f"Forbidden actions: {forbidden} | "
             f"Instructions: {request.instructions} | "

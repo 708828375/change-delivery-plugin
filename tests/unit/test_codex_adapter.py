@@ -16,7 +16,11 @@ from change_delivery.adapters.codex import (
     StageExecutionRequest,
     assert_fix_attempt_allowed,
 )
-from change_delivery.domain import CommandSpec, StageResult
+from change_delivery.domain import (
+    CommandSpec,
+    StageResult,
+    stage_result_schema_json,
+)
 from change_delivery.errors import BlockedError
 from change_delivery.process import ProcessResult
 
@@ -132,6 +136,11 @@ def request(tmp_path: Path, **overrides: object) -> StageExecutionRequest:
         "allowed_actions": ("read files", "run approved checks"),
         "forbidden_actions": ("write files", "use network"),
         "expected_skill": "requesting-code-review",
+        "result_schema_json": stage_result_schema_json(),
+        "status_policy": (
+            "passed=review passed; failed=changes required; "
+            "blocked=missing dependency"
+        ),
         "role": "read_only",
         "attempt": 1,
     }

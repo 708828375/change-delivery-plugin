@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import shutil
 import sys
@@ -18,12 +19,15 @@ import tempfile
 from typing import Any, Iterator, TextIO
 from uuid import uuid4
 
+from filelock import FileLock, Timeout
+
 from change_delivery.config import load_project_config, load_project_config_bytes
 from change_delivery.adapters.git import GitAdapter, GitError
 from change_delivery.adapters.github import GitHubAdapter
 from change_delivery.approval import (
+    ApprovalSnapshot,
     REQUIRED_ARTIFACT_NAMES,
-    load_approval,
+    build_approval,
     save_approval,
     verify_approval,
 )
@@ -34,6 +38,7 @@ from change_delivery.redaction import redact_text
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessRunner
 from change_delivery.runtime import (
+    RuntimeAcceptancePort,
     RuntimeCleanupPort,
     RuntimeCommitPort,
     RuntimeGitWorkspacePort,
@@ -226,11 +231,14 @@ class CliServices:
     ) = None
     orchestrator: Any | None = None
     scheduler: Any | None = None
+    base_sha_provider: Callable[[Any], str] | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = self.plugin_root.resolve(strict=False)
         if self.registration_verifier is None:
             self.registration_verifier = LocalRegistrationVerifier()
+        if self.base_sha_provider is None:
+            self.base_sha_provider = _registered_base_sha
 
     def load_project(self, project_id: str) -> tuple[Any, str]:
         if self.project_loader is not None:
@@ -273,6 +281,11 @@ class CliServices:
                 ),
                 github_factory=_github_port,
                 stage_executor=stage_executor,
+                acceptance_executor=RuntimeAcceptancePort(
+                    repository,
+                    self.plugin_root,
+                    stage_executor,
+                ),
                 worktree_port=workspace,
                 commit_port=RuntimeCommitPort(workspace),
                 cleanup_port=RuntimeCleanupPort(workspace),
@@ -294,6 +307,19 @@ def _default_services() -> CliServices:
     if not profile:
         raise CliUsageError("USERPROFILE is unavailable")
     return CliServices(Path(profile) / ".codex" / "change-delivery")
+
+
+def _registered_base_sha(config: Any) -> str:
+    adapter = GitAdapter(
+        config.repo_path,
+        remote=config.remote,
+        base_branch=config.base_branch,
+        test_branch=config.test_branch,
+        expected_fetch_url=config.remote_fetch_url,
+        expected_push_url=config.remote_push_url,
+    )
+    adapter.fetch(config.remote)
+    return adapter.remote_sha(config.remote, config.base_branch)
 
 
 def _child(root: Path, *parts: str) -> Path:
@@ -377,6 +403,27 @@ def _atomic_write(path: Path, data: bytes) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _require_safe_directory_chain(root: Path, target: Path) -> None:
+    base = root.resolve(strict=True)
+    destination = target.resolve(strict=True)
+    try:
+        relative = destination.relative_to(base)
+    except ValueError as error:
+        raise CliUsageError("run path escapes runtime root") from error
+    current = base
+    for part in relative.parts:
+        current = current / part
+        metadata = current.lstat()
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        if (
+            current.is_symlink()
+            or attributes
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise CliUsageError("run path must use non-reparse directories")
+
+
 def _parser() -> JsonArgumentParser:
     parser = JsonArgumentParser(
         prog="change-delivery",
@@ -400,6 +447,9 @@ def _parser() -> JsonArgumentParser:
     approve = command("approve")
     approve.add_argument("run_id")
     approve.add_argument("--approval-file", type=Path, required=True)
+    approve.add_argument("--confirm-hash", required=True)
+    prepare_approval = command("prepare-approval")
+    prepare_approval.add_argument("run_id")
     status = command("status")
     status.add_argument("--run-id")
     resume = command("resume")
@@ -488,10 +538,129 @@ def _status(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     }
 
 
-def _approve(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
+def _approval_identity_matches(
+    snapshot: ApprovalSnapshot,
+    run: Any,
+    project: Any,
+) -> bool:
+    return (
+        snapshot.run_id == run.run_id
+        and snapshot.project_id == run.project_id
+        and snapshot.base_branch == project.base_branch
+        and snapshot.test_branch == project.test_branch
+        and hmac.compare_digest(snapshot.config_hash, run.config_hash)
+    )
+
+
+@contextmanager
+def _approval_run_lock(
+    services: CliServices,
+    run_id: str,
+) -> Iterator[None]:
+    lock_root = _child(services.plugin_root, "locks")
+    lock_root.mkdir(parents=True, exist_ok=True)
+    _require_safe_directory_chain(services.plugin_root, lock_root)
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+    try:
+        with FileLock(lock_root / f"approval-{digest}.lock", timeout=30):
+            yield
+    except Timeout as error:
+        raise CliUsageError("approval operation is already in progress") from error
+
+
+def _prepare_approval(
+    args: argparse.Namespace,
+    services: CliServices,
+) -> dict[str, Any]:
+    with _approval_run_lock(services, args.run_id):
+        return _prepare_approval_locked(args, services)
+
+
+def _prepare_approval_locked(
+    args: argparse.Namespace,
+    services: CliServices,
+) -> dict[str, Any]:
     repository = services.get_repository()
     run = repository.get_run(args.run_id)
     if run.state is not RunState.AWAITING_DESIGN_APPROVAL:
+        raise CliUsageError("run is not awaiting design approval")
+    run_root = _child(services.plugin_root, "runs", run.run_id)
+    _require_safe_directory_chain(services.plugin_root, run_root)
+    project, digest = services.load_project(run.project_id)
+    if not hmac.compare_digest(digest, run.config_hash):
+        raise CliUsageError("project configuration hash changed")
+    artifacts = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
+    destination = run_root / "approval.json"
+    if destination.exists():
+        contents = _stable_read(destination, limit=MAX_REQUIREMENT_BYTES)
+        try:
+            snapshot = ApprovalSnapshot.model_validate(json.loads(contents))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise CliUsageError(
+                "existing approval candidate is invalid; refusing overwrite"
+            ) from error
+        if (
+            not _approval_identity_matches(snapshot, run, project)
+            or not verify_approval(snapshot, artifacts, run.config_hash)
+        ):
+            raise CliUsageError(
+                "existing approval candidate is stale; refusing overwrite"
+            )
+    else:
+        assert services.base_sha_provider is not None
+        base_sha = services.base_sha_provider(project)
+        if (
+            not isinstance(base_sha, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40}", base_sha) is None
+        ):
+            raise CliUsageError("registered base SHA is invalid")
+        snapshot = build_approval(
+            run_id=run.run_id,
+            project_id=run.project_id,
+            config_hash=run.config_hash,
+            base_branch=project.base_branch,
+            base_sha=base_sha.lower(),
+            test_branch=project.test_branch,
+            files=artifacts,
+        )
+        if not verify_approval(snapshot, artifacts, run.config_hash):
+            raise CliUsageError("approval artifacts changed during preparation")
+        save_approval(destination, snapshot)
+        contents = _stable_read(destination, limit=MAX_REQUIREMENT_BYTES)
+        persisted = ApprovalSnapshot.model_validate(json.loads(contents))
+        if (
+            persisted != snapshot
+            or not verify_approval(persisted, artifacts, run.config_hash)
+        ):
+            raise CliUsageError("persisted approval candidate is not stable")
+    file_sha = hashlib.sha256(contents).hexdigest()
+    return {
+        "ok": True,
+        "run_id": run.run_id,
+        "state": run.state.value,
+        "approval_file": str(destination.resolve(strict=True)),
+        "approval_sha256": file_sha,
+        "approved": False,
+    }
+
+
+def _approve(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
+    if re.fullmatch(r"[0-9a-f]{64}", args.confirm_hash) is None:
+        raise CliUsageError("confirmation hash must be 64 lowercase hex characters")
+    with _approval_run_lock(services, args.run_id):
+        return _approve_locked(args, services)
+
+
+def _approve_locked(
+    args: argparse.Namespace,
+    services: CliServices,
+) -> dict[str, Any]:
+    repository = services.get_repository()
+    run = repository.get_run(args.run_id)
+    if run.state not in {
+        RunState.AWAITING_DESIGN_APPROVAL,
+        RunState.APPROVED,
+    }:
         raise CliUsageError("run is not awaiting design approval")
     run_root = _child(services.plugin_root, "runs", run.run_id)
     expected = run_root / "approval.json"
@@ -504,20 +673,16 @@ def _approve(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     project, digest = services.load_project(run.project_id)
     if not hmac.compare_digest(digest, run.config_hash):
         raise CliUsageError("project configuration hash changed")
-    snapshot = load_approval(expected)
-    if (
-        snapshot.run_id != run.run_id
-        or snapshot.project_id != run.project_id
-        or snapshot.base_branch != project.base_branch
-        or snapshot.test_branch != project.test_branch
-    ):
+    contents = _stable_read(expected, limit=MAX_REQUIREMENT_BYTES)
+    file_sha = hashlib.sha256(contents).hexdigest()
+    if not hmac.compare_digest(args.confirm_hash, file_sha):
+        raise CliUsageError("confirmation hash does not match approval candidate")
+    snapshot = ApprovalSnapshot.model_validate(json.loads(contents))
+    if not _approval_identity_matches(snapshot, run, project):
         raise CliUsageError("approval identity does not match run")
     artifacts = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
     if not verify_approval(snapshot, artifacts, run.config_hash):
         raise CliUsageError("approval snapshot or artifacts changed")
-    save_approval(expected, snapshot)
-    contents = _stable_read(expected, limit=MAX_REQUIREMENT_BYTES)
-    file_sha = hashlib.sha256(contents).hexdigest()
     payload = json.loads(contents)
     repository.approve_with_evidence(
         run.run_id,
@@ -530,6 +695,7 @@ def _approve(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         "run_id": run.run_id,
         "state": RunState.APPROVED.value,
         "approval_sha256": file_sha,
+        "idempotent": run.state is RunState.APPROVED,
     }
 
 
@@ -588,6 +754,8 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         return _register(args, services)
     if args.command == "status":
         return _status(args, services)
+    if args.command == "prepare-approval":
+        return _prepare_approval(args, services)
     if args.command == "approve":
         return _approve(args, services)
     if args.command == "resume":
