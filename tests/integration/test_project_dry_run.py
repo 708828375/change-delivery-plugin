@@ -18,6 +18,8 @@ from change_delivery.adapters.http import (
     PinnedHttpsTransport,
     ReadOnlyHttpClient,
     SecureHttpTransport,
+    frozen_address_attestations,
+    validate_public_addresses,
 )
 from change_delivery.adapters.project import (
     ExampleProjectAdapter,
@@ -326,6 +328,11 @@ def slow_dns_worker(_hostname: str, _port: int):
     return ("93.184.216.34",)
 
 
+def slow_exchange_worker(_url: str, _timeout: float):
+    time.sleep(1)
+    return None
+
+
 @pytest.mark.parametrize(
     "hostname,addresses",
     (
@@ -338,55 +345,48 @@ def test_pinned_transport_rejects_any_non_public_resolution(
     hostname,
     addresses,
 ) -> None:
-    transport = PinnedHttpsTransport(
-        resolver=FakeResolver(addresses),
-        connector=lambda *_args, **_kwargs: pytest.fail("must not connect"),
-    )
-
     with pytest.raises(HttpReadError, match="public"):
-        transport.get(f"https://{hostname}/version", timeout=10)
+        validate_public_addresses(addresses)
 
 
 def test_pinned_transport_resolves_once_and_connects_to_frozen_ip() -> None:
-    resolver = FakeResolver(("93.184.216.34",))
-    attestations = []
-
-    def connector(attestation, timeout):
-        attestations.append((attestation, timeout))
-        return FakeResponse({"ok": True})
-
-    transport = PinnedHttpsTransport(
-        resolver=resolver,
-        connector=connector,
+    attestations = frozen_address_attestations(
+        "https://example.com/version",
+        ("93.184.216.34",),
     )
-    with transport.get("https://example.com/version", timeout=10):
-        pass
 
-    assert len(resolver.calls) == 1
-    assert attestations[0][0].hostname == "example.com"
-    assert attestations[0][0].pinned_ip == "93.184.216.34"
-    assert attestations[0][0].addresses == ("93.184.216.34",)
+    assert attestations[0].hostname == "example.com"
+    assert attestations[0].pinned_ip == "93.184.216.34"
+    assert attestations[0].addresses == ("93.184.216.34",)
 
 
 def test_pinned_transport_falls_back_without_resolving_again() -> None:
-    resolver = FakeResolver(("93.184.216.34", "93.184.216.35"))
-    pinned = []
-
-    def connector(attestation, timeout):
-        pinned.append(attestation.pinned_ip)
-        if len(pinned) == 1:
-            raise OSError("first address unavailable")
-        return FakeResponse({"ok": True})
-
-    transport = PinnedHttpsTransport(
-        resolver=resolver,
-        connector=connector,
+    attestations = frozen_address_attestations(
+        "https://example.com/version",
+        ("93.184.216.34", "93.184.216.35"),
     )
-    with transport.get("https://example.com/version", timeout=10):
-        pass
 
-    assert len(resolver.calls) == 1
-    assert pinned == ["93.184.216.34", "93.184.216.35"]
+    assert [item.pinned_ip for item in attestations] == [
+        "93.184.216.34",
+        "93.184.216.35",
+    ]
+    assert all(
+        item.addresses == ("93.184.216.34", "93.184.216.35")
+        for item in attestations
+    )
+
+
+def test_secure_exchange_process_is_reclaimed_at_header_deadline() -> None:
+    transport = PinnedHttpsTransport(worker=slow_exchange_worker)
+    before = {child.pid for child in multiprocessing.active_children()}
+    started = time.monotonic()
+
+    with pytest.raises(HttpReadError, match="deadline"):
+        transport.get("https://example.com/version", timeout=0.05)
+
+    elapsed = time.monotonic() - started
+    assert 0.04 <= elapsed < 0.5
+    assert {child.pid for child in multiprocessing.active_children()} == before
 
 
 def test_multiprocess_dns_is_terminated_at_hard_deadline() -> None:

@@ -70,7 +70,6 @@ class AddressAttestation:
     pinned_ip: str
 
 
-Connector = Callable[[AddressAttestation, float], SecureHttpResponse]
 _MAX_BODY_BYTES = 65_536
 _MAX_RETRY_AFTER_SECONDS = 5.0
 _RETRYABLE_HTTP_STATUS = frozenset({408, 429})
@@ -92,6 +91,41 @@ def validate_read_url(url: str) -> None:
         return
     if not address.is_global:
         raise ValueError("non-global IP literals are forbidden")
+
+
+def validate_public_addresses(addresses: tuple[str, ...]) -> tuple[str, ...]:
+    if not addresses:
+        raise HttpReadError("HTTPS hostname returned no addresses")
+    try:
+        parsed = tuple(ipaddress.ip_address(address) for address in addresses)
+    except ValueError as error:
+        raise HttpReadError("HTTPS resolver returned an invalid address") from error
+    if any(not address.is_global for address in parsed):
+        raise HttpReadError("HTTPS hostname must resolve only to public addresses")
+    return tuple(str(address) for address in parsed)
+
+
+def frozen_address_attestations(
+    url: str,
+    addresses: tuple[str, ...],
+) -> tuple[AddressAttestation, ...]:
+    validate_read_url(url)
+    parsed = urlsplit(url)
+    assert parsed.hostname is not None
+    frozen = validate_public_addresses(tuple(dict.fromkeys(addresses)))
+    port = parsed.port or 443
+    path = parsed.path or "/"
+    return tuple(
+        AddressAttestation(
+            url=url,
+            hostname=parsed.hostname,
+            port=port,
+            path=path,
+            addresses=frozen,
+            pinned_ip=address,
+        )
+        for address in frozen
+    )
 
 
 def _system_dns_worker(hostname: str, port: int) -> tuple[str, ...]:
@@ -166,6 +200,152 @@ class MultiprocessAddressResolver(AddressResolver):
                 process.join()
 
 
+def _read_exchange_body(
+    connection: _PinnedHTTPSConnection,
+    response: http.client.HTTPResponse,
+    deadline: float,
+) -> bytes:
+    raw_length = response.headers.get("Content-Length")
+    if raw_length is not None:
+        try:
+            declared = int(raw_length)
+        except ValueError as error:
+            raise HttpReadError("invalid Content-Length") from error
+        if declared < 0 or declared > _MAX_BODY_BYTES:
+            raise HttpReadError("GET response body is too large")
+    read1 = getattr(response, "read1", None)
+    if not callable(read1):
+        raise HttpReadError("HTTP response lacks single-read support")
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or connection.sock is None:
+            raise HttpReadError("HTTPS exchange exceeded hard deadline")
+        connection.sock.settimeout(remaining)
+        chunk = read1(min(4096, _MAX_BODY_BYTES + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > _MAX_BODY_BYTES:
+            raise HttpReadError("GET response body is too large")
+        chunks.append(chunk)
+
+
+def _secure_exchange_worker(url: str, timeout: float) -> dict[str, object]:
+    validate_read_url(url)
+    deadline = time.monotonic() + timeout
+    parsed = urlsplit(url)
+    assert parsed.hostname is not None
+    addresses = _system_dns_worker(parsed.hostname, parsed.port or 443)
+    attestations = frozen_address_attestations(url, addresses)
+    last_error: OSError | None = None
+    for attestation in attestations:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HttpReadError("HTTPS exchange exceeded hard deadline")
+        connection = _PinnedHTTPSConnection(
+            attestation.hostname,
+            attestation.pinned_ip,
+            attestation.port,
+            remaining,
+        )
+        try:
+            connection.request("GET", attestation.path)
+            if connection.sock is None:
+                raise HttpReadError("HTTPS socket is unavailable")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HttpReadError("HTTPS exchange exceeded hard deadline")
+            connection.sock.settimeout(remaining)
+            response = connection.getresponse()
+            safe_headers = {
+                key: value
+                for key in ("Content-Length", "Retry-After")
+                if (value := response.headers.get(key)) is not None
+            }
+            body = (
+                b""
+                if 300 <= response.status < 400
+                else _read_exchange_body(connection, response, deadline)
+            )
+            return {
+                "status": response.status,
+                "headers": safe_headers,
+                "body": body,
+                "url": url,
+            }
+        except OSError as error:
+            last_error = error
+        finally:
+            connection.close()
+    raise HttpReadError(
+        "HTTPS connection failed for all frozen addresses"
+    ) from last_error
+
+
+def _exchange_process(
+    sender: object,
+    worker: Callable[[str, float], dict[str, object]],
+    url: str,
+    timeout: float,
+) -> None:
+    try:
+        sender.send(("ok", worker(url, timeout)))
+    except BaseException as error:
+        sender.send(("error", type(error).__name__))
+    finally:
+        sender.close()
+
+
+class _BufferedSecureResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        status = payload.get("status")
+        headers = payload.get("headers")
+        body = payload.get("body")
+        url = payload.get("url")
+        if (
+            not isinstance(status, int)
+            or not isinstance(headers, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in headers.items()
+            )
+            or not isinstance(body, bytes)
+            or len(body) > _MAX_BODY_BYTES
+            or not isinstance(url, str)
+        ):
+            raise HttpReadError("secure exchange returned invalid output")
+        self.status = status
+        self.headers = headers
+        self._body = body
+        self._url = url
+        self._offset = 0
+
+    def __enter__(self) -> _BufferedSecureResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self.read1(size)
+
+    def read1(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._body) - self._offset
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+    def geturl(self) -> str:
+        return self._url
+
+    def set_read_timeout(self, timeout: float) -> None:
+        if timeout <= 0:
+            raise HttpReadError("GET exceeded total deadline")
+
+
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(
         self,
@@ -194,127 +374,44 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         )
 
 
-class _LiveResponse:
-    def __init__(
-        self,
-        connection: _PinnedHTTPSConnection,
-        response: http.client.HTTPResponse,
-        url: str,
-    ) -> None:
-        self._connection = connection
-        self._response = response
-        self._url = url
-        self.status = response.status
-        self.headers = response.headers
-
-    def __enter__(self) -> _LiveResponse:
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self._connection.close()
-
-    def read(self, size: int = -1) -> bytes:
-        return self._response.read(size)
-
-    def read1(self, size: int = -1) -> bytes:
-        read1 = getattr(self._response, "read1", None)
-        if not callable(read1):
-            raise HttpReadError("HTTP response lacks single-read support")
-        return read1(size)
-
-    def geturl(self) -> str:
-        return self._url
-
-    def set_read_timeout(self, timeout: float) -> None:
-        stream = getattr(self._response, "fp", None)
-        raw = getattr(stream, "raw", None)
-        sock = getattr(raw, "_sock", None)
-        if sock is None or not hasattr(sock, "settimeout"):
-            raise HttpReadError("transport cannot enforce read deadline")
-        sock.settimeout(timeout)
-
-
-def _connect_pinned(
-    attestation: AddressAttestation,
-    timeout: float,
-) -> SecureHttpResponse:
-    connection = _PinnedHTTPSConnection(
-        attestation.hostname,
-        attestation.pinned_ip,
-        attestation.port,
-        timeout,
-    )
-    try:
-        connection.request("GET", attestation.path)
-        response = connection.getresponse()
-    except Exception:
-        connection.close()
-        raise
-    return _LiveResponse(connection, response, attestation.url)
-
-
 class PinnedHttpsTransport(SecureHttpTransport):
     def __init__(
         self,
         *,
-        resolver: AddressResolver | None = None,
-        connector: Connector = _connect_pinned,
-        monotonic: Callable[[], float] = time.monotonic,
+        worker: Callable[[str, float], dict[str, object]] = _secure_exchange_worker,
     ) -> None:
-        selected = resolver or MultiprocessAddressResolver()
-        if not isinstance(selected, AddressResolver):
-            raise TypeError("resolver must enforce an absolute deadline")
-        self._resolver = selected
-        self._connector = connector
-        self._monotonic = monotonic
+        self._worker = worker
 
     def get(self, url: str, *, timeout: float) -> SecureHttpResponse:
         validate_read_url(url)
-        parsed = urlsplit(url)
-        assert parsed.hostname is not None
-        port = parsed.port or 443
-        deadline = self._monotonic() + timeout
+        if timeout <= 0:
+            raise HttpReadError("HTTPS exchange exceeded hard deadline")
+        context = multiprocessing.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_exchange_process,
+            args=(sender, self._worker, url, timeout),
+            daemon=True,
+        )
+        started = time.monotonic()
+        process.start()
+        sender.close()
         try:
-            addresses = self._resolver.resolve(
-                parsed.hostname,
-                port,
-                deadline=deadline,
-            )
-        except OSError as error:
-            raise HttpReadError("HTTPS hostname resolution failed") from error
-        addresses = tuple(dict.fromkeys(addresses))
-        if not addresses:
-            raise HttpReadError("HTTPS hostname returned no addresses")
-        try:
-            parsed_addresses = tuple(
-                ipaddress.ip_address(address) for address in addresses
-            )
-        except ValueError as error:
-            raise HttpReadError("HTTPS resolver returned an invalid address") from error
-        if any(not address.is_global for address in parsed_addresses):
-            raise HttpReadError("HTTPS hostname must resolve only to public addresses")
-        path = parsed.path or "/"
-        frozen_addresses = tuple(str(address) for address in parsed_addresses)
-        last_error: OSError | None = None
-        for address in frozen_addresses:
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                raise HttpReadError("HTTPS connect exceeded hard deadline")
-            attestation = AddressAttestation(
-                url=url,
-                hostname=parsed.hostname,
-                port=port,
-                path=path,
-                addresses=frozen_addresses,
-                pinned_ip=address,
-            )
-            try:
-                return self._connector(attestation, remaining)
-            except OSError as error:
-                last_error = error
-        raise HttpReadError(
-            "HTTPS connection failed for all frozen addresses"
-        ) from last_error
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0 or not receiver.poll(remaining):
+                raise HttpReadError("HTTPS exchange exceeded hard deadline")
+            status, payload = receiver.recv()
+            if status != "ok" or not isinstance(payload, dict):
+                raise HttpReadError("secure HTTPS exchange failed")
+            return _BufferedSecureResponse(payload)
+        finally:
+            receiver.close()
+            if process.is_alive():
+                process.terminate()
+            process.join(0.5)
+            if process.is_alive():
+                process.kill()
+                process.join()
 
 
 class ReadOnlyHttpClient:
