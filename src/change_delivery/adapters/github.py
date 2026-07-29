@@ -79,8 +79,12 @@ class RemoteOperationUncertain(GitHubError):
     """A remote write may have succeeded and must not be blindly replayed."""
 
 
-class HeadChanged(GitHubError):
-    """The pull request head changed while evidence was being collected."""
+class SnapshotChanged(GitHubError):
+    """Pull request gate evidence changed while it was being collected."""
+
+
+# Backward-compatible name for callers that only distinguished head changes.
+HeadChanged = SnapshotChanged
 
 
 class PullRequestRef(FrozenModel):
@@ -327,14 +331,19 @@ class GitHubAdapter:
 
     def snapshot(self, pr_number: int) -> CheckSnapshot:
         _validate_number(pr_number)
-        before_payload = self._snapshot_payload(pr_number)
-        before_sha = self._payload_sha(before_payload, "snapshot")
-        threads = self._query_threads(pr_number)
-        after_payload = self._snapshot_payload(pr_number)
-        after_sha = self._payload_sha(after_payload, "snapshot")
-        if before_sha != after_sha:
-            raise HeadChanged("snapshot", "pull request head changed")
-        return self.parse_snapshot(before_payload, threads)
+        first_payload, first_threads = self._snapshot_sample(pr_number)
+        second_payload, second_threads = self._snapshot_sample(pr_number)
+        if (
+            self._gate_fingerprint(first_payload)
+            != self._gate_fingerprint(second_payload)
+            or self._thread_fingerprint(first_threads)
+            != self._thread_fingerprint(second_threads)
+        ):
+            raise SnapshotChanged(
+                "snapshot",
+                "pull request gate evidence changed",
+            )
+        return self.parse_snapshot(second_payload, second_threads)
 
     def parse_snapshot(
         self,
@@ -429,8 +438,6 @@ class GitHubAdapter:
         args = (
             "api",
             "graphql",
-            "--repo",
-            self._repository,
             "-f",
             f"query={_REPLY_MUTATION}",
             "-f",
@@ -494,8 +501,13 @@ class GitHubAdapter:
             ) from None
         if view_result.exit_code == 0:
             ref = self._parse_pr(_json_object(view_result, "view_pr"))
-            self._require_pr_identity(ref, head, base)
-            return ref
+            if ref.head != head:
+                raise GitHubError(
+                    "locate_pr",
+                    "pull request identity did not match",
+                )
+            if ref.base == base:
+                return ref
 
         try:
             list_result = self._execute(
@@ -651,11 +663,27 @@ class GitHubAdapter:
 
     @staticmethod
     def _checks_passed(raw_checks: Any) -> bool:
+        normalized = GitHubAdapter._normalize_checks(raw_checks)
+        if not normalized:
+            return False
+        return all(
+            (
+                entry[0] == "CheckRun"
+                and entry[3] == "COMPLETED"
+                and entry[4] == "SUCCESS"
+            )
+            or (
+                entry[0] == "StatusContext"
+                and entry[3] == "SUCCESS"
+            )
+            for entry in normalized
+        )
+
+    @staticmethod
+    def _normalize_checks(raw_checks: Any) -> tuple[tuple[str, ...], ...]:
         if not isinstance(raw_checks, list):
             raise GitHubError("snapshot", "check rollup was invalid")
-        if not raw_checks:
-            return False
-        all_success = True
+        normalized: list[tuple[str, ...]] = []
         for raw in raw_checks:
             if not isinstance(raw, dict):
                 raise GitHubError("snapshot", "check entry was invalid")
@@ -676,10 +704,17 @@ class GitHubAdapter:
                     raise GitHubError("snapshot", "unknown check status")
                 if conclusion is not None and conclusion not in _KNOWN_CHECK_CONCLUSIONS:
                     raise GitHubError("snapshot", "unknown check conclusion")
-                all_success = (
-                    all_success
-                    and status == "COMPLETED"
-                    and conclusion == "SUCCESS"
+                workflow_name = raw.get("workflowName")
+                if workflow_name is not None and not isinstance(workflow_name, str):
+                    raise GitHubError("snapshot", "check workflow was invalid")
+                normalized.append(
+                    (
+                        "CheckRun",
+                        workflow_name or "",
+                        raw["name"],
+                        status,
+                        conclusion or "",
+                    )
                 )
             elif typename == "StatusContext":
                 if not {
@@ -699,10 +734,18 @@ class GitHubAdapter:
                     "EXPECTED",
                 }:
                     raise GitHubError("snapshot", "unknown status context state")
-                all_success = all_success and state == "SUCCESS"
+                normalized.append(
+                    (
+                        "StatusContext",
+                        "",
+                        raw["context"],
+                        state,
+                        "",
+                    )
+                )
             else:
                 raise GitHubError("snapshot", "unknown check entry type")
-        return all_success
+        return tuple(sorted(normalized))
 
     def _query_threads(self, pr_number: int) -> tuple[ReviewThread, ...]:
         try:
@@ -710,8 +753,6 @@ class GitHubAdapter:
                 (
                     "api",
                     "graphql",
-                    "--repo",
-                    self._repository,
                     "-f",
                     f"query={_THREAD_QUERY}",
                     "-F",
@@ -776,6 +817,48 @@ class GitHubAdapter:
                 "review thread result was incomplete",
             )
         return tuple(self._parse_thread(node) for node in nodes)
+
+    def _snapshot_sample(
+        self,
+        pr_number: int,
+    ) -> tuple[dict[str, Any], tuple[ReviewThread, ...]]:
+        payload = self._snapshot_payload(pr_number)
+        threads = self._query_threads(pr_number)
+        # Validate every sample before it participates in comparison.
+        self.parse_snapshot(payload, threads)
+        return payload, threads
+
+    def _gate_fingerprint(
+        self,
+        payload: Mapping[str, Any],
+    ) -> tuple[object, ...]:
+        # parse_snapshot validates all gate fields and unknown states.
+        self.parse_snapshot(payload, ())
+        return (
+            self._payload_sha(payload, "snapshot"),
+            payload["mergeable"],
+            payload["reviewDecision"],
+            payload["isDraft"],
+            self._normalize_checks(payload["statusCheckRollup"]),
+        )
+
+    @staticmethod
+    def _thread_fingerprint(
+        threads: Sequence[ReviewThread],
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            sorted(
+                (
+                    thread.thread_id,
+                    thread.resolved,
+                    thread.outdated,
+                    thread.path,
+                    thread.line,
+                    thread.comments,
+                )
+                for thread in threads
+            )
+        )
 
     @staticmethod
     def _parse_thread(payload: Any) -> ReviewThread:

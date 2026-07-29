@@ -14,6 +14,7 @@ from change_delivery.adapters.github import (
     PullRequestRef,
     RemoteOperationUncertain,
     ReviewThread,
+    SnapshotChanged,
 )
 from change_delivery.domain import CommandSpec, ProjectConfig
 from change_delivery.process import ProcessResult, ProcessTimeoutError
@@ -255,14 +256,41 @@ def test_ensure_draft_pr_reuses_existing_ready_pr_with_safe_command(
     assert command.env_names == ("GH_TOKEN", "GITHUB_TOKEN")
 
 
-def test_existing_pr_must_match_requested_head_and_base(tmp_path: Path) -> None:
-    runner = FakeRunner(result(pr_payload(base="main")))
+def test_view_same_head_wrong_base_falls_back_to_exact_list(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        result(pr_payload(base="main")),
+        result([pr_payload(base="develop")]),
+    )
     adapter = GitHubAdapter(runner, project_config(tmp_path))
 
-    with pytest.raises(GitHubError, match="identity"):
-        adapter.ensure_draft_pr("feature/cd-test", "develop", "title", "body")
+    ref = adapter.ensure_draft_pr("feature/cd-test", "develop", "title", "body")
 
-    assert len(runner.commands) == 1
+    assert ref.base == "develop"
+    assert len(runner.commands) == 2
+    assert runner.commands[1].args[:7] == (
+        "pr",
+        "list",
+        "--head",
+        "feature/cd-test",
+        "--base",
+        "develop",
+        "--state",
+    )
+
+
+def test_wrong_base_view_and_empty_exact_list_may_create(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        result(pr_payload(base="main")),
+        result([]),
+        result("created"),
+        result(pr_payload(base="develop")),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    ref = adapter.ensure_draft_pr("feature/cd-test", "develop", "title", "body")
+
+    assert ref.base == "develop"
+    assert sum(command.args[:2] == ("pr", "create") for command in runner.commands) == 1
 
 
 def test_pr_parser_does_not_coerce_numeric_sha_to_text(tmp_path: Path) -> None:
@@ -558,6 +586,7 @@ def test_snapshot_binds_pr_and_threads_to_unchanged_head(tmp_path: Path) -> None
         result(snapshot_payload()),
         result(graphql_payload(thread_payload(resolved=True))),
         result(snapshot_payload()),
+        result(graphql_payload(thread_payload(resolved=True))),
     )
     adapter = GitHubAdapter(runner, project_config(tmp_path))
 
@@ -565,9 +594,12 @@ def test_snapshot_binds_pr_and_threads_to_unchanged_head(tmp_path: Path) -> None
 
     assert snapshot.head_sha == SHA
     assert snapshot.threads_resolved
-    assert len(runner.commands) == 3
-    assert runner.commands[1].args[:3] == ("api", "graphql", "--repo")
-    assert all("--repo" in command.args for command in runner.commands)
+    assert len(runner.commands) == 4
+    assert runner.commands[1].args[:2] == ("api", "graphql")
+    assert "--repo" in runner.commands[0].args
+    assert "--repo" not in runner.commands[1].args
+    assert "--repo" in runner.commands[2].args
+    assert "--repo" not in runner.commands[3].args
 
 
 def test_snapshot_rejects_head_change_instead_of_mixing_evidence(
@@ -577,11 +609,75 @@ def test_snapshot_rejects_head_change_instead_of_mixing_evidence(
         result(snapshot_payload()),
         result(graphql_payload()),
         result(snapshot_payload(sha=OTHER_SHA)),
+        result(graphql_payload()),
     )
     adapter = GitHubAdapter(runner, project_config(tmp_path))
 
     with pytest.raises(HeadChanged):
         adapter.snapshot(152)
+
+
+@pytest.mark.parametrize(
+    "second_payload",
+    [
+        snapshot_payload(review_decision="CHANGES_REQUESTED"),
+        snapshot_payload(conclusions=("FAILURE",)),
+        snapshot_payload(mergeable="CONFLICTING"),
+        snapshot_payload(is_draft=True),
+    ],
+    ids=["review", "check", "mergeable", "draft"],
+)
+def test_snapshot_rejects_same_sha_gate_change(
+    tmp_path: Path,
+    second_payload: dict[str, object],
+) -> None:
+    runner = FakeRunner(
+        result(snapshot_payload()),
+        result(graphql_payload()),
+        result(second_payload),
+        result(graphql_payload()),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    with pytest.raises(SnapshotChanged):
+        adapter.snapshot(152)
+
+
+def test_snapshot_rejects_same_sha_thread_state_change(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        result(snapshot_payload()),
+        result(graphql_payload(thread_payload(resolved=False))),
+        result(snapshot_payload()),
+        result(graphql_payload(thread_payload(resolved=True))),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    with pytest.raises(SnapshotChanged):
+        adapter.snapshot(152)
+
+
+def test_snapshot_ignores_nonsemantic_check_metadata_change(tmp_path: Path) -> None:
+    first = snapshot_payload()
+    second = snapshot_payload()
+    first_check = first["statusCheckRollup"][0]
+    second_check = second["statusCheckRollup"][0]
+    assert isinstance(first_check, dict)
+    assert isinstance(second_check, dict)
+    first_check["detailsUrl"] = "https://example.invalid/old"
+    first_check["completedAt"] = "2026-07-29T00:00:00Z"
+    second_check["detailsUrl"] = "https://example.invalid/new"
+    second_check["completedAt"] = "2026-07-29T00:00:01Z"
+    runner = FakeRunner(
+        result(first),
+        result(graphql_payload()),
+        result(second),
+        result(graphql_payload()),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    snapshot = adapter.snapshot(152)
+
+    assert snapshot.ready_to_merge
 
 
 def test_list_actionable_reviews_filters_and_sorts_by_stable_id(
@@ -693,6 +789,22 @@ def test_graphql_errors_or_incomplete_pagination_fail_closed(
         adapter.list_actionable_reviews(152)
 
 
+def test_graphql_command_contract_uses_variables_without_unsupported_repo_flag(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(result(graphql_payload()))
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    assert adapter.list_actionable_reviews(152) == ()
+
+    args = runner.commands[0].args
+    assert args[:2] == ("api", "graphql")
+    assert "--repo" not in args
+    assert "owner=owner" in args
+    assert "name=repo" in args
+    assert "number=152" in args
+
+
 def test_reply_to_thread_uses_stable_id_and_direct_argv(tmp_path: Path) -> None:
     runner = FakeRunner(
         result(graphql_payload(thread_payload())),
@@ -703,10 +815,14 @@ def test_reply_to_thread_uses_stable_id_and_direct_argv(tmp_path: Path) -> None:
     adapter.reply_to_thread(152, "PRRT_kwDOAA", "fixed `value`")
 
     command = runner.commands[1]
-    assert command.args[:3] == ("api", "graphql", "--repo")
-    assert REPOSITORY in command.args
+    assert command.args[:2] == ("api", "graphql")
+    assert "--repo" not in command.args
     assert "threadId=PRRT_kwDOAA" in command.args
     assert "body=fixed `value`" in command.args
+    membership_args = runner.commands[0].args
+    assert "owner=owner" in membership_args
+    assert "name=repo" in membership_args
+    assert "number=152" in membership_args
     assert command.env_names == ("GH_TOKEN", "GITHUB_TOKEN")
 
 
