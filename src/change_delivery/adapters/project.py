@@ -185,7 +185,17 @@ def discover_registration(
             missing_fields=("version_endpoint",),
         )
     hostname = urlsplit(endpoint).hostname
-    if not dry_run and hostname is not None and hostname.endswith(".invalid"):
+    normalized_hostname = (
+        hostname.rstrip(".").casefold() if hostname is not None else None
+    )
+    if (
+        not dry_run
+        and normalized_hostname is not None
+        and (
+            normalized_hostname == "invalid"
+            or normalized_hostname.endswith(".invalid")
+        )
+    ):
         return RegistrationReport(
             status="blocked",
             config=None,

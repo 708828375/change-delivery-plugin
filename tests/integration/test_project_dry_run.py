@@ -167,11 +167,23 @@ def test_missing_real_version_endpoint_is_blocked(fixture_config) -> None:
     assert report.config is None
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "https://example.test.invalid/version",
+        "https://INVALID/version",
+        "https://project.test.INVALID./version",
+    ),
+)
 def test_fixture_endpoint_cannot_be_used_for_real_registration(
     fixture_config,
+    endpoint,
 ) -> None:
+    registration = fixture_config.model_dump(mode="python")
+    registration["version_endpoint"] = endpoint
+
     report = discover_registration(
-        fixture_config.model_dump(mode="python"),
+        registration,
         dry_run=False,
     )
 
