@@ -473,6 +473,13 @@ class RunRepository:
         )
         if sha256_payload(approval_payload) != approval_sha256:
             raise ValueError("approval file digest mismatch")
+        if (
+            not isinstance(approval_payload, dict)
+            or not isinstance(approval_payload.get("base_sha"), str)
+            or len(approval_payload["base_sha"]) != 40
+        ):
+            raise ValueError("approval base SHA is invalid")
+        base_sha = approval_payload["base_sha"].lower()
         timestamp = utc_now()
         event_id = new_event_id()
         reference = EvidenceRef(
@@ -513,8 +520,11 @@ class RunRepository:
                 (run_id, payload_json, timestamp),
             )
             connection.execute(
-                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
-                (RunState.APPROVED.value, timestamp, run_id),
+                """
+                UPDATE runs SET state = ?, head_sha = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (RunState.APPROVED.value, base_sha, timestamp, run_id),
             )
             connection.execute(
                 """

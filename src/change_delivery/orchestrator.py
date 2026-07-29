@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 import hmac
+import hashlib
 import json
 from pathlib import Path
 from typing import Protocol
@@ -17,6 +18,7 @@ from change_delivery.domain import (
     ProjectConfig,
     RunRecord,
     RunState,
+    StageResult,
     StepOutcome,
 )
 from change_delivery.repository import RunRepository
@@ -29,11 +31,38 @@ class GitPort(Protocol):
 
 
 class GitHubPort(Protocol):
-    def ensure_draft_pr(self, branch: str, base: str, head_sha: str) -> int: ...
+    def find_pr(self, branch: str, base: str) -> object | None: ...
+    def ensure_draft_pr(
+        self, branch: str, base: str, title: str, body: str
+    ) -> object: ...
+
+
+class StageExecutor(Protocol):
+    def execute(
+        self,
+        stage: str,
+        run: RunRecord,
+        config: ProjectConfig,
+        run_root: Path,
+    ) -> StageResult: ...
 
 
 ConfigLoader = Callable[[str], tuple[ProjectConfig, str]]
 ApprovalValidator = Callable[[RunRecord, ProjectConfig, Path], bool]
+
+
+class DependencyUnavailable(RuntimeError):
+    pass
+
+
+class UnavailableGit:
+    def __getattr__(self, name: str) -> object:
+        raise DependencyUnavailable(f"Git dependency unavailable for {name}")
+
+
+class UnavailableGitHub:
+    def __getattr__(self, name: str) -> object:
+        raise DependencyUnavailable(f"GitHub dependency unavailable for {name}")
 
 
 def _default_approval_validator(
@@ -70,6 +99,12 @@ class Orchestrator:
         github_factory: Callable[[ProjectConfig], GitHubPort],
         clock: Callable[[], datetime] | None = None,
         approval_validator: ApprovalValidator | None = None,
+        stage_executor: StageExecutor | None = None,
+        test_environment: object | None = None,
+        acceptance_executor: object | None = None,
+        worktree_port: object | None = None,
+        commit_port: object | None = None,
+        cleanup_port: object | None = None,
     ) -> None:
         self.repository = repository
         self.plugin_root = plugin_root.resolve()
@@ -80,6 +115,12 @@ class Orchestrator:
         self.approval_validator = (
             approval_validator or _default_approval_validator
         )
+        self.stage_executor = stage_executor
+        self.test_environment = test_environment
+        self.acceptance_executor = acceptance_executor
+        self.worktree_port = worktree_port
+        self.commit_port = commit_port
+        self.cleanup_port = cleanup_port
 
     def _run_root(self, run_id: str) -> Path:
         candidate = self.plugin_root / "runs" / run_id
@@ -139,10 +180,95 @@ class Orchestrator:
                 return self._draft_pr(run, config)
             if run.state is RunState.MONITORING_CI_REVIEW:
                 return self._monitor(run, config)
+            if run.state is RunState.DRAFT:
+                return self._draft_artifacts(run, config)
+            if run.state is RunState.AWAITING_DESIGN_APPROVAL:
+                return StepOutcome(
+                    state=run.state,
+                    action="waiting_approval",
+                    blocked_reason="explicit design approval is required",
+                )
+            if run.state is RunState.APPROVED:
+                return self._pure_transition(
+                    run,
+                    RunState.PREPARING_WORKTREE,
+                    "approval_scope_accepted",
+                )
+            if run.state is RunState.PREPARING_WORKTREE:
+                return self._run_reconciled_port(
+                    run,
+                    config,
+                    self.worktree_port,
+                    "prepare_worktree",
+                    RunState.IMPLEMENTING,
+                    "worktree_prepared",
+                )
+            if run.state is RunState.IMPLEMENTING:
+                return self._run_stage(
+                    run, config, "implementation", RunState.LOCAL_VALIDATION
+                )
+            if run.state is RunState.LOCAL_VALIDATION:
+                return self._run_stage(
+                    run, config, "local_validation", RunState.INTERNAL_REVIEW
+                )
+            if run.state is RunState.INTERNAL_REVIEW:
+                return self._run_stage(
+                    run, config, "internal_review", RunState.COMMITTING
+                )
+            if run.state is RunState.COMMITTING:
+                return self._commit(run, config)
+            if run.state is RunState.DEPLOYING_TEST:
+                return self._run_reconciled_port(
+                    run,
+                    config,
+                    self.test_environment,
+                    "deploy_test",
+                    RunState.ACCEPTANCE_TESTING,
+                    "test_deployed",
+                )
+            if run.state is RunState.ACCEPTANCE_TESTING:
+                return self._run_reconciled_port(
+                    run,
+                    config,
+                    self.acceptance_executor,
+                    "acceptance",
+                    RunState.PR_READY_FOR_REVIEW,
+                    "acceptance_passed",
+                )
+            if run.state is RunState.PR_READY_FOR_REVIEW:
+                return self._mark_pr_ready(run, config)
+            if run.state is RunState.FIXING_CI_REVIEW:
+                return self._run_stage(
+                    run, config, "review_fix", RunState.LOCAL_VALIDATION
+                )
+            if run.state is RunState.READY_TO_MERGE:
+                return self._ready_to_merge(run, config)
+            if run.state is RunState.MERGED:
+                return self._cleanup(run, config)
+            if run.state is RunState.CLEANING_LOCAL:
+                return self._pure_transition(
+                    run,
+                    RunState.COMPLETED,
+                    "local_cleanup_recorded",
+                )
+            if run.state is RunState.ENVIRONMENT_PREEMPTED:
+                return self._resume_environment(run)
+            if run.state is RunState.COMPLETED:
+                return StepOutcome(state=run.state, action="already_completed")
+            if run.state is RunState.FAILED_TERMINAL:
+                return StepOutcome(state=run.state, action="terminal_failure")
+            if run.state is RunState.CANCELLED:
+                return StepOutcome(state=run.state, action="already_cancelled")
+            raise AssertionError(f"unmapped RunState: {run.state.value}")
+        except DependencyUnavailable as error:
+            try:
+                state = self.repository.get_run(run_id).state
+            except KeyError:
+                state = RunState.BLOCKED
             return StepOutcome(
-                state=run.state,
-                action="noop_blocked",
-                blocked_reason=f"handler not implemented for {run.state.value}",
+                state=state,
+                action="blocked_dependency",
+                blocked_reason=str(error),
             )
         except Exception as error:
             try:
@@ -156,6 +282,466 @@ class Orchestrator:
             )
 
     resume = step
+
+    def _blocked_dependency(
+        self,
+        run: RunRecord,
+        dependency: str,
+    ) -> StepOutcome:
+        return StepOutcome(
+            state=run.state,
+            action="blocked_dependency",
+            blocked_reason=f"{dependency} is unavailable",
+        )
+
+    def _run_stage(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        stage: str,
+        target: RunState,
+    ) -> StepOutcome:
+        if self.stage_executor is None:
+            return self._blocked_dependency(run, f"{stage} stage executor")
+        result = self.stage_executor.execute(
+            stage,
+            run,
+            config,
+            self._run_root(run.run_id),
+        )
+        references = self.repository.rebind_primary_stage_result(
+            run.run_id,
+            result,
+            primary=True,
+        )
+        if result.status != "passed":
+            if stage == "internal_review":
+                target = (
+                    RunState.IMPLEMENTING
+                    if result.status == "failed"
+                    else RunState.REVIEW_DECISION_REQUIRED
+                )
+                self.repository.transition_with_evidence(
+                    run.run_id,
+                    run.state,
+                    target,
+                    "INTERNAL_REVIEW_NOT_PASSED",
+                    references,
+                )
+                return StepOutcome(
+                    state=target,
+                    action=(
+                        "review_changes_requested"
+                        if target is RunState.IMPLEMENTING
+                        else "review_decision_required"
+                    ),
+                    blocked_reason=result.summary,
+                    evidence_ids=tuple(
+                        reference.evidence_id for reference in references
+                    ),
+                )
+            return StepOutcome(
+                state=run.state,
+                action=f"{stage}_blocked",
+                blocked_reason=result.summary,
+            )
+        if stage == "local_validation":
+            if run.head_sha is None or any(
+                not self._evidence_is_current(ref.evidence_id, run.head_sha)
+                for ref in references
+            ):
+                return StepOutcome(
+                    state=run.state,
+                    action="local_validation_blocked",
+                    blocked_reason="validation evidence is not bound to current head",
+                )
+        self.repository.transition_with_evidence(
+            run.run_id,
+            run.state,
+            target,
+            f"{stage.upper()}_PASSED",
+            references,
+        )
+        return StepOutcome(
+            state=target,
+            action=f"{stage}_passed",
+            evidence_ids=tuple(ref.evidence_id for ref in references),
+        )
+
+    def _evidence_is_current(self, evidence_id: str, head_sha: str) -> bool:
+        payload = json.loads(
+            self.repository.get_evidence(evidence_id).payload_json
+        )
+        return (
+            type(payload) is dict
+            and payload.get("sha") == head_sha
+            and payload.get("passed") is True
+        )
+
+    def _run_reconciled_port(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        port: object | None,
+        operation_type: str,
+        target: RunState,
+        evidence_kind: str,
+    ) -> StepOutcome:
+        if port is None:
+            return self._blocked_dependency(run, f"{operation_type} adapter")
+        if run.head_sha is None:
+            return StepOutcome(
+                state=run.state,
+                action=f"{operation_type}_blocked",
+                blocked_reason="run head SHA is missing",
+            )
+        key = f"{operation_type}:{run.run_id}:{run.head_sha}"
+        try:
+            operation = self.repository.get_remote_operation(key)
+        except KeyError:
+            operation = None
+        observed = port.query(run, config)  # type: ignore[attr-defined]
+        if observed is None and operation is not None:
+            return StepOutcome(
+                state=run.state,
+                action=f"{operation_type}_reconciliation_pending",
+                blocked_reason="pending operation is not authoritatively observable",
+            )
+        if observed is None:
+            self.repository.begin_remote_operation(
+                key,
+                run.run_id,
+                operation_type,
+                f"{run.project_id}:{run.head_sha}",
+            )
+            try:
+                observed = port.execute(run, config)  # type: ignore[attr-defined]
+            except Exception as error:
+                return StepOutcome(
+                    state=run.state,
+                    action=f"{operation_type}_reconciliation_pending",
+                    blocked_reason=f"operation result is uncertain: {type(error).__name__}",
+                )
+        payload = observed
+        if (
+            type(payload) is not dict
+            or payload.get("sha") != run.head_sha
+            or payload.get("passed") is not True
+        ):
+            return StepOutcome(
+                state=run.state,
+                action=f"{operation_type}_blocked",
+                blocked_reason="operation evidence is not bound to current head",
+            )
+        if operation is None:
+            try:
+                operation = self.repository.get_remote_operation(key)
+            except KeyError:
+                operation = None
+        if operation is not None and operation.status == "PENDING":
+            self.repository.confirm_remote_operation(key)
+        reference = self.repository.register_evidence(
+            run.run_id,
+            f"{evidence_kind}:{run.run_id}:{run.head_sha}",
+            evidence_kind,
+            payload,
+        )
+        self.repository.transition_with_evidence(
+            run.run_id,
+            run.state,
+            target,
+            f"{operation_type.upper()}_PASSED",
+            (reference,),
+        )
+        return StepOutcome(
+            state=target,
+            action=f"{operation_type}_reconciled",
+            evidence_ids=(reference.evidence_id,),
+        )
+
+    def _pure_transition(
+        self,
+        run: RunRecord,
+        target: RunState,
+        action: str,
+    ) -> StepOutcome:
+        self.repository.transition_with_evidence(
+            run.run_id,
+            run.state,
+            target,
+            action.upper(),
+        )
+        return StepOutcome(state=target, action=action)
+
+    def _draft_artifacts(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> StepOutcome:
+        if self.stage_executor is None:
+            return self._blocked_dependency(run, "design stage executor")
+        root = self._run_root(run.run_id)
+        result = self.stage_executor.execute("design", run, config, root)
+        if result.status != "passed":
+            return StepOutcome(
+                state=run.state,
+                action="design_blocked",
+                blocked_reason=result.summary,
+            )
+        references = self.repository.rebind_primary_stage_result(
+            run.run_id,
+            result,
+            primary=True,
+        )
+        artifacts = {}
+        for name in REQUIRED_ARTIFACT_NAMES:
+            path = root / name
+            contents = path.read_bytes()
+            if not contents:
+                return StepOutcome(
+                    state=run.state,
+                    action="design_required",
+                    blocked_reason=f"design artifact is empty: {name}",
+                )
+            artifacts[name] = hashlib.sha256(contents).hexdigest()
+        self.repository.transition_with_evidence(
+            run.run_id,
+            RunState.DRAFT,
+            RunState.AWAITING_DESIGN_APPROVAL,
+            "DESIGN_ARTIFACTS_READY",
+            references,
+        )
+        return StepOutcome(
+            state=RunState.AWAITING_DESIGN_APPROVAL,
+            action="design_artifacts_ready",
+            evidence_ids=tuple(ref.evidence_id for ref in references),
+        )
+
+    def _resume_environment(self, run: RunRecord) -> StepOutcome:
+        events = self.repository.list_events(run.run_id)
+        entering = next(
+            (
+                event
+                for event in reversed(events)
+                if event.to_state is RunState.ENVIRONMENT_PREEMPTED
+            ),
+            None,
+        )
+        if entering is None or entering.from_state not in {
+            RunState.DEPLOYING_TEST,
+            RunState.ACCEPTANCE_TESTING,
+        }:
+            return StepOutcome(
+                state=run.state,
+                action="environment_reconciliation_blocked",
+                blocked_reason="persisted environment interruption source is missing",
+            )
+        # Task11 supplies the shared-environment fact query before this resumes.
+        return self._blocked_dependency(run, "test environment fact adapter")
+
+    def _ready_to_merge(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> StepOutcome:
+        if run.pr_number is None:
+            return StepOutcome(
+                state=run.state,
+                action="merge_fact_blocked",
+                blocked_reason="PR number is missing",
+            )
+        github = self.github_factory(config)
+        try:
+            merged = github.is_merged(run.pr_number)  # type: ignore[attr-defined]
+        except DependencyUnavailable:
+            raise
+        except AttributeError:
+            return self._blocked_dependency(run, "merge fact adapter")
+        if merged is not True:
+            return StepOutcome(
+                state=run.state,
+                action="waiting_manual_merge",
+                blocked_reason="manual merge has not been observed",
+            )
+        return self._pure_transition(run, RunState.MERGED, "merge_observed")
+
+    def _mark_pr_ready(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> StepOutcome:
+        if run.pr_number is None or run.head_sha is None:
+            return StepOutcome(
+                state=run.state,
+                action="pr_readiness_blocked",
+                blocked_reason="PR identity is incomplete",
+            )
+        github = self.github_factory(config)
+        key = f"mark_ready:{run.run_id}:{run.pr_number}:{run.head_sha}"
+        try:
+            operation = self.repository.get_remote_operation(key)
+        except KeyError:
+            operation = None
+        try:
+            current = github.get_pr(run.pr_number)  # type: ignore[attr-defined]
+        except AttributeError:
+            return self._blocked_dependency(run, "PR readiness adapter")
+        if current.head_sha != run.head_sha:
+            return StepOutcome(
+                state=run.state,
+                action="pr_readiness_blocked",
+                blocked_reason="PR head SHA changed",
+            )
+        if current.is_draft:
+            if operation is not None and operation.status == "PENDING":
+                return StepOutcome(
+                    state=run.state,
+                    action="mark_ready_reconciliation_pending",
+                    blocked_reason="pending ready operation is not observable",
+                )
+            self.repository.begin_remote_operation(
+                key,
+                run.run_id,
+                "mark_ready",
+                f"{config.github_repository}:{run.pr_number}:{run.head_sha}",
+            )
+            try:
+                current = github.mark_ready(run.pr_number)  # type: ignore[attr-defined]
+            except Exception as error:
+                return StepOutcome(
+                    state=run.state,
+                    action="mark_ready_reconciliation_pending",
+                    blocked_reason=f"ready result is uncertain: {type(error).__name__}",
+                )
+        if current.is_draft or current.head_sha != run.head_sha:
+            return StepOutcome(
+                state=run.state,
+                action="mark_ready_reconciliation_pending",
+                blocked_reason="ready PR fact is not authoritative",
+            )
+        try:
+            operation = self.repository.get_remote_operation(key)
+        except KeyError:
+            operation = None
+        if operation is not None and operation.status == "PENDING":
+            self.repository.confirm_remote_operation(key)
+        reference = self.repository.register_evidence(
+            run.run_id,
+            f"pr-ready:{run.run_id}:{run.head_sha}",
+            "pr_ready",
+            {"number": run.pr_number, "sha": run.head_sha, "passed": True},
+        )
+        self.repository.transition_with_evidence(
+            run.run_id,
+            RunState.PR_READY_FOR_REVIEW,
+            RunState.MONITORING_CI_REVIEW,
+            "PR_READY_RECONCILED",
+            (reference,),
+        )
+        return StepOutcome(
+            state=RunState.MONITORING_CI_REVIEW,
+            action="pr_ready_reconciled",
+            evidence_ids=(reference.evidence_id,),
+        )
+
+    def _commit(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> StepOutcome:
+        port = self.commit_port
+        if port is None:
+            return self._blocked_dependency(run, "commit adapter")
+        key = f"commit:{run.run_id}:{run.head_sha or 'unborn'}"
+        try:
+            operation = self.repository.get_remote_operation(key)
+        except KeyError:
+            operation = None
+        observed = port.query(run, config)  # type: ignore[attr-defined]
+        if observed is None and operation is not None:
+            return StepOutcome(
+                state=run.state,
+                action="commit_reconciliation_pending",
+                blocked_reason="pending commit is not authoritatively observable",
+            )
+        if observed is None:
+            self.repository.begin_remote_operation(
+                key,
+                run.run_id,
+                "commit",
+                f"{run.project_id}:{run.head_sha or 'unborn'}",
+            )
+            try:
+                observed = port.execute(run, config)  # type: ignore[attr-defined]
+            except Exception as error:
+                return StepOutcome(
+                    state=run.state,
+                    action="commit_reconciliation_pending",
+                    blocked_reason=f"commit result is uncertain: {type(error).__name__}",
+                )
+        if (
+            type(observed) is not dict
+            or type(observed.get("sha")) is not str
+            or len(observed["sha"]) != 40
+            or observed.get("passed") is not True
+        ):
+            return StepOutcome(
+                state=run.state,
+                action="commit_blocked",
+                blocked_reason="commit fact is invalid",
+            )
+        if operation is not None and operation.status == "PENDING":
+            self.repository.confirm_remote_operation(key)
+        else:
+            try:
+                pending = self.repository.get_remote_operation(key)
+            except KeyError:
+                pending = None
+            if pending is not None and pending.status == "PENDING":
+                self.repository.confirm_remote_operation(key)
+        new_sha = observed["sha"]
+        reference = self.repository.register_evidence(
+            run.run_id,
+            f"commit:{run.run_id}:{new_sha}",
+            "commit_created",
+            observed,
+        )
+        self.repository.transition_with_evidence(
+            run.run_id,
+            RunState.COMMITTING,
+            RunState.PUSHING_FEATURE,
+            "COMMIT_RECONCILED",
+            (reference,),
+            run_updates={"head_sha": new_sha},
+        )
+        return StepOutcome(
+            state=RunState.PUSHING_FEATURE,
+            action="commit_reconciled",
+            evidence_ids=(reference.evidence_id,),
+        )
+
+    def _cleanup(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> StepOutcome:
+        port = self.cleanup_port
+        if port is None:
+            return self._blocked_dependency(run, "worktree cleanup adapter")
+        observed = port.query(run, config)  # type: ignore[attr-defined]
+        if type(observed) is not dict or observed.get("clean") is not True:
+            return StepOutcome(
+                state=run.state,
+                action="cleanup_blocked",
+                blocked_reason="worktree is not clean",
+            )
+        if observed.get("removed") is not True:
+            port.execute(run, config)  # type: ignore[attr-defined]
+        return self._pure_transition(
+            run,
+            RunState.CLEANING_LOCAL,
+            "worktree_cleanup_reconciled",
+        )
 
     def _resume_interrupted(self, run: RunRecord) -> StepOutcome:
         events = self.repository.list_events(run.run_id)
@@ -206,6 +792,8 @@ class Orchestrator:
         git = self.git_factory(config)
         try:
             remote_sha = git.feature_sha(branch)
+        except DependencyUnavailable:
+            raise
         except Exception as error:
             return StepOutcome(
                 state=run.state,
@@ -242,6 +830,8 @@ class Orchestrator:
         )
         try:
             pushed = git.push_feature(branch, run.head_sha)
+        except DependencyUnavailable:
+            raise
         except Exception as error:
             return StepOutcome(
                 state=run.state,
@@ -310,12 +900,47 @@ class Orchestrator:
                 action="blocked",
                 blocked_reason="draft PR operation is terminal without state transition",
             )
+        github = self.github_factory(config)
         try:
-            number = self.github_factory(config).ensure_draft_pr(
-                branch,
-                config.base_branch,
-                run.head_sha,
-            )
+            if existing is not None:
+                found = github.find_pr(branch, config.base_branch)
+                if found is None:
+                    return StepOutcome(
+                        state=run.state,
+                        action="pr_reconciliation_pending",
+                        blocked_reason="pending PR is not authoritatively observable",
+                    )
+                found_sha = getattr(found, "head_sha", run.head_sha)
+                if found_sha != run.head_sha:
+                    return StepOutcome(
+                        state=run.state,
+                        action="pr_reconciliation_pending",
+                        blocked_reason="pending PR head SHA mismatch",
+                    )
+                number = (
+                    found if isinstance(found, int) else getattr(found, "number")
+                )
+            else:
+                created = github.ensure_draft_pr(
+                    branch,
+                    config.base_branch,
+                    f"chore: delivery {run.run_id}",
+                    f"Automated delivery run: {run.run_id}",
+                )
+                created_sha = getattr(created, "head_sha", run.head_sha)
+                if created_sha != run.head_sha:
+                    return StepOutcome(
+                        state=run.state,
+                        action="pr_reconciliation_pending",
+                        blocked_reason="created PR head SHA mismatch",
+                    )
+                number = (
+                    created
+                    if isinstance(created, int)
+                    else getattr(created, "number")
+                )
+        except DependencyUnavailable:
+            raise
         except Exception as error:
             return StepOutcome(
                 state=run.state,
@@ -362,6 +987,18 @@ class Orchestrator:
                 action="blocked",
                 blocked_reason="PR head SHA changed",
             )
+        if (
+            snapshot.checks_passed is not True
+            or snapshot.threads_resolved is not True
+            or snapshot.mergeable is not True
+            or snapshot.review_decision is not True
+            or snapshot.is_draft is not False
+        ):
+            return StepOutcome(
+                state=run.state,
+                action="monitoring",
+                blocked_reason="remote PR gates are not all strictly satisfied",
+            )
         facts = {
             "ci_passed": snapshot.checks_passed,
             "threads_resolved": snapshot.threads_resolved,
@@ -379,11 +1016,15 @@ class Orchestrator:
                         {"sha": run.head_sha, "passed": True},
                     )
                 )
-        by_kind = {
-            evidence.kind: evidence
-            for evidence in self.repository.list_evidence(run.run_id)
-            if json.loads(evidence.payload_json).get("sha") == run.head_sha
-        }
+        by_kind = {}
+        for evidence in self.repository.list_evidence(run.run_id):
+            payload = json.loads(evidence.payload_json)
+            if (
+                type(payload) is dict
+                and payload.get("sha") == run.head_sha
+                and payload.get("passed") is True
+            ):
+                by_kind[evidence.kind] = evidence
         if not READY_TO_MERGE_EVIDENCE <= by_kind.keys():
             return StepOutcome(
                 state=run.state,

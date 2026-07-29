@@ -256,6 +256,17 @@ def test_ensure_draft_pr_reuses_existing_ready_pr_with_safe_command(
     assert command.env_names == ("GH_TOKEN", "GITHUB_TOKEN")
 
 
+def test_find_pr_is_public_read_only_lookup(tmp_path: Path) -> None:
+    runner = FakeRunner(result(pr_payload()))
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    ref = adapter.find_pr("feature/cd-test", "develop")
+
+    assert ref is not None and ref.number == 152
+    assert len(runner.commands) == 1
+    assert runner.commands[0].args[0:2] == ("pr", "view")
+
+
 def test_view_same_head_wrong_base_falls_back_to_exact_list(tmp_path: Path) -> None:
     runner = FakeRunner(
         result(pr_payload(base="main")),

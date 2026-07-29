@@ -12,12 +12,14 @@ import json
 import os
 from pathlib import Path
 import stat
+import shutil
 import sys
 import tempfile
 from typing import Any, TextIO
 from uuid import uuid4
 
-from change_delivery.config import load_project_config
+from change_delivery.config import load_project_config, load_project_config_bytes
+from change_delivery.adapters.git import GitAdapter
 from change_delivery.approval import (
     REQUIRED_ARTIFACT_NAMES,
     load_approval,
@@ -28,6 +30,11 @@ from change_delivery.database import Database
 from change_delivery.domain import LoadedProjectConfig, RunState
 from change_delivery.repository import RunRepository
 from change_delivery.redaction import redact_text
+from change_delivery.orchestrator import (
+    Orchestrator,
+    UnavailableGit,
+    UnavailableGitHub,
+)
 
 
 MAX_REQUIREMENT_BYTES = 1_048_576
@@ -42,6 +49,38 @@ class JsonArgumentParser(argparse.ArgumentParser):
         raise CliUsageError(message)
 
 
+@dataclass(frozen=True)
+class StableFileSnapshot:
+    data: bytes
+    signature: tuple[int, int, int, int]
+
+
+class LocalRegistrationVerifier:
+    """Read-only local checks; Task11 adds the remote HTTP/version checks."""
+
+    def __call__(self, loaded: LoadedProjectConfig) -> tuple[bool, str]:
+        config = loaded.config
+        try:
+            if config.base_branch == config.test_branch:
+                return False, "base and test branches must differ"
+            for executable in ("git", "gh", "codex"):
+                if shutil.which(executable) is None:
+                    return False, f"required tool is unavailable: {executable}"
+            adapter = GitAdapter(
+                config.repo_path,
+                remote=config.remote,
+                base_branch=config.base_branch,
+                test_branch=config.test_branch,
+                expected_fetch_url=config.remote_fetch_url,
+                expected_push_url=config.remote_push_url,
+            )
+            adapter.remote_sha(config.remote, config.base_branch)
+            adapter.remote_sha(config.remote, config.test_branch)
+        except Exception as error:
+            return False, f"local registration verification failed: {type(error).__name__}"
+        return True, "local repository and tool bindings verified"
+
+
 @dataclass
 class CliServices:
     plugin_root: Path
@@ -51,6 +90,11 @@ class CliServices:
         Callable[[LoadedProjectConfig], tuple[bool, str]] | None
     ) = None
     orchestrator: Any | None = None
+
+    def __post_init__(self) -> None:
+        self.plugin_root = self.plugin_root.resolve(strict=False)
+        if self.registration_verifier is None:
+            self.registration_verifier = LocalRegistrationVerifier()
 
     def load_project(self, project_id: str) -> tuple[Any, str]:
         if self.project_loader is not None:
@@ -71,6 +115,18 @@ class CliServices:
             database.migrate()
         self.repository = RunRepository(database)
         return self.repository
+
+    def get_orchestrator(self) -> Any:
+        if self.orchestrator is None:
+            repository = self.get_repository()
+            self.orchestrator = Orchestrator(
+                repository=repository,
+                plugin_root=self.plugin_root,
+                config_loader=self.load_project,
+                git_factory=lambda config: UnavailableGit(),
+                github_factory=lambda config: UnavailableGitHub(),
+            )
+        return self.orchestrator
 
 
 def _default_services() -> CliServices:
@@ -94,6 +150,14 @@ def _child(root: Path, *parts: str) -> Path:
 
 
 def _stable_read(path: Path, *, limit: int | None = None) -> bytes:
+    return _stable_snapshot(path, limit=limit).data
+
+
+def _stable_snapshot(
+    path: Path,
+    *,
+    limit: int | None = None,
+) -> StableFileSnapshot:
     if path.is_symlink():
         raise CliUsageError("links and reparse points are not allowed")
     metadata = path.lstat()
@@ -116,7 +180,15 @@ def _stable_read(path: Path, *, limit: int | None = None) -> bytes:
         raise CliUsageError("input changed while being read")
     if limit is not None and len(data) > limit:
         raise CliUsageError("input is too large")
-    return data
+    return StableFileSnapshot(
+        data=data,
+        signature=(
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ),
+    )
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -212,16 +284,11 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
 
 
 def _register(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
-    candidate_bytes = _stable_read(
+    initial = _stable_snapshot(
         args.candidate_file,
         limit=MAX_REQUIREMENT_BYTES,
     )
-    loaded = load_project_config(args.candidate_file)
-    if not hmac.compare_digest(
-        candidate_bytes,
-        _stable_read(args.candidate_file, limit=MAX_REQUIREMENT_BYTES),
-    ):
-        raise CliUsageError("candidate changed while being validated")
+    loaded = load_project_config_bytes(initial.data, args.candidate_file)
     verifier = services.registration_verifier
     if verifier is None:
         raise CliUsageError("registration verifier is unavailable until Task11")
@@ -230,12 +297,21 @@ def _register(args: argparse.Namespace, services: CliServices) -> dict[str, Any]
         raise CliUsageError(reason or "registration doctor failed")
     if not hmac.compare_digest(args.confirm_hash, loaded.config_hash):
         raise CliUsageError("confirmation hash does not match candidate")
+    final = _stable_snapshot(
+        args.candidate_file,
+        limit=MAX_REQUIREMENT_BYTES,
+    )
+    if (
+        initial.signature != final.signature
+        or not hmac.compare_digest(initial.data, final.data)
+    ):
+        raise CliUsageError("candidate changed while being validated")
     target = _child(
         services.plugin_root,
         "projects",
         f"{loaded.config.project_id}.yaml",
     )
-    _atomic_write(target, candidate_bytes)
+    _atomic_write(target, initial.data)
     return {
         "ok": True,
         "project_id": loaded.config.project_id,
@@ -303,11 +379,39 @@ def _approve(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
 def _doctor(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     if not services.plugin_root.exists():
         raise CliUsageError("runtime is not configured")
-    if args.project:
-        services.load_project(args.project)
-    elif not (services.plugin_root / "projects").is_dir():
+    registry = services.plugin_root / "projects"
+    if not registry.is_dir():
         raise CliUsageError("project registry is not configured")
-    return {"ok": True, "project": args.project, "mode": "read_only"}
+    paths = (
+        [_child(registry, f"{args.project}.yaml")]
+        if args.project
+        else sorted(registry.glob("*.yaml"))
+    )
+    if not paths:
+        raise CliUsageError("project registry is empty")
+    evidence = []
+    verifier = services.registration_verifier
+    assert verifier is not None
+    for path in paths:
+        snapshot = _stable_snapshot(path, limit=MAX_REQUIREMENT_BYTES)
+        loaded = load_project_config_bytes(snapshot.data, path)
+        verified, reason = verifier(loaded)
+        evidence.append(
+            {
+                "project_id": loaded.config.project_id,
+                "config_hash": loaded.config_hash,
+                "verified": verified,
+                "reason": reason,
+            }
+        )
+        if not verified:
+            raise CliUsageError(reason)
+    return {
+        "ok": True,
+        "project": args.project,
+        "mode": "read_only",
+        "evidence": evidence,
+    }
 
 
 def _orchestrator_action(
@@ -315,9 +419,8 @@ def _orchestrator_action(
     run_id: str,
     services: CliServices,
 ) -> dict[str, Any]:
-    if services.orchestrator is None:
-        raise CliUsageError("orchestrator services are not configured")
-    outcome = getattr(services.orchestrator, action)(run_id)
+    orchestrator = services.get_orchestrator()
+    outcome = getattr(orchestrator, action)(run_id)
     return {"ok": True, **outcome.model_dump(mode="json")}
 
 

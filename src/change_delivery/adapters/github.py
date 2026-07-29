@@ -262,6 +262,23 @@ class GitHubAdapter:
             name for name in _GH_ENV_NAMES if name in configured_credentials
         )
 
+    def find_pr(self, head: str, base: str) -> PullRequestRef | None:
+        """Return an existing exact PR without creating or mutating it."""
+        _validate_branch(head)
+        _validate_branch(base)
+        try:
+            return self._locate_pr(head, base)
+        except ProcessTimeoutError:
+            raise GitHubError(
+                "locate_pr",
+                "pull request existence is unknown",
+            ) from None
+
+    def get_pr(self, pr_number: int) -> PullRequestRef:
+        """Return one PR snapshot without mutating it."""
+        _validate_number(pr_number)
+        return self._view_pr(pr_number)
+
     def ensure_draft_pr(
         self,
         head: str,
