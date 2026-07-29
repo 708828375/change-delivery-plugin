@@ -52,7 +52,8 @@ _THREAD_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){"
     "repository(owner:$owner,name:$name){pullRequest(number:$number){"
     "reviewThreads(first:100){nodes{id isResolved isOutdated path line "
-    "comments(first:100){nodes{body}}}pageInfo{hasNextPage endCursor}}}}}}"
+    "comments(first:100){nodes{body}pageInfo{hasNextPage endCursor}}}"
+    "pageInfo{hasNextPage endCursor}}}}}}"
 )
 _REPLY_MUTATION = (
     "mutation($threadId:ID!,$body:String!){"
@@ -786,11 +787,42 @@ class GitHubAdapter:
             "review_threads",
         )
         comments = payload["comments"]
-        if not isinstance(comments, dict) or set(comments) != {"nodes"}:
+        if not isinstance(comments, dict):
             raise GitHubError("review_threads", "thread comments were invalid")
+        _exact_keys(
+            comments,
+            {"nodes", "pageInfo"},
+            "review_threads",
+        )
         nodes = comments["nodes"]
         if not isinstance(nodes, list):
             raise GitHubError("review_threads", "thread comments were invalid")
+        page_info = comments["pageInfo"]
+        if not isinstance(page_info, dict):
+            raise GitHubError(
+                "review_threads",
+                "comment page information was invalid",
+            )
+        _exact_keys(
+            page_info,
+            {"hasNextPage", "endCursor"},
+            "review_threads",
+        )
+        has_next_page = page_info["hasNextPage"]
+        end_cursor = page_info["endCursor"]
+        if (
+            not isinstance(has_next_page, bool)
+            or (end_cursor is not None and not isinstance(end_cursor, str))
+        ):
+            raise GitHubError(
+                "review_threads",
+                "comment page information was invalid",
+            )
+        if has_next_page:
+            raise GitHubError(
+                "review_threads",
+                "review comment result was incomplete",
+            )
         bodies: list[str] = []
         for node in nodes:
             if not isinstance(node, dict) or set(node) != {"body"}:

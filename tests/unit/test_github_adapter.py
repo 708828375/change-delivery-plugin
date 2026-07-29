@@ -135,7 +135,13 @@ def thread_payload(
         "isOutdated": outdated,
         "path": "src/app.py",
         "line": 42,
-        "comments": {"nodes": [{"body": "please fix"}]},
+        "comments": {
+            "nodes": [{"body": "please fix"}],
+            "pageInfo": {
+                "hasNextPage": False,
+                "endCursor": None,
+            },
+        },
     }
 
 
@@ -605,6 +611,47 @@ def test_graphql_parser_rejects_missing_fields_and_unknown_shape(
     malformed = thread_payload()
     malformed.pop("id")
     runner = FakeRunner(result(graphql_payload(malformed)))
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    with pytest.raises(GitHubError):
+        adapter.list_actionable_reviews(152)
+
+
+def test_complete_comment_page_returns_every_comment(tmp_path: Path) -> None:
+    thread = thread_payload()
+    thread["comments"] = {
+        "nodes": [{"body": "first"}, {"body": "second"}],
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }
+    runner = FakeRunner(result(graphql_payload(thread)))
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    reviews = adapter.list_actionable_reviews(152)
+
+    assert reviews[0].comments == ("first", "second")
+
+
+@pytest.mark.parametrize(
+    "comments",
+    [
+        {"nodes": [{"body": "first page only"}]},
+        {
+            "nodes": [{"body": "first page only"}],
+            "pageInfo": {"hasNextPage": True, "endCursor": "COMMENT_CURSOR"},
+        },
+        {
+            "nodes": [{"body": "invalid flag"}],
+            "pageInfo": {"hasNextPage": "false", "endCursor": None},
+        },
+    ],
+)
+def test_incomplete_or_invalid_comment_pagination_fails_closed(
+    tmp_path: Path,
+    comments: dict[str, object],
+) -> None:
+    thread = thread_payload()
+    thread["comments"] = comments
+    runner = FakeRunner(result(graphql_payload(thread)))
     adapter = GitHubAdapter(runner, project_config(tmp_path))
 
     with pytest.raises(GitHubError):
