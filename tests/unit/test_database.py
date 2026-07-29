@@ -232,6 +232,17 @@ def test_active_runs_exclude_terminal_states_and_are_stably_sorted(
     assert [run.run_id for run in repository.list_active_runs()] == ["a", "b"]
 
 
+def test_active_runs_exclude_ready_to_merge(repository: RunRepository) -> None:
+    repository.create_run("ready", "project", "hash")
+    with repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.READY_TO_MERGE.value, "ready"),
+        )
+
+    assert repository.list_active_runs() == []
+
+
 def test_event_record_rejects_invalid_evidence_json() -> None:
     common = {
         "event_id": "event",

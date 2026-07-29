@@ -865,26 +865,12 @@ class Orchestrator:
         run: RunRecord,
         config: ProjectConfig,
     ) -> StepOutcome:
-        if run.pr_number is None:
-            return StepOutcome(
-                state=run.state,
-                action="merge_fact_blocked",
-                blocked_reason="PR number is missing",
-            )
-        github = self.github_factory(config)
-        try:
-            merged = github.is_merged(run.pr_number)  # type: ignore[attr-defined]
-        except DependencyUnavailable:
-            raise
-        except AttributeError:
-            return self._blocked_dependency(run, "merge fact adapter")
-        if merged is not True:
-            return StepOutcome(
-                state=run.state,
-                action="waiting_manual_merge",
-                blocked_reason="manual merge has not been observed",
-            )
-        return self._pure_transition(run, RunState.MERGED, "merge_observed")
+        del config
+        return StepOutcome(
+            state=run.state,
+            action="ready_to_merge",
+            blocked_reason="automation stops before merge",
+        )
 
     def _mark_pr_ready(
         self,

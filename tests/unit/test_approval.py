@@ -250,9 +250,39 @@ def test_build_rejects_symlink_or_reparse_artifact(
             base_sha=BASE_SHA,
             test_branch="test",
             files=files,
+
             user_provider=lambda: "JoySun",
             clock=lambda: NOW,
         )
+
+
+def test_build_rejects_reparse_point_in_artifact_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "reparse-ancestor" / "run"
+    artifact_root.mkdir(parents=True)
+    files = write_artifacts(artifact_root)
+    real_check = approval_module._is_reparse_point
+    monkeypatch.setattr(
+        approval_module,
+        "_is_reparse_point",
+        lambda path: path == artifact_root.parent or real_check(path),
+    )
+
+    with pytest.raises(ValueError, match="ancestor.*reparse"):
+        build_approval(
+            run_id="run-001",
+            project_id="project-001",
+            config_hash=CONFIG_HASH,
+            base_branch="develop",
+            base_sha=BASE_SHA,
+            test_branch="test",
+            files=files,
+            user_provider=lambda: "JoySun",
+            clock=lambda: NOW,
+        )
+
 
 
 @pytest.mark.parametrize("bad_kind", ["missing", "directory"])

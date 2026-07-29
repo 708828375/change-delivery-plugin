@@ -1135,6 +1135,59 @@ def test_default_runtime_ports_deploy_with_exact_lease_then_require_host_accepta
     assert payload["stdout_sha256"]
 
 
+@pytest.mark.parametrize(
+    "updates, missing",
+    [
+        ({"version_endpoint": ""}, "version_endpoint"),
+        ({"acceptance_check": None}, "acceptance_check"),
+    ],
+)
+def test_deploy_blocks_before_git_io_when_required_config_is_missing(
+    fixture: Fixture,
+    updates: dict[str, object],
+    missing: str,
+) -> None:
+    run_id = fixture.create(RunState.DEPLOYING_TEST)
+    calls: list[str] = []
+
+    class NoIoGit:
+        def fetch(self, remote: str) -> None:
+            calls.append(f"fetch:{remote}")
+
+        def remote_sha(self, remote: str, branch: str) -> str:
+            calls.append(f"remote_sha:{remote}:{branch}")
+            return OTHER_SHA
+
+        def push_test_with_lease(self, remote: str, branch: str, source_sha: str, observed_sha: str) -> str:
+            calls.append(f"push:{remote}:{branch}:{source_sha}:{observed_sha}")
+            return source_sha
+
+    configured = config(fixture.root).model_copy(
+        update={
+            "acceptance_check": CommandSpec(
+                executable=sys.executable,
+                args=("-c", "raise SystemExit(0)"),
+                workdir=fixture.root,
+            ),
+            **updates,
+        }
+    )
+    port = RuntimeTestEnvironmentPort(
+        fixture.repository,
+        git_factory=lambda project: NoIoGit(),
+    )
+
+    result = port.execute(fixture.repository.get_run(run_id), configured)
+
+    assert result == {
+        "sha": SHA,
+        "passed": False,
+        "reason": "DEPLOYMENT_CONFIG_INCOMPLETE",
+        "missing_fields": [missing],
+    }
+    assert calls == []
+
+
 def test_cli_release_is_disabled_and_has_no_side_effect(tmp_path: Path) -> None:
     before = tuple(tmp_path.iterdir())
     stdout, stderr = StringIO(), StringIO()
@@ -1949,8 +2002,11 @@ def test_ready_merge_and_cleanup_are_observation_driven(
             (ready_id,),
         )
     fixture.github.merged = True
-    assert fixture.orchestrator().step(ready_id).state is RunState.MERGED
-    assert fixture.github.merge_query_calls == 1
+    outcome = fixture.orchestrator().step(ready_id)
+    assert outcome.state is RunState.READY_TO_MERGE
+    assert outcome.action == "ready_to_merge"
+    assert fixture.github.merge_query_calls == 0
+    assert fixture.repository.get_run(ready_id).state is RunState.READY_TO_MERGE
 
     merged_id = fixture.create(RunState.MERGED)
     cleanup = FakeCleanupPort()
@@ -2168,6 +2224,142 @@ def test_cli_start_prepare_and_approve_lifecycle_is_hash_bound(
         )
     )
     assert scope["design.md"] == original_design.decode("utf-8")
+
+
+def test_approved_artifact_rejects_content_and_row_digest_double_tamper(
+    fixture: Fixture,
+) -> None:
+    run_id, _ = approve_fixture_run(fixture)
+    malicious = b"attacker-controlled design"
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            """
+            UPDATE approved_artifacts
+            SET content = ?, sha256 = ?
+            WHERE run_id = ? AND artifact_name = 'design.md'
+            """,
+            (malicious, hashlib.sha256(malicious).hexdigest(), run_id),
+        )
+
+    with pytest.raises(ValueError, match="approved artifact snapshot is corrupt"):
+        fixture.repository.get_approved_artifacts(run_id)
+
+
+def test_same_hash_reapprove_backfills_legacy_missing_artifacts_in_later_state(
+    fixture: Fixture,
+) -> None:
+    run_id, run_root = approve_fixture_run(fixture)
+    fixture.repository.transition(
+        run_id,
+        RunState.APPROVED,
+        RunState.PREPARING_WORKTREE,
+        "APPROVAL_SCOPE_ACCEPTED",
+    )
+    before_events = fixture.repository.list_events(run_id)
+    before_evidence = fixture.repository.list_evidence(run_id)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute("DROP TABLE approved_artifacts")
+    fixture.repository.database.migrate()
+    approval_file = run_root / "approval.json"
+    approval_hash = hashlib.sha256(approval_file.read_bytes()).hexdigest()
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "approve",
+            run_id,
+            "--approval-file",
+            str(approval_file),
+            "--confirm-hash",
+            approval_hash,
+            "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 0, stderr.getvalue()
+    assert fixture.repository.get_run(run_id).state is RunState.PREPARING_WORKTREE
+    assert fixture.repository.list_events(run_id) == before_events
+    assert fixture.repository.list_evidence(run_id) == before_evidence
+    assert set(fixture.repository.get_approved_artifacts(run_id)) == {
+        "requirement.md",
+        "design.md",
+        "implementation-plan.md",
+    }
+    executor = RuntimeStageExecutor(fixture.repository, fixture.root)
+    scope = json.loads(
+        executor._approval_scope(  # type: ignore[attr-defined]
+            "implementation",
+            fixture.repository.get_run(run_id),
+            run_root,
+        )
+    )
+    assert scope["design.md"] == "design.md"
+    assert json.loads(stdout.getvalue())["backfilled"] is True
+
+
+@pytest.mark.parametrize("attack", ["wrong_hash", "missing", "changed"])
+def test_legacy_backfill_rejects_nonidentical_approval_scope(
+    fixture: Fixture,
+    attack: str,
+) -> None:
+    run_id, run_root = approve_fixture_run(fixture)
+    fixture.repository.transition(
+        run_id,
+        RunState.APPROVED,
+        RunState.PREPARING_WORKTREE,
+        "APPROVAL_SCOPE_ACCEPTED",
+    )
+    approval_file = run_root / "approval.json"
+    approval_hash = hashlib.sha256(approval_file.read_bytes()).hexdigest()
+    with fixture.repository.database.transaction() as connection:
+        connection.execute("DROP TABLE approved_artifacts")
+    fixture.repository.database.migrate()
+    if attack == "missing":
+        (run_root / "design.md").unlink()
+    elif attack == "changed":
+        (run_root / "design.md").write_text("changed", encoding="utf-8")
+    if attack == "wrong_hash":
+        approval_hash = "0" * 64
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    stderr = StringIO()
+
+    result = main(
+        [
+            "approve",
+            run_id,
+            "--approval-file",
+            str(approval_file),
+            "--confirm-hash",
+            approval_hash,
+            "--json",
+        ],
+        services=services,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert result != 0
+    assert fixture.repository.get_run(run_id).state is RunState.PREPARING_WORKTREE
+    with fixture.repository.database.connection() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) AS count FROM approved_artifacts WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()["count"]
+    assert count == 0
+    assert "restore exact approved content" in stderr.getvalue()
+    assert "same confirmation hash" in stderr.getvalue()
 
 
 def test_prepare_approval_converges_and_releases_lock_after_error(

@@ -95,6 +95,21 @@ def test_scheduler_does_not_invoke_orchestrator_without_active_runs(
     assert fixture.orchestrator.calls == []
 
 
+def test_scheduler_does_not_tick_ready_to_merge(tmp_path: Path) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("ready", "project", "hash")
+    with fixture.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.READY_TO_MERGE.value, "ready"),
+        )
+
+    result = fixture.scheduler.tick()
+
+    assert result.status == "idle"
+    assert fixture.orchestrator.calls == []
+
+
 def test_recent_run_uses_five_minute_poll_window(tmp_path: Path) -> None:
     current = [NOW]
     fixture = make_scheduler(tmp_path, clock=lambda: current[0])

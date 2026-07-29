@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -83,7 +84,8 @@ class RunRepository:
         return RunRecord.model_validate(dict(row))
 
     def list_active_runs(self) -> list[RunRecord]:
-        placeholders = ", ".join("?" for _ in TERMINAL_STATES)
+        inactive_states = (*TERMINAL_STATES, RunState.READY_TO_MERGE)
+        placeholders = ", ".join("?" for _ in inactive_states)
         with self.database.connection() as connection:
             rows = connection.execute(
                 f"""
@@ -91,7 +93,7 @@ class RunRepository:
                 WHERE state NOT IN ({placeholders})
                 ORDER BY created_at, run_id
                 """,
-                tuple(state.value for state in TERMINAL_STATES),
+                tuple(state.value for state in inactive_states),
             ).fetchall()
         return [RunRecord.model_validate(dict(row)) for row in rows]
 
@@ -913,9 +915,135 @@ class RunRepository:
         assert event_row is not None
         return EventRecord.model_validate(dict(event_row))
 
+    def backfill_approved_artifacts(
+        self,
+        run_id: str,
+        *,
+        approval_payload: object,
+        approval_sha256: str,
+        evidence_id: str,
+        approved_artifacts: dict[str, bytes],
+    ) -> bool:
+        """Backfill only a completely missing legacy artifact snapshot.
+
+        The original approval audit graph remains authoritative and unchanged.
+        """
+        snapshot = ApprovalSnapshot.model_validate(approval_payload)
+        if snapshot.run_id != run_id:
+            raise ValueError("approval run identity mismatch")
+        if sha256_payload(approval_payload) != approval_sha256:
+            raise ValueError("approval file digest mismatch")
+        if set(approved_artifacts) != set(REQUIRED_ARTIFACT_NAMES):
+            raise ValueError("approved artifact snapshot is incomplete")
+        payload_json = json.dumps(
+            approval_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        artifact_rows = tuple(
+            (
+                name,
+                approved_artifacts[name],
+                hashlib.sha256(approved_artifacts[name]).hexdigest(),
+            )
+            for name in REQUIRED_ARTIFACT_NAMES
+        )
+        if any(
+            not hmac.compare_digest(digest, snapshot.artifact_hashes[name])
+            for name, _contents, digest in artifact_rows
+        ):
+            raise ValueError("approved artifact snapshot digest mismatch")
+        with self.database.transaction() as connection:
+            run = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(run_id)
+            state = RunState(run["state"])
+            if state in {
+                RunState.DRAFT,
+                RunState.AWAITING_DESIGN_APPROVAL,
+                *TERMINAL_STATES,
+            }:
+                raise ValueError("run is not eligible for approval artifact backfill")
+            approval = connection.execute(
+                "SELECT approval_json FROM approvals WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            evidence = connection.execute(
+                "SELECT * FROM evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            events = connection.execute(
+                """
+                SELECT * FROM events
+                WHERE run_id = ? AND event_type = 'DESIGN_APPROVED'
+                ORDER BY created_at, event_id
+                """,
+                (run_id,),
+            ).fetchall()
+            matching_events = [
+                event
+                for event in events
+                if json.loads(event["evidence_json"]) == [evidence_id]
+                and event["to_state"] == RunState.APPROVED.value
+            ]
+            if (
+                approval is None
+                or approval["approval_json"] != payload_json
+                or snapshot.project_id != run["project_id"]
+                or snapshot.config_hash != run["config_hash"]
+                or evidence is None
+                or evidence["run_id"] != run_id
+                or evidence["kind"] != "explicit_approval"
+                or evidence["payload_json"] != payload_json
+                or not hmac.compare_digest(evidence["sha256"], approval_sha256)
+                or len(matching_events) != 1
+                or matching_events[0]["from_state"]
+                != RunState.AWAITING_DESIGN_APPROVAL.value
+            ):
+                raise ValueError("approved run has a conflicting audit binding")
+            stored = connection.execute(
+                "SELECT * FROM approved_artifacts WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            if stored:
+                expected = {
+                    name: (contents, digest, approval_sha256)
+                    for name, contents, digest in artifact_rows
+                }
+                actual = {
+                    item["artifact_name"]: (
+                        bytes(item["content"]),
+                        item["sha256"],
+                        item["approval_sha256"],
+                    )
+                    for item in stored
+                }
+                if actual != expected:
+                    raise ValueError("approved run has a conflicting audit binding")
+                return False
+            connection.executemany(
+                """
+                INSERT INTO approved_artifacts (
+                    run_id, artifact_name, content, sha256, approval_sha256
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (run_id, name, contents, digest, approval_sha256)
+                    for name, contents, digest in artifact_rows
+                ),
+            )
+        return True
+
     def get_approved_artifacts(self, run_id: str) -> dict[str, bytes]:
         approval_json, evidence = self.get_approval_binding(run_id)
-        approval_hash = sha256_payload(json.loads(approval_json))
+        approval_payload = json.loads(approval_json)
+        snapshot = ApprovalSnapshot.model_validate(approval_payload)
+        approval_hash = sha256_payload(approval_payload)
         if evidence.sha256 != approval_hash:
             raise ValueError("approval artifact binding digest is inconsistent")
         with self.database.connection() as connection:
@@ -933,10 +1061,14 @@ class RunRepository:
         if set(captured) != set(REQUIRED_ARTIFACT_NAMES):
             raise ValueError("approved artifact snapshot is incomplete")
         for row in rows:
+            content_hash = hashlib.sha256(bytes(row["content"])).hexdigest()
             if (
                 row["approval_sha256"] != approval_hash
-                or hashlib.sha256(bytes(row["content"])).hexdigest()
-                != row["sha256"]
+                or not hmac.compare_digest(content_hash, row["sha256"])
+                or not hmac.compare_digest(
+                    row["sha256"],
+                    snapshot.artifact_hashes[row["artifact_name"]],
+                )
             ):
                 raise ValueError("approved artifact snapshot is corrupt")
         return captured

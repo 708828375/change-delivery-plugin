@@ -691,6 +691,18 @@ class RuntimeTestEnvironmentPort:
     ) -> dict[str, object]:
         if run.head_sha is None:
             raise ValueError("run head SHA is missing")
+        missing_fields = []
+        if not isinstance(config.version_endpoint, str) or not config.version_endpoint:
+            missing_fields.append("version_endpoint")
+        if config.acceptance_check is None:
+            missing_fields.append("acceptance_check")
+        if missing_fields:
+            return {
+                "sha": run.head_sha,
+                "passed": False,
+                "reason": "DEPLOYMENT_CONFIG_INCOMPLETE",
+                "missing_fields": missing_fields,
+            }
         git = self._git_factory(config)
         git.fetch(config.remote)  # type: ignore[attr-defined]
         observed = git.remote_sha(  # type: ignore[attr-defined]

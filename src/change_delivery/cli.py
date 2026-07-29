@@ -663,11 +663,18 @@ def _approve_locked(
 ) -> dict[str, Any]:
     repository = services.get_repository()
     run = repository.get_run(args.run_id)
-    if run.state not in {
-        RunState.AWAITING_DESIGN_APPROVAL,
-        RunState.APPROVED,
+    if run.state in {
+        RunState.DRAFT,
+        RunState.COMPLETED,
+        RunState.CANCELLED,
+        RunState.FAILED_TERMINAL,
     }:
-        raise CliUsageError("run is not awaiting design approval")
+        raise CliUsageError("run cannot approve or backfill approval artifacts")
+    backfill_hint = (
+        "legacy approval backfill refused; restore exact approved content "
+        "and rerun approve with the same confirmation hash"
+    )
+    is_backfill = run.state is not RunState.AWAITING_DESIGN_APPROVAL
     run_root = _child(services.plugin_root, "runs", run.run_id)
     _require_safe_directory_chain(services.plugin_root, run_root)
     expected = run_root / "approval.json"
@@ -683,30 +690,52 @@ def _approve_locked(
     contents = _stable_read(expected, limit=MAX_REQUIREMENT_BYTES)
     file_sha = hashlib.sha256(contents).hexdigest()
     if not hmac.compare_digest(args.confirm_hash, file_sha):
+        if is_backfill:
+            raise CliUsageError(backfill_hint)
         raise CliUsageError("confirmation hash does not match approval candidate")
     snapshot = ApprovalSnapshot.model_validate(json.loads(contents))
     if not _approval_identity_matches(snapshot, run, project):
         raise CliUsageError("approval identity does not match run")
     artifacts = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
-    approved_artifacts = capture_approval_artifacts(
-        snapshot,
-        artifacts,
-        run.config_hash,
-    )
+    try:
+        approved_artifacts = capture_approval_artifacts(
+            snapshot,
+            artifacts,
+            run.config_hash,
+        )
+    except (OSError, ValueError) as error:
+        if is_backfill:
+            raise CliUsageError(backfill_hint) from error
+        raise
     payload = json.loads(contents)
-    repository.approve_with_evidence(
-        run.run_id,
-        approval_payload=payload,
-        approval_sha256=file_sha,
-        evidence_id=f"explicit-approval:{run.run_id}:{file_sha}",
-        approved_artifacts=approved_artifacts,
-    )
+    evidence_id = f"explicit-approval:{run.run_id}:{file_sha}"
+    backfilled = False
+    if run.state is RunState.AWAITING_DESIGN_APPROVAL:
+        repository.approve_with_evidence(
+            run.run_id,
+            approval_payload=payload,
+            approval_sha256=file_sha,
+            evidence_id=evidence_id,
+            approved_artifacts=approved_artifacts,
+        )
+    else:
+        try:
+            backfilled = repository.backfill_approved_artifacts(
+                run.run_id,
+                approval_payload=payload,
+                approval_sha256=file_sha,
+                evidence_id=evidence_id,
+                approved_artifacts=approved_artifacts,
+            )
+        except ValueError as error:
+            raise CliUsageError(backfill_hint) from error
     return {
         "ok": True,
         "run_id": run.run_id,
-        "state": RunState.APPROVED.value,
+        "state": repository.get_run(run.run_id).state.value,
         "approval_sha256": file_sha,
-        "idempotent": run.state is RunState.APPROVED,
+        "idempotent": run.state is not RunState.AWAITING_DESIGN_APPROVAL,
+        "backfilled": backfilled,
     }
 
 
