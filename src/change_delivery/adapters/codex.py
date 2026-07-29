@@ -29,7 +29,6 @@ CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 THREAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 SCRIPT_SUFFIXES = {".cmd", ".ps1", ".bat", ".sh"}
-AUTH_ENV_NAMES = ("OPENAI_API_KEY",)
 FIXED_CONFIG = (
     'approval_policy="never"',
     'shell_environment_policy.inherit="none"',
@@ -136,6 +135,10 @@ class _NeedsRepair(ValueError):
     pass
 
 
+class CodexOutputError(BlockedError):
+    """The required controlled ``-o`` result could not be consumed."""
+
+
 class CodexAdapter:
     """Execute schema-bound Codex stages without a shell.
 
@@ -150,6 +153,7 @@ class CodexAdapter:
         result_root: Path,
         codex_executable: Path,
         sandbox_home_root: Path,
+        auth_mode: Literal["auth_file", "api_key"],
         *,
         auth_source: Path | None = None,
         approved_skill_registry: Mapping[str, Path] | None = None,
@@ -162,7 +166,19 @@ class CodexAdapter:
             sandbox_home_root,
             "sandbox home root",
         )
-        self._auth_source = self._validate_auth_source(auth_source)
+        self._auth_mode = auth_mode
+        if auth_mode == "auth_file":
+            if auth_source is None:
+                raise ValueError("auth_file mode requires auth_source")
+            self._auth_source = self._validate_auth_source(auth_source)
+            self._auth_env_names: tuple[str, ...] = ()
+        elif auth_mode == "api_key":
+            if auth_source is not None:
+                raise ValueError("api_key mode forbids auth_source")
+            self._auth_source = None
+            self._auth_env_names = ("OPENAI_API_KEY",)
+        else:
+            raise ValueError("invalid auth mode")
         self._approved_skills = self._validate_skill_registry(
             approved_skill_registry or {},
         )
@@ -293,7 +309,7 @@ class CodexAdapter:
             ),
             workdir=workdir,
             timeout_seconds=7200,
-            env_names=AUTH_ENV_NAMES,
+            env_names=self._auth_env_names,
         )
 
     def _invoke(
@@ -431,20 +447,13 @@ class CodexAdapter:
         raise _NeedsRepair("no unambiguous JSON object")
 
     def _select_output(self, output_path: Path, stdout: str) -> bytes:
-        if output_path.exists():
-            try:
-                file_output = self._read_and_remove_output(output_path)
-            except OSError:
-                raise _UnrepairableOutput("Codex output could not be read safely") from None
-        else:
-            file_output = b""
-        stdout_output = stdout.encode("utf-8") if stdout else b""
-        selected = file_output or stdout_output
-        if not selected:
-            raise ValueError("Codex produced no output")
-        if len(selected) > MAX_OUTPUT_BYTES:
-            raise _UnrepairableOutput("Codex output exceeds size limit")
-        return selected
+        del stdout
+        if not output_path.exists():
+            raise CodexOutputError("required Codex output file is missing")
+        try:
+            return self._read_and_remove_output(output_path)
+        except OSError:
+            raise CodexOutputError("Codex output file could not be read safely") from None
 
     def _read_and_remove_output(self, output_path: Path) -> bytes:
         before = output_path.lstat()
@@ -545,11 +554,13 @@ class CodexAdapter:
     def _validate_auth_source(path: Path | None) -> Path | None:
         if path is None:
             return None
+        attributes = getattr(path.lstat(), "st_file_attributes", 0) if path.exists() else 0
         if (
             not path.is_absolute()
             or path.name != "auth.json"
             or not path.is_file()
             or path.is_symlink()
+            or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         ):
             raise ValueError("auth source must be an absolute regular auth.json")
         return path.resolve(strict=True)

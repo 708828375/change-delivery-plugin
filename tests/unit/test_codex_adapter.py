@@ -90,10 +90,13 @@ class FakeRunner:
         if isinstance(outcome, bytes):
             output_path.write_bytes(outcome)
             return process_result()
+        if outcome.startswith("STDOUT:"):
+            return process_result(outcome.removeprefix("STDOUT:"))
         if outcome.startswith("FILE:"):
             output_path.write_text(outcome.removeprefix("FILE:"), encoding="utf-8")
             return process_result()
-        return process_result(outcome)
+        output_path.write_text(outcome, encoding="utf-8")
+        return process_result()
 
 
 class BlockingRunner:
@@ -112,7 +115,9 @@ class BlockingRunner:
         self.release.wait(2)
         with self.lock:
             self.active -= 1
-        return process_result(payload())
+        output = Path(spec.args[spec.args.index("-o") + 1])
+        output.write_text(payload(), encoding="utf-8")
+        return process_result()
 
 
 def request(tmp_path: Path, **overrides: object) -> StageExecutionRequest:
@@ -155,6 +160,7 @@ def adapter(
         "stage_schema_path": schema,
         "result_root": result_root,
         "sandbox_home_root": sandbox_home_root,
+        "auth_mode": "api_key",
         "approved_skill_registry": {"requesting-code-review": skill},
         "codex_executable": launcher,
         "limiter_timeout_seconds": 0.05,
@@ -272,6 +278,15 @@ def test_output_file_is_authoritative_and_stdout_is_only_diagnostic(
     assert result.status == "failed"
 
 
+def test_stdout_fake_passed_never_replaces_missing_output_file(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(f"STDOUT:{payload()}")
+    with pytest.raises(BlockedError, match="output"):
+        adapter(tmp_path, runner).run_stage(request(tmp_path))
+    assert len(runner.commands) == 1
+
+
 def test_invalid_json_gets_one_read_only_repair_in_isolated_directory(
     tmp_path: Path,
 ) -> None:
@@ -300,6 +315,13 @@ def test_second_invalid_result_blocks_without_third_call(tmp_path: Path) -> None
     with pytest.raises(BlockedError, match="format|schema"):
         adapter(tmp_path, runner).run_stage(request(tmp_path))
 
+    assert len(runner.commands) == 2
+
+
+def test_repair_also_requires_controlled_output_file(tmp_path: Path) -> None:
+    runner = FakeRunner("not json", f"STDOUT:{payload(status='failed')}")
+    with pytest.raises(BlockedError, match="output"):
+        adapter(tmp_path, runner).run_stage(request(tmp_path))
     assert len(runner.commands) == 2
 
 
@@ -532,6 +554,7 @@ def test_isolated_home_copies_only_auth_and_selected_approved_skill(
     adapter(
         tmp_path,
         runner,
+        auth_mode="auth_file",
         auth_source=user_home / "auth.json",
     ).run_stage(request(tmp_path))
 
@@ -542,6 +565,39 @@ def test_isolated_home_copies_only_auth_and_selected_approved_skill(
         "skills/requesting-code-review/SKILL.md",
     )
     assert not Path(runner.fixed_environments[0]["CODEX_HOME"]).exists()
+
+
+def test_auth_modes_are_explicit_mutually_exclusive_and_set_exact_env(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    for mode, source in (
+        ("auth_file", None),
+        ("api_key", auth),
+    ):
+        with pytest.raises(ValueError, match="auth"):
+            adapter(
+                tmp_path,
+                FakeRunner(),
+                auth_mode=mode,
+                auth_source=source,
+            )
+
+    file_runner = FakeRunner(payload())
+    adapter(
+        tmp_path,
+        file_runner,
+        auth_mode="auth_file",
+        auth_source=auth,
+    ).run_stage(request(tmp_path))
+    assert file_runner.commands[0].env_names == ()
+    assert "auth.json" in file_runner.home_snapshots[0]
+
+    key_runner = FakeRunner(payload())
+    adapter(tmp_path, key_runner, auth_mode="api_key").run_stage(request(tmp_path))
+    assert key_runner.commands[0].env_names == ("OPENAI_API_KEY",)
+    assert "auth.json" not in key_runner.home_snapshots[0]
 
 
 def test_result_root_must_exist_and_not_overlap_worktree(tmp_path: Path) -> None:
