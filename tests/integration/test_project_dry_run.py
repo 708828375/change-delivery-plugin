@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 from email.message import Message
 from pathlib import Path
 import time
@@ -10,8 +11,10 @@ import pytest
 
 from change_delivery.adapters.git import GitDiscoveryAttestation, RepositoryIdentity
 from change_delivery.adapters.http import (
+    AddressResolver,
     HttpMethodNotAllowed,
     HttpReadError,
+    MultiprocessAddressResolver,
     PinnedHttpsTransport,
     ReadOnlyHttpClient,
     SecureHttpTransport,
@@ -285,6 +288,9 @@ class FakeResponse:
         self._offset += len(chunk)
         return chunk
 
+    def read1(self, size: int = -1) -> bytes:
+        return self.read(size)
+
     def geturl(self) -> str:
         return self._url
 
@@ -305,6 +311,21 @@ class FakeTransport(SecureHttpTransport):
         return outcome
 
 
+class FakeResolver(AddressResolver):
+    def __init__(self, answers) -> None:
+        self.answers = tuple(answers)
+        self.calls = []
+
+    def resolve(self, hostname: str, port: int, *, deadline: float):
+        self.calls.append((hostname, port, deadline))
+        return self.answers
+
+
+def slow_dns_worker(_hostname: str, _port: int):
+    time.sleep(1)
+    return ("93.184.216.34",)
+
+
 @pytest.mark.parametrize(
     "hostname,addresses",
     (
@@ -317,14 +338,8 @@ def test_pinned_transport_rejects_any_non_public_resolution(
     hostname,
     addresses,
 ) -> None:
-    def resolver(_host, port, **_kwargs):
-        return [
-            (2, 1, 6, "", (address, port))
-            for address in addresses
-        ]
-
     transport = PinnedHttpsTransport(
-        resolver=resolver,
+        resolver=FakeResolver(addresses),
         connector=lambda *_args, **_kwargs: pytest.fail("must not connect"),
     )
 
@@ -333,22 +348,8 @@ def test_pinned_transport_rejects_any_non_public_resolution(
 
 
 def test_pinned_transport_resolves_once_and_connects_to_frozen_ip() -> None:
-    resolutions = iter(
-        (
-            ("93.184.216.34",),
-            ("127.0.0.1",),
-        )
-    )
-    resolve_calls = 0
+    resolver = FakeResolver(("93.184.216.34",))
     attestations = []
-
-    def resolver(_host, port, **_kwargs):
-        nonlocal resolve_calls
-        resolve_calls += 1
-        return [
-            (2, 1, 6, "", (address, port))
-            for address in next(resolutions)
-        ]
 
     def connector(attestation, timeout):
         attestations.append((attestation, timeout))
@@ -361,10 +362,48 @@ def test_pinned_transport_resolves_once_and_connects_to_frozen_ip() -> None:
     with transport.get("https://example.com/version", timeout=10):
         pass
 
-    assert resolve_calls == 1
+    assert len(resolver.calls) == 1
     assert attestations[0][0].hostname == "example.com"
     assert attestations[0][0].pinned_ip == "93.184.216.34"
     assert attestations[0][0].addresses == ("93.184.216.34",)
+
+
+def test_pinned_transport_falls_back_without_resolving_again() -> None:
+    resolver = FakeResolver(("93.184.216.34", "93.184.216.35"))
+    pinned = []
+
+    def connector(attestation, timeout):
+        pinned.append(attestation.pinned_ip)
+        if len(pinned) == 1:
+            raise OSError("first address unavailable")
+        return FakeResponse({"ok": True})
+
+    transport = PinnedHttpsTransport(
+        resolver=resolver,
+        connector=connector,
+    )
+    with transport.get("https://example.com/version", timeout=10):
+        pass
+
+    assert len(resolver.calls) == 1
+    assert pinned == ["93.184.216.34", "93.184.216.35"]
+
+
+def test_multiprocess_dns_is_terminated_at_hard_deadline() -> None:
+    resolver = MultiprocessAddressResolver(worker=slow_dns_worker)
+    before = {child.pid for child in multiprocessing.active_children()}
+    started = time.monotonic()
+
+    with pytest.raises(HttpReadError, match="deadline"):
+        resolver.resolve(
+            "example.com",
+            443,
+            deadline=started + 0.05,
+        )
+
+    elapsed = time.monotonic() - started
+    assert 0.04 <= elapsed < 0.5
+    assert {child.pid for child in multiprocessing.active_children()} == before
 
 
 def test_http_client_uses_get_ten_second_timeout_and_three_attempts() -> None:
@@ -494,6 +533,15 @@ def test_http_client_fails_closed_without_read_timeout_control() -> None:
     client = ReadOnlyHttpClient(transport=FakeTransport((response,)))
 
     with pytest.raises(HttpReadError, match="enforce read deadline"):
+        client.get_json("https://example.invalid/version")
+
+
+def test_http_client_fails_closed_without_single_read_contract() -> None:
+    response = FakeResponse(b"{}")
+    response.read1 = None
+    client = ReadOnlyHttpClient(transport=FakeTransport((response,)))
+
+    with pytest.raises(HttpReadError, match="single-read"):
         client.get_json("https://example.invalid/version")
 
 

@@ -4,6 +4,7 @@ from collections.abc import Callable
 import os
 from pathlib import Path
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -333,6 +334,41 @@ def test_discovery_attestation_fails_closed_for_zero_file_identity(
 
     with pytest.raises(RemoteIdentityChanged, match="reliable"):
         adapter.discovery_attestation("origin", ("develop",))
+
+
+def test_real_fetch_writer_is_blocked_while_attestation_holds_project_lock(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, repo, _ = local_remote
+    runner = HookedRunner()
+    adapter = adapter_for(repo, runner=runner)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold_snapshot() -> None:
+        entered.set()
+        assert release.wait(5)
+
+    runner.arm("for-each-ref", hold_snapshot)
+    errors = []
+
+    def attest() -> None:
+        try:
+            adapter.discovery_attestation("origin", ("develop",))
+        except Exception as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=attest)
+    thread.start()
+    assert entered.wait(5)
+    try:
+        with pytest.raises(BlockedError, match="lock"):
+            adapter.fetch("origin")
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_worktree_creation_uses_frozen_expected_base_sha(

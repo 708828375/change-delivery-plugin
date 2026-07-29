@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import ctypes
+from functools import wraps
 import hmac
 import os
 from pathlib import Path
@@ -10,9 +11,10 @@ import threading
 from typing import Protocol
 
 from pydantic import Field
+from filelock import FileLock, Timeout
 
 from change_delivery.domain import CommandSpec, FrozenModel
-from change_delivery.errors import DeliveryError
+from change_delivery.errors import BlockedError, DeliveryError
 from change_delivery.locking import project_lock_path, project_read_lock
 from change_delivery.process import ProcessResult, ProcessRunner
 from change_delivery.redaction import redact_text
@@ -126,7 +128,7 @@ class _StableDirectoryHandle:
         handle = kernel32.CreateFileW(
             str(self._path),
             0x0001,
-            0x00000001 | 0x00000002 | 0x00000004,
+            0x00000001 | 0x00000002,
             None,
             3,
             0x02000000 | 0x00200000,
@@ -198,6 +200,19 @@ class RemoteIdentityChanged(GitError):
     """The configured remote no longer has its registered fetch/push identity."""
 
 
+def _project_write(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        self.discovery_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self._project_file_lock, self._attestation_lock:
+                return method(self, *args, **kwargs)
+        except Timeout as error:
+            raise BlockedError("project delivery lock is held") from error
+
+    return locked
+
+
 def _git_environment(names: tuple[str, ...]) -> dict[str, str]:
     values = {
         "GIT_CONFIG_NOSYSTEM": "true",
@@ -239,6 +254,10 @@ class GitAdapter:
         self.discovery_lock_path = project_lock_path(
             self.repo_path,
             lock_root=lock_root,
+        )
+        self._project_file_lock = FileLock(
+            self.discovery_lock_path,
+            timeout=0,
         )
         self._attestation_lock = threading.RLock()
         with self._open_repository_handle() as repository_handle:
@@ -285,6 +304,7 @@ class GitAdapter:
                     reason="repository identity changed during initialization",
                 )
 
+    @_project_write
     def fetch(self, remote: str) -> None:
         self._require_bound_remote(remote)
         self._assert_remote_identity()
@@ -375,6 +395,7 @@ class GitAdapter:
                 branch_shas=branch_shas,
             )
 
+    @_project_write
     def create_worktree(
         self,
         base_ref: str,
@@ -432,6 +453,7 @@ class GitAdapter:
             workdir=resolved,
         ).stdout
 
+    @_project_write
     def commit_all(self, workdir: Path, message: str) -> str:
         resolved = self._require_secondary_worktree(workdir)
         self._validate_commit_message(message)
@@ -457,6 +479,7 @@ class GitAdapter:
         self._validate_branch(branch)
         return branch
 
+    @_project_write
     def staged_tree(self, workdir: Path, *, stage_all: bool) -> str:
         resolved = self._require_secondary_worktree(workdir)
         if not isinstance(stage_all, bool):
@@ -466,6 +489,7 @@ class GitAdapter:
         result = self._run("write_tree", ("write-tree",), workdir=resolved)
         return self._parse_single_sha(result.stdout, "write_tree")
 
+    @_project_write
     def commit_tree_cas(
         self,
         workdir: Path,
@@ -555,6 +579,7 @@ class GitAdapter:
             "message": message,
         }
 
+    @_project_write
     def push_feature(
         self,
         workdir: Path,
@@ -591,6 +616,7 @@ class GitAdapter:
             raise GitError("push_feature", reason="remote SHA verification failed")
         return expected
 
+    @_project_write
     def push_test_with_lease(
         self,
         remote: str,
@@ -641,6 +667,7 @@ class GitAdapter:
             )
         return source
 
+    @_project_write
     def remove_clean_worktree(self, path: Path) -> None:
         target = Path(path)
         if not target.is_absolute():
@@ -657,6 +684,7 @@ class GitAdapter:
             ("worktree", "remove", str(target)),
         )
 
+    @_project_write
     def delete_merged_local_branch(self, branch: str) -> None:
         self._validate_branch(branch)
         if branch.casefold() in self._protected_branches:
