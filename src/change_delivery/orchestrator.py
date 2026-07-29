@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 from typing import Protocol
 
@@ -48,6 +49,10 @@ class StageExecutor(Protocol):
         run: RunRecord,
         config: ProjectConfig,
         run_root: Path,
+        *,
+        operation_identity: str | None = None,
+        tested_tree_sha: str | None = None,
+        checks_identity: str | None = None,
     ) -> StageResult: ...
 
 
@@ -363,6 +368,8 @@ class Orchestrator:
         tested_tree_sha: str | None = None
         validation_attestation_id: str | None = None
         validation_attestation: object | None = None
+        validation_operation_identity: str | None = None
+        checks_identity: str | None = None
         if stage == "local_validation":
             if self.commit_port is None:
                 return self._blocked_dependency(run, "validation tree fact adapter")
@@ -378,6 +385,10 @@ class Orchestrator:
                     action="local_validation_blocked",
                     blocked_reason="validation tree SHA is invalid",
                 )
+            validation_operation_identity = (
+                f"local-validation:{run.run_id}:{secrets.token_hex(16)}"
+            )
+            checks_identity = self._checks_identity(config)
         if stage == "internal_review":
             if self.commit_port is None:
                 return self._blocked_dependency(run, "review tree fact adapter")
@@ -404,12 +415,23 @@ class Orchestrator:
                     blocked_reason="worktree changed after local validation",
                 )
             validation_attestation_id = validation_attestation.evidence_id
-        result = self.stage_executor.execute(
-            stage,
-            run,
-            config,
-            self._run_root(run.run_id),
-        )
+        if stage == "local_validation":
+            result = self.stage_executor.execute(
+                stage,
+                run,
+                config,
+                self._run_root(run.run_id),
+                operation_identity=validation_operation_identity,
+                tested_tree_sha=tested_tree_sha,
+                checks_identity=checks_identity,
+            )
+        else:
+            result = self.stage_executor.execute(
+                stage,
+                run,
+                config,
+                self._run_root(run.run_id),
+            )
         references = self.repository.rebind_primary_stage_result(
             run.run_id,
             result,
@@ -424,6 +446,21 @@ class Orchestrator:
                     state=run.state,
                     action="local_validation_blocked",
                     blocked_reason="worktree changed during local validation",
+                )
+            if result.status == "passed" and not self._validation_sources_match(
+                run,
+                references,
+                tested_tree_sha,
+                validation_operation_identity,
+                checks_identity,
+            ):
+                return StepOutcome(
+                    state=run.state,
+                    action="local_validation_blocked",
+                    blocked_reason=(
+                        "local validation source evidence does not match "
+                        "this execution"
+                    ),
                 )
         if result.status != "passed":
             if stage == "local_validation":
@@ -475,14 +512,19 @@ class Orchestrator:
         transition_references = references
         if stage == "local_validation":
             assert tested_tree_sha is not None
+            assert validation_operation_identity is not None
+            assert checks_identity is not None
+            nonce = validation_operation_identity.rsplit(":", 1)[-1]
             validation_attestation = self.repository.register_evidence(
                 run.run_id,
-                f"validation-attestation:{run.run_id}:{tested_tree_sha}",
+                f"validation-attestation:{run.run_id}:{tested_tree_sha}:{nonce}",
                 "local_validation_attestation",
                 {
                     "passed": True,
                     "tested_tree_sha": tested_tree_sha,
                     "expected_parent_sha": run.head_sha,
+                    "operation_identity": validation_operation_identity,
+                    "checks_identity": checks_identity,
                     "source_evidence_ids": [
                         reference.evidence_id for reference in references
                     ],
@@ -526,6 +568,56 @@ class Orchestrator:
             ),
         )
 
+    @staticmethod
+    def _checks_identity(config: ProjectConfig) -> str:
+        payload = [
+            check.model_dump(mode="json")
+            for check in config.required_pre_pr_checks
+        ]
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _validation_sources_match(
+        self,
+        run: RunRecord,
+        references: tuple[object, ...],
+        tested_tree_sha: str | None,
+        operation_identity: str | None,
+        checks_identity: str | None,
+    ) -> bool:
+        if (
+            tested_tree_sha is None
+            or operation_identity is None
+            or checks_identity is None
+            or not references
+        ):
+            return False
+        for reference in references:
+            try:
+                evidence = self.repository.get_evidence(  # type: ignore[attr-defined]
+                    reference.evidence_id  # type: ignore[attr-defined]
+                )
+                payload = json.loads(evidence.payload_json)
+            except (AttributeError, KeyError, TypeError, json.JSONDecodeError):
+                return False
+            if (
+                evidence.run_id != run.run_id
+                or evidence.kind != "local_validation_passed"
+                or type(payload) is not dict
+                or payload.get("passed") is not True
+                or payload.get("sha") != run.head_sha
+                or payload.get("tested_tree_sha") != tested_tree_sha
+                or payload.get("operation_identity") != operation_identity
+                or payload.get("checks_identity") != checks_identity
+            ):
+                return False
+        return True
+
     def _local_validation_attestation(self, run: RunRecord) -> object:
         candidates = [
             evidence
@@ -540,6 +632,13 @@ class Orchestrator:
             type(payload) is not dict
             or payload.get("passed") is not True
             or payload.get("expected_parent_sha") != run.head_sha
+            or not isinstance(payload.get("operation_identity"), str)
+            or not payload["operation_identity"].startswith(
+                f"local-validation:{run.run_id}:"
+            )
+            or not isinstance(payload.get("checks_identity"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", payload["checks_identity"])
+            is None
             or not isinstance(payload.get("tested_tree_sha"), str)
             or re.fullmatch(r"[0-9a-f]{40}", payload["tested_tree_sha"])
             is None
@@ -1251,9 +1350,9 @@ class Orchestrator:
             or snapshot.is_draft is not False
         ):
             if (
-                snapshot.checks_passed is not True
-                or snapshot.review_decision is not True
-                or snapshot.threads_resolved is not True
+                snapshot.checks_status == "failed"
+                or snapshot.review_status == "changes_requested"
+                or bool(snapshot.unresolved_thread_ids)
             ):
                 self.repository.transition_with_evidence(
                     run.run_id,

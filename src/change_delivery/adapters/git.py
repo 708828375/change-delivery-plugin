@@ -180,6 +180,8 @@ class GitAdapter:
         base_ref: str,
         branch: str,
         worktree_path: Path,
+        *,
+        expected_base_sha: str | None = None,
     ) -> WorktreeResult:
         canonical_base_ref = self._canonical_remote_base_ref(base_ref)
         self._validate_branch(branch)
@@ -199,6 +201,16 @@ class GitAdapter:
             ),
         )
         base_sha = self._parse_single_sha(base_result.stdout, "resolve_base")
+        frozen_base = (
+            base_sha
+            if expected_base_sha is None
+            else self._normalize_sha(expected_base_sha)
+        )
+        if base_sha != frozen_base:
+            raise GitError(
+                "create_worktree",
+                reason="remote base does not match expected SHA",
+            )
         self._run(
             "create_worktree",
             (
@@ -207,10 +219,10 @@ class GitAdapter:
                 "-b",
                 branch,
                 str(target),
-                canonical_base_ref,
+                frozen_base if expected_base_sha is not None else canonical_base_ref,
             ),
         )
-        return WorktreeResult(path=target, branch=branch, base_sha=base_sha)
+        return WorktreeResult(path=target, branch=branch, base_sha=frozen_base)
 
     def status_short(self, workdir: Path) -> str:
         resolved = self._existing_directory(workdir)

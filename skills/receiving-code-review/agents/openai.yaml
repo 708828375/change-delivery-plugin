@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Fix Executor"
+  short_description: "Apply approved CI and review fixes safely"
+  default_prompt: "Use $receiving-code-review to apply actionable review fixes."

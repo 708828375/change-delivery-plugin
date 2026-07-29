@@ -500,6 +500,33 @@ def test_parse_snapshot_fails_closed_for_unready_status(
     assert not snapshot.ready_to_merge
 
 
+@pytest.mark.parametrize(
+    ("changes", "checks_status", "review_status"),
+    [
+        ({"conclusions": ()}, "pending", "approved"),
+        ({"conclusions": ("FAILURE",)}, "failed", "approved"),
+        ({"review_decision": "REVIEW_REQUIRED"}, "passed", "pending"),
+        (
+            {"review_decision": "CHANGES_REQUESTED"},
+            "passed",
+            "changes_requested",
+        ),
+    ],
+)
+def test_parse_snapshot_preserves_authoritative_gate_status(
+    tmp_path: Path,
+    changes: dict[str, object],
+    checks_status: str,
+    review_status: str,
+) -> None:
+    adapter = GitHubAdapter(FakeRunner(), project_config(tmp_path))
+
+    snapshot = adapter.parse_snapshot(snapshot_payload(**changes), ())
+
+    assert snapshot.checks_status == checks_status
+    assert snapshot.review_status == review_status
+
+
 def test_parse_snapshot_rejects_unknown_status_and_missing_fields(
     tmp_path: Path,
 ) -> None:

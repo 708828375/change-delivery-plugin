@@ -21,7 +21,9 @@ from change_delivery.domain import (
     StageResult,
 )
 from change_delivery.orchestrator import Orchestrator
+from change_delivery.process import ProcessResult
 from change_delivery.repository import RunRepository
+from change_delivery.runtime import RuntimeStageExecutor
 
 
 SHA = "a" * 40
@@ -159,11 +161,23 @@ class FakeGitHub:
 @dataclass(frozen=True)
 class Snapshot:
     head_sha: str
-    checks_passed: bool = True
-    threads_resolved: bool = True
+    checks_status: str = "passed"
+    review_status: str = "approved"
+    unresolved_thread_ids: tuple[str, ...] = ()
     mergeable: bool = True
-    review_decision: bool = True
     is_draft: bool = False
+
+    @property
+    def checks_passed(self) -> bool:
+        return self.checks_status == "passed"
+
+    @property
+    def review_decision(self) -> bool:
+        return self.review_status == "approved"
+
+    @property
+    def threads_resolved(self) -> bool:
+        return not self.unresolved_thread_ids
 
 
 @dataclass(frozen=True)
@@ -190,19 +204,34 @@ class FakeStageExecutor:
         run: object,
         project: object,
         run_root: Path,
+        *,
+        operation_identity: str | None = None,
+        tested_tree_sha: str | None = None,
+        checks_identity: str | None = None,
     ) -> StageResult:
         self.calls.append(stage)
         run_id = run.run_id  # type: ignore[attr-defined]
         head_sha = run.head_sha  # type: ignore[attr-defined]
+        evidence_id = f"{stage}-proof:{run_id}"
+        if stage == "local_validation" and operation_identity is not None:
+            evidence_id = (
+                f"{evidence_id}:{operation_identity.rsplit(':', 1)[-1]}"
+            )
         reference = self.repository.register_evidence(
             run_id,
-            f"{stage}-proof:{run_id}",
+            evidence_id,
             (
                 "internal_review_source"
                 if stage == "internal_review"
                 else f"{stage}_passed"
             ),
-            {"sha": head_sha, "passed": True},
+            {
+                "sha": head_sha,
+                "passed": True,
+                "operation_identity": operation_identity,
+                "tested_tree_sha": tested_tree_sha,
+                "checks_identity": checks_identity,
+            },
         )
         return StageResult(
             status=self.status,
@@ -700,6 +729,119 @@ def test_default_cli_wires_git_and_github_adapters(
     assert git_initializations
     assert isinstance(github, StubGitHubAdapter)
     assert github_initializations
+    assert orchestrator.stage_executor is not None
+    assert orchestrator.worktree_port is not None
+    assert orchestrator.commit_port is not None
+
+
+def test_default_runtime_skills_are_bundled_with_plugin() -> None:
+    source_root = Path(cli_module.__file__).resolve().parents[2]
+    for name in (
+        "writing-plans",
+        "subagent-driven-development",
+        "verification-before-completion",
+        "requesting-code-review",
+        "receiving-code-review",
+    ):
+        assert (source_root / "skills" / name / "SKILL.md").is_file()
+
+
+def test_runtime_local_validation_registers_host_bound_source(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+
+    class PassingRunner:
+        def run(self, spec: object) -> ProcessResult:
+            return ProcessResult(
+                command_id="1" * 16,
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=1,
+            )
+
+    executor = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        runner=PassingRunner(),  # type: ignore[arg-type]
+    )
+    run = fixture.repository.get_run(run_id)
+
+    result = executor.execute(
+        "local_validation",
+        run,
+        config(fixture.root),
+        fixture.root / "runs" / run_id,
+        operation_identity=f"local-validation:{run_id}:nonce",
+        tested_tree_sha=TREE_SHA,
+        checks_identity="f" * 64,
+    )
+
+    evidence = fixture.repository.get_evidence(
+        result.evidence[0].evidence_id
+    )
+    payload = json.loads(evidence.payload_json)
+    assert evidence.kind == "local_validation_passed"
+    assert payload["operation_identity"].endswith(":nonce")
+    assert payload["tested_tree_sha"] == TREE_SHA
+    assert payload["checks_identity"] == "f" * 64
+    assert payload["commands"] == [
+        {"command_id": "1" * 16, "exit_code": 0}
+    ]
+
+
+def test_runtime_codex_stage_replaces_untrusted_model_evidence(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DRAFT)
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            worktree = request.worktree  # type: ignore[attr-defined]
+            (worktree / "design.md").write_text("design", encoding="utf-8")
+            (worktree / "implementation-plan.md").write_text(
+                "plan",
+                encoding="utf-8",
+            )
+            return StageResult(
+                status="passed",
+                summary="designed",
+                evidence=(
+                    EvidenceRef(
+                        evidence_id="model-invented",
+                        kind="model_invented",
+                        sha256="f" * 64,
+                    ),
+                ),
+                findings=(),
+                next_action="approve",
+            )
+
+    executor = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        codex_factory=lambda: FakeCodex(),
+    )
+    run = fixture.repository.get_run(run_id)
+
+    result = executor.execute(
+        "design",
+        run,
+        config(fixture.root),
+        fixture.root / "runs" / run_id,
+    )
+
+    assert result.evidence[0].evidence_id != "model-invented"
+    evidence = fixture.repository.get_evidence(
+        result.evidence[0].evidence_id
+    )
+    assert evidence.kind == "design_passed"
+    assert json.loads(evidence.payload_json)["artifact_hashes"]
+    with pytest.raises(KeyError):
+        fixture.repository.get_evidence("model-invented")
 
 
 def test_cli_release_is_disabled_and_has_no_side_effect(tmp_path: Path) -> None:
@@ -979,7 +1121,7 @@ def test_default_services_support_resume_cancel_and_tick(tmp_path: Path) -> None
         stdout=stdout,
         stderr=stderr,
     ) == 0
-    assert json.loads(stdout.getvalue())["action"] == "blocked_dependency"
+    assert json.loads(stdout.getvalue())["action"] != "blocked_dependency"
 
     stdout = StringIO()
     assert main(
@@ -1056,6 +1198,54 @@ def test_local_validation_rejects_tree_change_during_stage(
 
     assert outcome.state is RunState.LOCAL_VALIDATION
     assert "during local validation" in (outcome.blocked_reason or "")
+    assert not any(
+        evidence.kind == "local_validation_attestation"
+        for evidence in fixture.repository.list_evidence(run_id)
+    )
+
+
+def test_local_validation_rejects_stale_source_evidence_replay(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    stale = fixture.repository.register_evidence(
+        run_id,
+        f"stale-validation:{run_id}",
+        "local_validation_passed",
+        {
+            "sha": SHA,
+            "passed": True,
+            "operation_identity": "validation:stale",
+            "tested_tree_sha": TREE_SHA,
+            "checks_identity": "f" * 64,
+        },
+    )
+
+    class ReplayExecutor:
+        def execute(self, *args: object, **kwargs: object) -> StageResult:
+            return StageResult(
+                status="passed",
+                summary="replayed",
+                evidence=(stale,),
+                findings=(),
+                next_action="continue",
+            )
+
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=ReplayExecutor(),
+        commit_port=FakeCommitPort(),
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.LOCAL_VALIDATION
+    assert "source evidence" in (outcome.blocked_reason or "")
     assert not any(
         evidence.kind == "local_validation_attestation"
         for evidence in fixture.repository.list_evidence(run_id)
@@ -1176,6 +1366,47 @@ def test_commit_derives_review_evidence_for_new_head(
     assert payload["sha"] == NEW_SHA
     assert payload["tree_sha"] == TREE_SHA
     assert payload["passed"] is True
+
+
+def test_commit_rejects_validation_attestation_without_validation_event(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            """
+            DELETE FROM events
+            WHERE run_id = ? AND from_state = ? AND to_state = ?
+            """,
+            (
+                run_id,
+                RunState.LOCAL_VALIDATION.value,
+                RunState.INTERNAL_REVIEW.value,
+            ),
+        )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.COMMITTING
+    assert fixture.repository.get_run(run_id).head_sha == SHA
+    assert not any(
+        evidence.kind == "internal_review_passed"
+        for evidence in fixture.repository.list_evidence(run_id)
+    )
 
 
 @pytest.mark.parametrize("pending", [False, True])
@@ -1516,19 +1747,23 @@ def test_monitor_requires_all_six_gates_for_current_head(fixture: Fixture) -> No
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "expected_state"),
+    ("changes", "expected_state"),
     [
-        ("checks_passed", False, RunState.FIXING_CI_REVIEW),
-        ("threads_resolved", False, RunState.FIXING_CI_REVIEW),
-        ("mergeable", False, RunState.MONITORING_CI_REVIEW),
-        ("review_decision", False, RunState.FIXING_CI_REVIEW),
-        ("is_draft", True, RunState.MONITORING_CI_REVIEW),
+        ({"checks_status": "pending"}, RunState.MONITORING_CI_REVIEW),
+        ({"checks_status": "failed"}, RunState.FIXING_CI_REVIEW),
+        ({"review_status": "pending"}, RunState.MONITORING_CI_REVIEW),
+        ({"review_status": "changes_requested"}, RunState.FIXING_CI_REVIEW),
+        (
+            {"unresolved_thread_ids": ("PRRT_actionable",)},
+            RunState.FIXING_CI_REVIEW,
+        ),
+        ({"mergeable": False}, RunState.MONITORING_CI_REVIEW),
+        ({"is_draft": True}, RunState.MONITORING_CI_REVIEW),
     ],
 )
-def test_monitor_rejects_each_false_remote_gate(
+def test_monitor_distinguishes_waiting_from_actionable_failure(
     fixture: Fixture,
-    field: str,
-    value: bool,
+    changes: dict[str, object],
     expected_state: RunState,
 ) -> None:
     run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
@@ -1537,7 +1772,7 @@ def test_monitor_rejects_each_false_remote_gate(
             "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
             (run_id,),
         )
-    fixture.github.snapshot_result = Snapshot(SHA, **{field: value})
+    fixture.github.snapshot_result = Snapshot(SHA, **changes)
     for kind in ("acceptance_passed", "internal_review_passed"):
         fixture.repository.register_evidence(
             run_id, f"{kind}-ok", kind, {"sha": SHA, "passed": True}

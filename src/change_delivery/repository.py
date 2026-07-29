@@ -692,6 +692,72 @@ class RunRepository:
                 != expected_parent_sha
             ):
                 raise ValueError("commit tree is not bound to validation and review")
+            validation_source_ids = validation_payload.get(
+                "source_evidence_ids"
+            )
+            if (
+                type(validation_source_ids) is not list
+                or not validation_source_ids
+                or any(
+                    not isinstance(source_id, str)
+                    for source_id in validation_source_ids
+                )
+            ):
+                raise ValueError("validation source binding is invalid")
+            for source_id in validation_source_ids:
+                source = connection.execute(
+                    "SELECT * FROM evidence WHERE evidence_id = ?",
+                    (source_id,),
+                ).fetchone()
+                if source is None or source["run_id"] != run_id:
+                    raise ValueError(
+                        "validation source evidence is missing or forged"
+                    )
+                try:
+                    source_payload = json.loads(source["payload_json"])
+                except (json.JSONDecodeError, TypeError):
+                    raise ValueError(
+                        "validation source evidence payload is invalid"
+                    ) from None
+                if (
+                    source["kind"] != "local_validation_passed"
+                    or type(source_payload) is not dict
+                    or source_payload.get("passed") is not True
+                    or source_payload.get("sha") != expected_parent_sha
+                    or source_payload.get("tested_tree_sha")
+                    != commit_tree_sha
+                    or source_payload.get("operation_identity")
+                    != validation_payload.get("operation_identity")
+                    or source_payload.get("checks_identity")
+                    != validation_payload.get("checks_identity")
+                ):
+                    raise ValueError(
+                        "validation source evidence does not match attestation"
+                    )
+            validation_events = connection.execute(
+                """
+                SELECT evidence_json FROM events
+                WHERE run_id = ? AND from_state = ? AND to_state = ?
+                """,
+                (
+                    run_id,
+                    RunState.LOCAL_VALIDATION.value,
+                    RunState.INTERNAL_REVIEW.value,
+                ),
+            ).fetchall()
+            required_validation_ids = {
+                validation_id,
+                *validation_source_ids,
+            }
+            if not any(
+                required_validation_ids
+                <= set(json.loads(event["evidence_json"]))
+                for event in validation_events
+            ):
+                raise ValueError(
+                    "validation attestation sources are not bound "
+                    "to validation event"
+                )
             for source_id in source_evidence_ids:
                 source = connection.execute(
                     "SELECT run_id FROM evidence WHERE evidence_id = ?",

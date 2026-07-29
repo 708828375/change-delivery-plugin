@@ -221,6 +221,37 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
     )
 
 
+def test_worktree_creation_uses_frozen_expected_base_sha(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    _, _, repo, initial_sha = local_remote
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner)
+    worktree = tmp_path / "worktrees" / "frozen-base"
+
+    adapter.fetch("origin")
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/frozen-base",
+        worktree,
+        expected_base_sha=initial_sha,
+    )
+
+    assert any(
+        git_operation_args(spec.args)
+        == (
+            "worktree",
+            "add",
+            "-b",
+            "feature/frozen-base",
+            str(worktree.resolve()),
+            initial_sha,
+        )
+        for spec in runner.specs
+    )
+
+
 def test_commit_and_feature_push_are_direct_non_force_argv(
     local_remote: tuple[Path, Path, Path, str],
     tmp_path: Path,

@@ -147,11 +147,22 @@ class ReviewThread(FrozenModel):
 class CheckSnapshot(FrozenModel):
     head_sha: str = Field(pattern=r"^[0-9a-f]{40}$", strict=True)
     mergeable: bool = Field(strict=True)
-    review_decision: bool = Field(strict=True)
-    checks_passed: bool = Field(strict=True)
-    threads_resolved: bool = Field(strict=True)
+    review_status: Literal["approved", "pending", "changes_requested"]
+    checks_status: Literal["passed", "pending", "failed"]
     unresolved_thread_ids: tuple[str, ...]
     is_draft: bool = Field(strict=True)
+
+    @property
+    def review_decision(self) -> bool:
+        return self.review_status == "approved"
+
+    @property
+    def checks_passed(self) -> bool:
+        return self.checks_status == "passed"
+
+    @property
+    def threads_resolved(self) -> bool:
+        return not self.unresolved_thread_ids
 
     @property
     def ready_to_merge(self) -> bool:
@@ -396,7 +407,7 @@ class GitHubAdapter:
         is_draft = payload["isDraft"]
         if not isinstance(is_draft, bool):
             raise GitHubError("snapshot", "draft state was invalid")
-        checks_passed = self._checks_passed(payload["statusCheckRollup"])
+        checks_status = self._checks_status(payload["statusCheckRollup"])
         actionable_ids = tuple(
             sorted(
                 thread.thread_id
@@ -407,9 +418,16 @@ class GitHubAdapter:
         return CheckSnapshot(
             head_sha=sha,
             mergeable=mergeable_raw == "MERGEABLE",
-            review_decision=review_raw == "APPROVED",
-            checks_passed=checks_passed,
-            threads_resolved=not actionable_ids,
+            review_status=(
+                "approved"
+                if review_raw == "APPROVED"
+                else (
+                    "changes_requested"
+                    if review_raw == "CHANGES_REQUESTED"
+                    else "pending"
+                )
+            ),
+            checks_status=checks_status,
             unresolved_thread_ids=actionable_ids,
             is_draft=is_draft,
         )
@@ -679,11 +697,33 @@ class GitHubAdapter:
         return sha.lower()
 
     @staticmethod
-    def _checks_passed(raw_checks: Any) -> bool:
+    def _checks_status(
+        raw_checks: Any,
+    ) -> Literal["passed", "pending", "failed"]:
         normalized = GitHubAdapter._normalize_checks(raw_checks)
         if not normalized:
-            return False
-        return all(
+            return "pending"
+        if any(
+            (
+                entry[0] == "CheckRun"
+                and entry[3] == "COMPLETED"
+                and entry[4]
+                in {
+                    "FAILURE",
+                    "CANCELLED",
+                    "TIMED_OUT",
+                    "ACTION_REQUIRED",
+                    "STARTUP_FAILURE",
+                }
+            )
+            or (
+                entry[0] == "StatusContext"
+                and entry[3] in {"ERROR", "FAILURE"}
+            )
+            for entry in normalized
+        ):
+            return "failed"
+        if all(
             (
                 entry[0] == "CheckRun"
                 and entry[3] == "COMPLETED"
@@ -694,7 +734,9 @@ class GitHubAdapter:
                 and entry[3] == "SUCCESS"
             )
             for entry in normalized
-        )
+        ):
+            return "passed"
+        return "pending"
 
     @staticmethod
     def _normalize_checks(raw_checks: Any) -> tuple[tuple[str, ...], ...]:

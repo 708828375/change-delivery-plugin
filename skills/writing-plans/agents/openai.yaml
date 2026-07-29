@@ -1,0 +1,4 @@
+interface:
+  display_name: "Writing Plans"
+  short_description: "Create approved implementation plans safely"
+  default_prompt: "Use $writing-plans to create the delivery design and plan."

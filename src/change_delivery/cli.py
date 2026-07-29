@@ -33,6 +33,12 @@ from change_delivery.repository import RunRepository
 from change_delivery.redaction import redact_text
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessRunner
+from change_delivery.runtime import (
+    RuntimeCleanupPort,
+    RuntimeCommitPort,
+    RuntimeGitWorkspacePort,
+    RuntimeStageExecutor,
+)
 
 
 MAX_REQUIREMENT_BYTES = 1_048_576
@@ -247,6 +253,14 @@ class CliServices:
     def get_orchestrator(self) -> Any:
         if self.orchestrator is None:
             repository = self.get_repository()
+            stage_executor = RuntimeStageExecutor(
+                repository,
+                self.plugin_root,
+            )
+            workspace = RuntimeGitWorkspacePort(
+                repository,
+                self.plugin_root,
+            )
             self.orchestrator = Orchestrator(
                 repository=repository,
                 plugin_root=self.plugin_root,
@@ -256,6 +270,10 @@ class CliServices:
                     self.plugin_root,
                 ),
                 github_factory=_github_port,
+                stage_executor=stage_executor,
+                worktree_port=workspace,
+                commit_port=RuntimeCommitPort(workspace),
+                cleanup_port=RuntimeCleanupPort(workspace),
             )
         return self.orchestrator
 
