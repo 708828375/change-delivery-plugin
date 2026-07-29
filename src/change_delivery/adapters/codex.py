@@ -23,6 +23,7 @@ from change_delivery.process import ProcessResult
 
 
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_AUTH_BYTES = 1024 * 1024
 MAX_PRIMARY_PROMPT_BYTES = 16 * 1024
 MAX_REPAIR_INPUT_BYTES = 64 * 1024
 CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
@@ -181,12 +182,16 @@ class CodexAdapter:
         if auth_mode == "auth_file":
             if auth_source is None:
                 raise ValueError("auth_file mode requires auth_source")
-            self._auth_source = self._validate_auth_source(auth_source)
+            (
+                self._auth_source,
+                self._auth_identity,
+            ) = self._validate_auth_source(auth_source)
             self._auth_env_names: tuple[str, ...] = ()
         elif auth_mode == "api_key":
             if auth_source is not None:
                 raise ValueError("api_key mode forbids auth_source")
             self._auth_source = None
+            self._auth_identity = None
             self._auth_env_names = ("OPENAI_API_KEY",)
         else:
             raise ValueError("invalid auth mode")
@@ -356,8 +361,27 @@ class CodexAdapter:
         try:
             os.chmod(home, 0o700)
             if self._auth_source is not None:
-                shutil.copyfile(self._auth_source, home / "auth.json")
-                os.chmod(home / "auth.json", 0o600)
+                try:
+                    auth_bytes = self._read_auth_bytes(
+                        self._auth_source,
+                        self._auth_identity,
+                    )
+                except ValueError:
+                    raise BlockedError("auth source changed or became unsafe") from None
+                auth_target = home / "auth.json"
+                descriptor = os.open(
+                    auth_target,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                    0o600,
+                )
+                try:
+                    offset = 0
+                    while offset < len(auth_bytes):
+                        offset += os.write(descriptor, auth_bytes[offset:])
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                os.chmod(auth_target, 0o600)
             if expected_skill is not None:
                 source = self._approved_skills.get(expected_skill)
                 if source is None:
@@ -559,9 +583,11 @@ class CodexAdapter:
         return path.resolve(strict=True)
 
     @staticmethod
-    def _validate_auth_source(path: Path | None) -> Path | None:
+    def _validate_auth_source(
+        path: Path | None,
+    ) -> tuple[Path, tuple[int, int, int, int]]:
         if path is None:
-            return None
+            raise ValueError("auth source is required")
         if not path.is_absolute() or path.name != "auth.json" or not path.exists():
             raise ValueError("auth source must be an absolute regular auth.json")
         before = path.lstat()
@@ -579,7 +605,78 @@ class CodexAdapter:
             or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
         ):
             raise ValueError("auth source identity changed during validation")
-        return resolved
+        identity = CodexAdapter._file_identity(after)
+        CodexAdapter._read_auth_bytes(resolved, identity)
+        return resolved, identity
+
+    @staticmethod
+    def _file_identity(info: os.stat_result | object) -> tuple[int, int, int, int]:
+        return (
+            int(getattr(info, "st_dev")),
+            int(getattr(info, "st_ino")),
+            int(getattr(info, "st_size")),
+            int(getattr(info, "st_mtime_ns")),
+        )
+
+    @staticmethod
+    def _read_auth_bytes(
+        path: Path,
+        expected_identity: tuple[int, int, int, int] | None,
+    ) -> bytes:
+        if expected_identity is None:
+            raise ValueError("auth identity is missing")
+        try:
+            before = path.lstat()
+            if (
+                _is_link_or_reparse(path, before)
+                or not stat.S_ISREG(before.st_mode)
+                or CodexAdapter._file_identity(before) != expected_identity
+                or before.st_size > MAX_AUTH_BYTES
+            ):
+                raise ValueError("auth source identity changed")
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                chunks = bytearray()
+                while len(chunks) <= MAX_AUTH_BYTES:
+                    chunk = os.read(
+                        descriptor,
+                        min(64 * 1024, MAX_AUTH_BYTES + 1 - len(chunks)),
+                    )
+                    if not chunk:
+                        break
+                    chunks.extend(chunk)
+                after_handle = os.fstat(descriptor)
+                after_path = path.stat()
+                after_link = path.lstat()
+            finally:
+                os.close(descriptor)
+        except (OSError, AttributeError):
+            raise ValueError("auth source could not be read safely") from None
+        identities = (
+            CodexAdapter._file_identity(before),
+            CodexAdapter._file_identity(opened),
+            CodexAdapter._file_identity(after_handle),
+            CodexAdapter._file_identity(after_path),
+            CodexAdapter._file_identity(after_link),
+        )
+        if (
+            any(identity != expected_identity for identity in identities)
+            or _is_link_or_reparse(path, after_link)
+            or not stat.S_ISREG(after_handle.st_mode)
+            or len(chunks) > MAX_AUTH_BYTES
+        ):
+            raise ValueError("auth source changed while reading")
+        raw = bytes(chunks)
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="strict"))
+        except (UnicodeError, json.JSONDecodeError):
+            raise ValueError("auth source must contain UTF-8 JSON") from None
+        if not isinstance(parsed, dict):
+            raise ValueError("auth source JSON must be an object")
+        return raw
 
     @staticmethod
     def _validate_skill_registry(

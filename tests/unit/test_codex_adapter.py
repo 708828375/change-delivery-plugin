@@ -655,6 +655,87 @@ def test_auth_source_rejects_resolve_identity_change(
         )
 
 
+@pytest.mark.parametrize("mutation", ["replace", "modify"])
+def test_auth_source_change_after_construction_fails_without_home_leak(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"first"}', encoding="utf-8")
+    instance = adapter(
+        tmp_path,
+        FakeRunner(payload()),
+        auth_mode="auth_file",
+        auth_source=auth,
+    )
+    if mutation == "replace":
+        auth.unlink()
+        auth.write_text('{"token":"second"}', encoding="utf-8")
+    else:
+        auth.write_text('{"token":"changed-content"}', encoding="utf-8")
+
+    with pytest.raises(BlockedError, match="auth"):
+        instance.run_stage(request(tmp_path))
+
+    home_root = tmp_path.parent / f"{tmp_path.name}-homes"
+    assert tuple(home_root.iterdir()) == ()
+
+
+def test_auth_source_reparse_after_construction_fails_without_home_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"token":"first"}', encoding="utf-8")
+    instance = adapter(
+        tmp_path,
+        FakeRunner(payload()),
+        auth_mode="auth_file",
+        auth_source=auth,
+    )
+    path_type = type(auth)
+    original_lstat = path_type.lstat
+    monkeypatch.setattr(
+        path_type,
+        "lstat",
+        lambda value: (
+            SimpleNamespace(st_file_attributes=0x400)
+            if value == auth
+            else original_lstat(value)
+        ),
+    )
+
+    with pytest.raises(BlockedError, match="auth"):
+        instance.run_stage(request(tmp_path))
+
+    home_root = tmp_path.parent / f"{tmp_path.name}-homes"
+    assert tuple(home_root.iterdir()) == ()
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b"\xff\xfe",
+        b"[]",
+        b"x" * (1024 * 1024 + 1),
+    ],
+    ids=["invalid-utf8", "not-object", "oversized"],
+)
+def test_auth_source_requires_bounded_utf8_json_object(
+    tmp_path: Path,
+    contents: bytes,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_bytes(contents)
+    with pytest.raises(ValueError, match="auth"):
+        adapter(
+            tmp_path,
+            FakeRunner(),
+            auth_mode="auth_file",
+            auth_source=auth,
+        )
+
+
 def test_result_root_must_exist_and_not_overlap_worktree(tmp_path: Path) -> None:
     missing = tmp_path.parent / f"{tmp_path.name}-missing-results"
     with pytest.raises(ValueError):
