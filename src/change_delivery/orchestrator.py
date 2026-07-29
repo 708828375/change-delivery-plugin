@@ -322,15 +322,23 @@ class Orchestrator:
             if run.state is RunState.CANCELLED:
                 return StepOutcome(state=run.state, action="already_cancelled")
             raise AssertionError(f"unmapped RunState: {run.state.value}")
-        except ProcessTimeoutError:
+        except ProcessTimeoutError as error:
             try:
-                state = self.repository.get_run(run_id).state
+                timed_out_run = self.repository.get_run(run_id)
+                state = timed_out_run.state
             except KeyError:
                 state = RunState.BLOCKED
             return StepOutcome(
                 state=state,
                 action="process_timeout",
                 blocked_reason="configured process timeout exceeded",
+                configured_timeout_seconds=error.timeout_seconds,
+                operation_hash=hashlib.sha256(
+                    f"{run_id}:{state.value}".encode("utf-8")
+                ).hexdigest(),
+                command_hash=hashlib.sha256(
+                    error.command_id.encode("ascii")
+                ).hexdigest(),
             )
         except DependencyUnavailable as error:
             try:

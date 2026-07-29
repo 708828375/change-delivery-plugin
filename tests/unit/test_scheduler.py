@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
+import os
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 from filelock import FileLock
+import pytest
 
 from change_delivery.database import Database
 from change_delivery.domain import RunState, StepOutcome
@@ -163,6 +168,9 @@ def test_process_timeout_is_recorded_as_blocked(tmp_path: Path) -> None:
         state=RunState.IMPLEMENTING,
         action="process_timeout",
         blocked_reason="ProcessTimeoutError: operation timed out",
+        configured_timeout_seconds=321,
+        operation_hash="a" * 64,
+        command_hash="b" * 64,
     )
     fixture = make_scheduler(tmp_path, outcomes={"run-1": timeout})
     fixture.repository.create_run("run-1", "project", "hash")
@@ -179,6 +187,11 @@ def test_process_timeout_is_recorded_as_blocked(tmp_path: Path) -> None:
     evidence = fixture.repository.list_evidence("run-1")[-1]
     assert evidence.kind == "process_timeout"
     assert "ProcessTimeoutError" not in evidence.payload_json
+    payload = json.loads(evidence.payload_json)
+    assert "threshold_hours" not in payload
+    assert payload["configured_timeout_seconds"] == 321
+    assert payload["operation_hash"] == "a" * 64
+    assert payload["command_hash"] == "b" * 64
 
 
 def test_blocked_runs_are_not_automatically_resumed(tmp_path: Path) -> None:
@@ -204,3 +217,145 @@ def test_scheduler_rejects_tick_lock_directory(tmp_path: Path) -> None:
 
     assert result.status == "unsafe_lock"
     assert fixture.orchestrator.calls == []
+
+
+class NoopLock:
+    def acquire(self, *, timeout: float) -> "NoopLock":
+        return self
+
+    def __enter__(self) -> "NoopLock":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def test_database_claim_allows_only_one_concurrent_scheduler_step(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+    calls: list[str] = []
+    calls_lock = threading.Lock()
+
+    class SlowOrchestrator:
+        def step(self, run_id: str) -> StepOutcome:
+            with calls_lock:
+                calls.append(run_id)
+            time.sleep(0.2)
+            return StepOutcome(state=RunState.DRAFT, action="advanced")
+
+    schedulers = [
+        Scheduler(
+            runtime_root=tmp_path,
+            repository=fixture.repository,
+            orchestrator=SlowOrchestrator(),
+            clock=lambda: NOW,
+        )
+        for _ in range(2)
+    ]
+    (tmp_path / "tick.lock").touch()
+    for scheduler in schedulers:
+        scheduler.lock = NoopLock()  # type: ignore[assignment]
+        scheduler._validate_held_lock_identity = lambda expected=None: None  # type: ignore[method-assign]
+    threads = [threading.Thread(target=scheduler.tick) for scheduler in schedulers]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert calls == ["run-1"]
+
+
+def test_timeout_cas_rejects_concurrent_activity_without_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    observed = fixture.repository.create_run("run-1", "project", "hash")
+    backdate_run(fixture, "run-1", hours=73)
+    observed = fixture.repository.get_run("run-1")
+    with fixture.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET updated_at = ? WHERE run_id = ?",
+            (NOW.isoformat(), "run-1"),
+        )
+
+    event = fixture.repository.block_for_scheduler(
+        "run-1",
+        RunState.DRAFT,
+        observed_updated_at=observed.updated_at,
+        inactivity_threshold=timedelta(hours=72),
+        evidence_kind="scheduler_timeout",
+        event_type="SCHEDULER_INACTIVITY_TIMEOUT",
+        reason_code="inactivity_limit_exceeded",
+        occurred_at=NOW,
+    )
+
+    assert event is None
+    assert fixture.repository.get_run("run-1").state is RunState.DRAFT
+    assert fixture.repository.list_evidence("run-1") == []
+
+
+def test_future_poll_claim_is_monotonic_and_does_not_duplicate(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    run = fixture.repository.create_run("run-1", "project", "hash")
+    future = NOW + timedelta(days=30)
+    fixture.repository.record_scheduler_poll("run-1", future)
+
+    first = fixture.repository.claim_scheduler_run(
+        run,
+        now=NOW,
+        window=timedelta(minutes=5),
+    )
+    second = fixture.repository.claim_scheduler_run(
+        run,
+        now=NOW,
+        window=timedelta(minutes=5),
+    )
+
+    assert first is True
+    assert second is False
+    assert fixture.repository.get_scheduler_poll_at("run-1") >= future
+
+
+def test_tick_script_uses_frozen_isolated_runtime_host() -> None:
+    script = (
+        Path(__file__).parents[2] / "scripts" / "run-tick.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert "runtime-host.json" in script
+    assert "PYTHONPATH = $null" in script
+    assert "PYTHONHOME = $null" in script
+    assert "& $pythonPath -I" in script
+    assert "python -m change_delivery" not in script
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock sharing semantics")
+def test_tick_holds_non_replaceable_lock_handle(tmp_path: Path) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+    replaced = []
+
+    class Replacer:
+        def step(self, run_id: str) -> StepOutcome:
+            try:
+                (tmp_path / "tick.lock").unlink()
+                (tmp_path / "tick.lock").write_text("replacement")
+                replaced.append(True)
+            except OSError:
+                replaced.append(False)
+            return StepOutcome(state=RunState.DRAFT, action="advanced")
+
+    scheduler = Scheduler(
+        runtime_root=tmp_path,
+        repository=fixture.repository,
+        orchestrator=Replacer(),
+        clock=lambda: NOW,
+    )
+
+    scheduler.tick()
+
+    assert replaced == [False]

@@ -120,12 +120,88 @@ class RunRepository:
                 raise KeyError(run_id)
             connection.execute(
                 """
-                INSERT INTO scheduler_polls (run_id, polled_at)
-                VALUES (?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET polled_at = excluded.polled_at
+                INSERT INTO scheduler_polls (
+                    run_id, polled_at, effective_at, generation
+                ) VALUES (?, ?, ?, 1)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    polled_at = MAX(scheduler_polls.polled_at, excluded.polled_at),
+                    effective_at = excluded.effective_at,
+                    generation = scheduler_polls.generation + 1
                 """,
-                (run_id, timestamp),
+                (run_id, timestamp, timestamp),
             )
+
+    def claim_scheduler_run(
+        self,
+        observed: RunRecord,
+        *,
+        now: datetime,
+        window: object,
+    ) -> bool:
+        from datetime import timedelta
+
+        if now.tzinfo is None or not isinstance(window, timedelta):
+            raise ValueError("scheduler claim requires aware time and timedelta")
+        if window <= timedelta(0):
+            raise ValueError("scheduler claim window must be positive")
+        now = now.astimezone(UTC)
+        timestamp = now.isoformat()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT state, updated_at FROM runs WHERE run_id = ?",
+                (observed.run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(observed.run_id)
+            if (
+                RunState(row["state"]) is not observed.state
+                or datetime.fromisoformat(row["updated_at"])
+                != observed.updated_at
+            ):
+                return False
+            poll = connection.execute(
+                """
+                SELECT polled_at, effective_at, generation
+                FROM scheduler_polls WHERE run_id = ?
+                """,
+                (observed.run_id,),
+            ).fetchone()
+            if poll is not None:
+                effective = datetime.fromisoformat(
+                    poll["effective_at"] or poll["polled_at"]
+                ).astimezone(UTC)
+                if effective <= now and now - effective < window:
+                    return False
+                connection.execute(
+                    """
+                    UPDATE scheduler_polls SET
+                        polled_at = MAX(polled_at, ?),
+                        effective_at = ?,
+                        generation = generation + 1
+                    WHERE run_id = ? AND generation = ?
+                    """,
+                    (
+                        timestamp,
+                        timestamp,
+                        observed.run_id,
+                        poll["generation"],
+                    ),
+                )
+                return connection.execute(
+                    "SELECT changes()"
+                ).fetchone()[0] == 1
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO scheduler_polls (
+                        run_id, polled_at, effective_at, generation
+                    ) VALUES (?, ?, ?, 1)
+                    """,
+                    (observed.run_id, timestamp, timestamp),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
 
     def block_for_scheduler(
         self,
@@ -136,16 +212,24 @@ class RunRepository:
         event_type: str,
         reason_code: str,
         occurred_at: datetime,
-    ) -> EventRecord:
+        observed_updated_at: datetime | None = None,
+        inactivity_threshold: object | None = None,
+        evidence_details: dict[str, object] | None = None,
+    ) -> EventRecord | None:
+        from datetime import timedelta
+
         if occurred_at.tzinfo is None:
             raise ValueError("scheduler timestamp must be timezone-aware")
         timestamp = occurred_at.astimezone(UTC).isoformat()
         evidence_id = f"{evidence_kind}:{uuid4().hex}"
-        payload = {
+        payload: dict[str, object] = {
             "reason": reason_code,
-            "threshold_hours": 72,
             "safe_summary": "automatic processing stopped; manual review required",
         }
+        if evidence_kind == "scheduler_timeout":
+            payload["threshold_hours"] = 72
+        if evidence_details:
+            payload.update(evidence_details)
         payload_json = json.dumps(
             payload,
             ensure_ascii=False,
@@ -169,7 +253,20 @@ class RunRepository:
                 raise KeyError(run_id)
             current = RunState(row["state"])
             if current is not expected:
-                raise RuntimeError("run state changed")
+                return None
+            if observed_updated_at is not None:
+                stored_updated_at = connection.execute(
+                    "SELECT updated_at FROM runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()["updated_at"]
+                activity_at = datetime.fromisoformat(stored_updated_at)
+                if activity_at != observed_updated_at:
+                    return None
+                threshold = inactivity_threshold
+                if not isinstance(threshold, timedelta):
+                    raise ValueError("inactivity threshold is required")
+                if occurred_at.astimezone(UTC) - activity_at.astimezone(UTC) <= threshold:
+                    return None
             assert_transition(
                 current,
                 RunState.BLOCKED,

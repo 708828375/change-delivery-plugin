@@ -4,11 +4,13 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Mapping
 
 from pydantic import ValidationError
 import pytest
 
+import change_delivery.process as process_module
 from change_delivery.domain import CommandSpec
 from change_delivery.process import (
     ProcessLaunchError,
@@ -90,7 +92,7 @@ def test_runner_uses_direct_argv_isolated_env_and_redacts_output(
             "Cookie: a=1; secret=s3cr.et[值]",
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     ticks = iter((10.0, 10.025))
     runner = ProcessRunner(provider, start_time_ns=lambda: 123, monotonic=lambda: next(ticks))
 
@@ -135,7 +137,7 @@ def test_runner_passes_prompt_only_through_stdin_and_dynamic_fixed_environment(
         captured.update(kwargs)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     result = ProcessRunner(lambda names: {}, start_time_ns=lambda: 123).run(
         command_spec(tmp_path, args=("exec", "-"), env_names=()),
         stdin_text=secret_prompt,
@@ -185,7 +187,7 @@ def test_runner_uses_minimal_base_environment_and_never_inherits_secrets(
         captured["env"] = kwargs["env"]
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(
         lambda names: {"DELIVERY_TEST_SECRET": "explicit-secret"},
     )
@@ -222,7 +224,7 @@ def test_missing_provider_value_does_not_fall_back_to_parent_environment(
         captured["env"] = kwargs["env"]
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(lambda names: {})
 
     runner.run(command_spec(tmp_path, env_names=("PATH", "HOME")))
@@ -243,7 +245,7 @@ def test_fixed_non_secret_environment_is_injected_without_output_redaction(
         captured["env"] = kwargs["env"]
         return subprocess.CompletedProcess(argv, 0, "mode=never", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(
         lambda names: {},
         fixed_environment_provider=lambda names: {"DELIVERY_MODE": "never"},
@@ -296,7 +298,7 @@ def test_sensitive_home_can_only_enter_through_explicit_provider(
         captured["env"] = kwargs["env"]
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(lambda names: {"HOME": "C:/explicit-home"})
 
     runner.run(command_spec(tmp_path, env_names=("HOME",)))
@@ -376,7 +378,7 @@ def test_timeout_error_contains_only_redacted_output_and_safe_id(
             stderr=f"token={secret}".encode(),
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(
         lambda names: {"DELIVERY_TEST_SECRET": secret},
         start_time_ns=lambda: 123,
@@ -404,7 +406,7 @@ def test_launch_error_does_not_expose_secret_or_environment(
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise OSError(f"failed with {secret}")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(
         lambda names: {"DELIVERY_TEST_SECRET": secret},
         start_time_ns=lambda: 123,
@@ -437,7 +439,7 @@ def test_safe_process_errors_have_no_raw_chain_or_sensitive_traceback_locals(
             )
         raise OSError(f"start failed with {secret}")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(process_module, "_run_process_tree", fake_run)
     runner = ProcessRunner(
         lambda names: {"DELIVERY_TEST_SECRET": secret},
         start_time_ns=lambda: 123,
@@ -481,8 +483,8 @@ def test_command_id_has_stable_shape_and_changes_with_start_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        subprocess,
-        "run",
+        process_module,
+        "_run_process_tree",
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", ""),
     )
     spec = command_spec(tmp_path, env_names=())
@@ -495,3 +497,33 @@ def test_command_id_has_stable_shape_and_changes_with_start_time(
     assert first.command_id != later.command_id
     assert len(first.command_id) == 16
     assert set(first.command_id) <= set("0123456789abcdef")
+
+
+def test_timeout_terminates_descendant_process_tree(tmp_path: Path) -> None:
+    sentinel = tmp_path / "escaped-child.txt"
+    child = (
+        "import pathlib,time;"
+        "time.sleep(2);"
+        f"pathlib.Path({str(sentinel)!r}).write_text('escaped')"
+    )
+    parent = (
+        "import subprocess,sys,time;"
+        f"subprocess.Popen([sys.executable,'-c',{child!r}]);"
+        "time.sleep(30)"
+    )
+    runner = ProcessRunner(lambda names: {})
+
+    with pytest.raises(ProcessTimeoutError):
+        runner.run(
+            command_spec(
+                tmp_path,
+                args=("-c", parent),
+                timeout_seconds=1,
+                env_names=(),
+            )
+        )
+
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline and not sentinel.exists():
+        time.sleep(0.05)
+    assert not sentinel.exists()

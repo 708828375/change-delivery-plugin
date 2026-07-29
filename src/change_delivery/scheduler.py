@@ -65,12 +65,14 @@ class Scheduler:
     def tick(self) -> SchedulerResult:
         try:
             self._validate_lock_boundary()
+            expected_identity = self._named_lock_identity()
         except (OSError, ValueError):
             return SchedulerResult(status="unsafe_lock", processed=0)
         try:
             with self.lock.acquire(timeout=0):
                 try:
                     self._validate_lock_boundary(require_lock=True)
+                    self._validate_held_lock_identity(expected_identity)
                 except (OSError, ValueError):
                     return SchedulerResult(status="unsafe_lock", processed=0)
                 return self._tick_locked()
@@ -91,14 +93,19 @@ class Scheduler:
         for run in runs:
             age = max(timedelta(0), now - run.updated_at.astimezone(UTC))
             if run.state not in _INTERVENTION_STATES and age > _STOP_AFTER:
-                self.repository.block_for_scheduler(
+                event = self.repository.block_for_scheduler(
                     run.run_id,
                     run.state,
                     evidence_kind="scheduler_timeout",
                     event_type="SCHEDULER_INACTIVITY_TIMEOUT",
                     reason_code="inactivity_limit_exceeded",
                     occurred_at=now,
+                    observed_updated_at=run.updated_at,
+                    inactivity_threshold=_STOP_AFTER,
                 )
+                if event is None:
+                    throttled = True
+                    continue
                 return SchedulerResult(
                     status="blocked",
                     processed=1,
@@ -118,14 +125,14 @@ class Scheduler:
                 continue
 
             interval = _FAST_WINDOW if age < _SLOW_AFTER else _SLOW_WINDOW
-            last_poll = self.repository.get_scheduler_poll_at(run.run_id)
-            if last_poll is not None and now - last_poll.astimezone(UTC) < interval:
+            if not self.repository.claim_scheduler_run(
+                run,
+                now=now,
+                window=interval,
+            ):
                 throttled = True
                 continue
 
-            # Persist before the delegated action so a scheduler crash cannot
-            # immediately replay a side effect on the next invocation.
-            self.repository.record_scheduler_poll(run.run_id, now)
             outcome = self.orchestrator.step(run.run_id)
             if outcome.action == "process_timeout":
                 current = self.repository.get_run(run.run_id)
@@ -137,6 +144,13 @@ class Scheduler:
                         event_type="SCHEDULER_PROCESS_TIMEOUT",
                         reason_code="configured_process_timeout",
                         occurred_at=now,
+                        evidence_details={
+                            "configured_timeout_seconds": (
+                                outcome.configured_timeout_seconds
+                            ),
+                            "operation_hash": outcome.operation_hash,
+                            "command_hash": outcome.command_hash,
+                        },
                     )
                 outcome = StepOutcome(
                     state=RunState.BLOCKED,
@@ -144,6 +158,11 @@ class Scheduler:
                     blocked_reason=(
                         "the configured process timeout stopped automatic processing"
                     ),
+                    configured_timeout_seconds=(
+                        outcome.configured_timeout_seconds
+                    ),
+                    operation_hash=outcome.operation_hash,
+                    command_hash=outcome.command_hash,
                 )
                 return SchedulerResult(
                     status="blocked",
@@ -190,6 +209,38 @@ class Scheduler:
             or self.lock_path.resolve(strict=True).parent != root.resolve(strict=True)
         ):
             raise ValueError("tick lock must be a regular non-reparse file")
+
+    def _named_lock_identity(self) -> tuple[int, int] | None:
+        if not self.lock_path.exists():
+            return None
+        named = self.lock_path.lstat()
+        return named.st_dev, named.st_ino
+
+    def _validate_held_lock_identity(
+        self,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        context = getattr(self.lock, "_context", None)
+        descriptor = getattr(context, "lock_file_fd", None)
+        if not isinstance(descriptor, int) or descriptor < 0:
+            raise ValueError("tick lock has no stable held descriptor")
+        opened = os.fstat(descriptor)
+        named = self.lock_path.lstat()
+        if self._is_reparse(opened) or self._is_reparse(named):
+            raise ValueError("tick lock became a reparse point")
+        if (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (
+            named.st_dev,
+            named.st_ino,
+        ):
+            raise ValueError("tick lock identity changed")
+        if expected_identity is not None and (
+            opened.st_dev,
+            opened.st_ino,
+        ) != expected_identity:
+            raise ValueError("tick lock was replaced before acquisition")
 
     @staticmethod
     def _is_reparse(metadata: os.stat_result) -> bool:

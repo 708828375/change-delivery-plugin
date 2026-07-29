@@ -422,6 +422,13 @@ class StepOutcome(FrozenModel):
     action: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
     blocked_reason: str | None = None
     evidence_ids: tuple[str, ...] = Field(default_factory=tuple)
+    configured_timeout_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=7200,
+    )
+    operation_hash: str | None = Field(default=None, pattern=SHA256_PATTERN)
+    command_hash: str | None = Field(default=None, pattern=SHA256_PATTERN)
 
     @field_validator("blocked_reason")
     @classmethod
@@ -439,6 +446,20 @@ class StepOutcome(FrozenModel):
             for character in safe
         )
         return safe[:512]
+
+    @model_validator(mode="after")
+    def require_complete_timeout_fact(self) -> Self:
+        timeout_fact = (
+            self.configured_timeout_seconds,
+            self.operation_hash,
+            self.command_hash,
+        )
+        if self.action == "process_timeout":
+            if any(value is None for value in timeout_fact):
+                raise ValueError("process timeout outcome requires a complete fact")
+        elif any(value is not None for value in timeout_fact):
+            raise ValueError("timeout facts are only valid for process_timeout")
+        return self
 
 
 class EvidenceRecord(FrozenModel):

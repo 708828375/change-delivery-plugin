@@ -30,10 +30,17 @@ class ProcessResult(FrozenModel):
 
 
 class ProcessTimeoutError(DeliveryError):
-    def __init__(self, command_id: str, stdout: str, stderr: str) -> None:
+    def __init__(
+        self,
+        command_id: str,
+        stdout: str,
+        stderr: str,
+        timeout_seconds: int = 7200,
+    ) -> None:
         self.command_id = command_id
         self.stdout = stdout
         self.stderr = stderr
+        self.timeout_seconds = timeout_seconds
         super().__init__(f"command {command_id} timed out")
 
 
@@ -92,6 +99,187 @@ def _safe_base_environment(env_names: tuple[str, ...]) -> dict[str, str]:
     }
 
 
+class _WindowsJob:
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class _IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _BASIC_LIMITS(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _EXTENDED_LIMITS(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BASIC_LIMITS),
+                ("IoInfo", _IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        )
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+        limits = _EXTENDED_LIMITS()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000
+        if not kernel32.SetInformationJobObject(
+            handle,
+            9,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise OSError(error, "SetInformationJobObject failed")
+        self._ctypes = ctypes
+        self._kernel32 = kernel32
+        self._ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        self._ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+        self._ntdll.NtResumeProcess.restype = ctypes.c_long
+        self.handle = handle
+
+    def bind_and_resume(self, process: subprocess.Popen[str]) -> None:
+        process_handle = process._handle  # type: ignore[attr-defined]
+        if not self._kernel32.AssignProcessToJobObject(
+            self.handle,
+            process_handle,
+        ):
+            raise OSError(
+                self._ctypes.get_last_error(),
+                "AssignProcessToJobObject failed",
+            )
+        status = self._ntdll.NtResumeProcess(process_handle)
+        if status < 0:
+            raise OSError(status, "NtResumeProcess failed")
+
+    def terminate(self) -> None:
+        if not self._kernel32.TerminateJobObject(self.handle, 1):
+            error = self._ctypes.get_last_error()
+            raise OSError(error, "TerminateJobObject failed")
+
+    def close(self) -> None:
+        if self.handle:
+            self._kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+
+def _terminate_posix_tree(process: subprocess.Popen[str]) -> None:
+    import signal
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    # The direct process exiting does not prove that descendants honored TERM.
+    # Always issue KILL to the original process group after the grace period.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _run_process_tree(
+    argv: list[str],
+    **kwargs: object,
+) -> subprocess.CompletedProcess[str]:
+    timeout = kwargs.pop("timeout")
+    capture_output = bool(kwargs.pop("capture_output", False))
+    kwargs.pop("check", None)
+    if capture_output:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    input_text = kwargs.pop("input", None)
+    stdin = kwargs.pop("stdin", None)
+    if input_text is not None:
+        stdin = subprocess.PIPE
+    job: _WindowsJob | None = None
+    if os.name == "nt":
+        job = _WindowsJob()
+        kwargs["creationflags"] = int(kwargs.get("creationflags", 0)) | 0x4
+    else:
+        kwargs["start_new_session"] = True
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(argv, stdin=stdin, **kwargs)
+        if job is not None:
+            try:
+                job.bind_and_resume(process)
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+        try:
+            stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if job is not None:
+                job.terminate()
+            else:
+                _terminate_posix_tree(process)
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                argv,
+                timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from None
+        return subprocess.CompletedProcess(
+            argv,
+            process.returncode,
+            stdout,
+            stderr,
+        )
+    finally:
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+        if job is not None:
+            job.close()
+
+
 def _invoke_process(
     spec: CommandSpec,
     workdir: Path,
@@ -115,7 +303,7 @@ def _invoke_process(
             kwargs["stdin"] = subprocess.DEVNULL
         else:
             kwargs["input"] = stdin_text
-        return subprocess.run(
+        return _run_process_tree(
             [spec.executable, *spec.args],
             **kwargs,
         )
@@ -202,6 +390,7 @@ class ProcessRunner:
             failure_kind = outcome.kind
             safe_stdout = outcome.stdout
             safe_stderr = outcome.stderr
+            timeout_seconds = spec.timeout_seconds
             del outcome
             del child_environment
             del dynamic_environment
@@ -216,6 +405,7 @@ class ProcessRunner:
                     command_id,
                     safe_stdout,
                     safe_stderr,
+                    timeout_seconds,
                 )
             raise ProcessStartError(command_id)
 

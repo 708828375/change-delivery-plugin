@@ -68,7 +68,9 @@ MIGRATIONS = (
     """
     CREATE TABLE IF NOT EXISTS scheduler_polls (
         run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
-        polled_at TEXT NOT NULL
+        polled_at TEXT NOT NULL,
+        effective_at TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0
     )
     """,
 )
@@ -118,3 +120,22 @@ class Database:
         with self.transaction() as connection:
             for statement in MIGRATIONS:
                 connection.execute(statement)
+            scheduler_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(scheduler_polls)"
+                ).fetchall()
+            }
+            if "effective_at" not in scheduler_columns:
+                connection.execute(
+                    "ALTER TABLE scheduler_polls ADD COLUMN effective_at TEXT"
+                )
+                connection.execute(
+                    "UPDATE scheduler_polls SET effective_at = polled_at "
+                    "WHERE effective_at IS NULL"
+                )
+            if "generation" not in scheduler_columns:
+                connection.execute(
+                    "ALTER TABLE scheduler_polls "
+                    "ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+                )
