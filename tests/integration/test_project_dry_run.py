@@ -102,6 +102,22 @@ def test_discovery_rejects_git_probe_bound_to_other_remote_url(
         adapter.discover(dry_run=True)
 
 
+def test_discovery_rejects_git_probe_without_frozen_remote_identity(
+    fixture_config,
+) -> None:
+    fake_git = FakeGit(fixture_config)
+    del fake_git.remote_fetch_url
+    adapter = ExampleProjectAdapter(
+        fixture_config,
+        git=fake_git,
+        github=FakeGitHub(),
+        http=FakeHttp({"git_sha": TEST_SHA}),
+    )
+
+    with pytest.raises(ValueError, match="remote fetch URL"):
+        adapter.discover(dry_run=True)
+
+
 def test_version_probe_requires_present_exact_40_hex_sha(
     fixture_config,
 ) -> None:

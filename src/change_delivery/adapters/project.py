@@ -159,7 +159,11 @@ class ExampleProjectAdapter:
                 "remote push URL",
             ),
         ):
-            actual = getattr(self.git, attribute, expected)
+            actual = getattr(self.git, attribute, None)
+            if actual is None and attribute == "remote_fetch_url":
+                actual = getattr(self.git, "_fetch_url", None)
+            if actual is None and attribute == "remote_push_url":
+                actual = getattr(self.git, "_push_url", None)
             if not isinstance(actual, str) or not hmac.compare_digest(
                 actual,
                 expected,
