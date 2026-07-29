@@ -1,0 +1,7 @@
+interface:
+  display_name: "ExampleProject Test Acceptance"
+  short_description: "Verify ExampleProject test behavior against one exact SHA"
+  default_prompt: "Use $project-test-acceptance to verify the deployed ExampleProject test SHA."
+
+policy:
+  allow_implicit_invocation: false

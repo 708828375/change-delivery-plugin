@@ -1,0 +1,7 @@
+interface:
+  display_name: "Delivery Review"
+  short_description: "Review the approved pending tree without modifying it"
+  default_prompt: "Use $delivery-review to review the exact pending delivery tree."
+
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Delivery Implement"
+  short_description: "Implement approved work in one isolated worktree"
+  default_prompt: "Use $delivery-implement to implement the approved delivery plan."
+
+policy:
+  allow_implicit_invocation: false

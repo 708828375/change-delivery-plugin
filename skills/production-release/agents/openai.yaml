@@ -1,0 +1,7 @@
+interface:
+  display_name: "Production Release"
+  short_description: "Preflight a production release without writing production"
+  default_prompt: "Use $production-release to preflight a merged delivery run."
+
+policy:
+  allow_implicit_invocation: false

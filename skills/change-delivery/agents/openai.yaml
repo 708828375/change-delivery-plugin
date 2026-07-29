@@ -1,0 +1,7 @@
+interface:
+  display_name: "Change Delivery"
+  short_description: "Safely advance approved work to a merge-ready PR"
+  default_prompt: "Use $change-delivery to start or resume a delivery run."
+
+policy:
+  allow_implicit_invocation: false
