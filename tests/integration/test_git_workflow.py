@@ -103,6 +103,18 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
     latest_sha = commit_file(seed, "server.txt", "latest\n", "remote advance")
     git(seed, "push", "origin", "develop")
     (repo / "dirty.txt").write_text("dirty main checkout\n", encoding="utf-8")
+    colliding = tmp_path / "colliding-local-branch"
+    git(
+        repo,
+        "worktree",
+        "add",
+        "-b",
+        "origin/develop",
+        str(colliding),
+        initial_sha,
+    )
+    commit_file(colliding, "local-only.txt", "wrong base\n", "local collision")
+    git(repo, "worktree", "remove", str(colliding))
     worktree = tmp_path / "worktrees" / "feature-one"
     runner = RecordingRunner()
     adapter = GitAdapter(repo, runner=runner)
@@ -115,6 +127,8 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
     assert result.branch == "feature/one"
     assert result.base_sha == latest_sha
     assert git(worktree, "rev-parse", "HEAD").stdout.strip().lower() == latest_sha
+    assert (worktree / "server.txt").read_text(encoding="utf-8") == "latest\n"
+    assert not (worktree / "local-only.txt").exists()
     assert git(repo, "rev-parse", "HEAD").stdout.strip().lower() == initial_sha
     assert (repo / "dirty.txt").exists()
     assert any(spec.args == ("fetch", "--prune", "origin") for spec in runner.specs)
@@ -135,7 +149,7 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
             "-b",
             "feature/one",
             str(worktree.resolve()),
-            "origin/develop",
+            "refs/remotes/origin/develop",
         )
         for spec in runner.specs
     )
@@ -294,6 +308,18 @@ def test_worktree_base_must_name_a_registered_remote_ref(
             "feature/unregistered-base",
             tmp_path / "unregistered",
         )
+    with pytest.raises(ValueError, match="remote base"):
+        adapter.create_worktree(
+            "refs/heads/develop",
+            "feature/local-head-base",
+            tmp_path / "local-head",
+        )
+    exact = adapter.create_worktree(
+        "refs/remotes/origin/develop",
+        "feature/exact-remote-base",
+        tmp_path / "exact",
+    )
+    assert exact.base_sha == adapter.remote_sha("origin", "develop")
 
 
 def test_remove_worktree_refuses_dirty_and_removes_only_registered_clean_path(

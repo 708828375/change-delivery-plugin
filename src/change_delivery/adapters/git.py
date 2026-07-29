@@ -122,7 +122,7 @@ class GitAdapter:
         branch: str,
         worktree_path: Path,
     ) -> WorktreeResult:
-        self._validate_remote_base_ref(base_ref)
+        canonical_base_ref = self._canonical_remote_base_ref(base_ref)
         self._validate_branch(branch)
         target = Path(worktree_path)
         if not target.is_absolute():
@@ -133,12 +133,23 @@ class GitAdapter:
         target.parent.mkdir(parents=True, exist_ok=True)
         base_result = self._run(
             "resolve_base",
-            ("rev-parse", "--verify", f"{base_ref}^{{commit}}"),
+            (
+                "rev-parse",
+                "--verify",
+                f"{canonical_base_ref}^{{commit}}",
+            ),
         )
         base_sha = self._parse_single_sha(base_result.stdout, "resolve_base")
         self._run(
             "create_worktree",
-            ("worktree", "add", "-b", branch, str(target), base_ref),
+            (
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(target),
+                canonical_base_ref,
+            ),
         )
         return WorktreeResult(path=target, branch=branch, base_sha=base_sha)
 
@@ -329,14 +340,24 @@ class GitAdapter:
         if result.exit_code != 0:
             raise ValueError("invalid branch or ref name")
 
-    def _validate_remote_base_ref(self, base_ref: str) -> None:
-        if not isinstance(base_ref, str) or "/" not in base_ref:
+    def _canonical_remote_base_ref(self, base_ref: str) -> str:
+        if not isinstance(base_ref, str):
             raise ValueError("worktree base must be a remote base ref")
-        remote, branch = base_ref.split("/", 1)
+        prefix = "refs/remotes/"
+        if base_ref.startswith(prefix):
+            remote_branch = base_ref[len(prefix) :]
+        elif base_ref.startswith("refs/"):
+            raise ValueError("worktree base must be a remote base ref")
+        else:
+            remote_branch = base_ref
+        if "/" not in remote_branch:
+            raise ValueError("worktree base must be a remote base ref")
+        remote, branch = remote_branch.split("/", 1)
         if not remote or not branch:
             raise ValueError("worktree base must be a remote base ref")
         self._require_registered_remote(remote)
         self._validate_branch(branch)
+        return f"refs/remotes/{remote}/{branch}"
 
     def _head_sha(self, workdir: Path) -> str:
         result = self._run(
