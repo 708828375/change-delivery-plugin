@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 from pydantic import ValidationError
 import pytest
@@ -117,12 +118,14 @@ def adapter(
     **overrides: object,
 ) -> CodexAdapter:
     schema = Path(__file__).parents[2] / "schemas" / "stage-result.schema.json"
+    launcher = tmp_path / "vendor" / "codex.exe"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.touch(exist_ok=True)
     values: dict[str, object] = {
         "runner": runner,
         "stage_schema_path": schema,
         "result_root": tmp_path / "results",
-        "codex_executable": Path("C:/tools/codex.exe"),
-        "launcher_validator": lambda _: True,
+        "codex_executable": launcher,
         "limiter_timeout_seconds": 0.05,
     }
     values.update(overrides)
@@ -157,7 +160,7 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
 
     assert result.status == "passed"
     command = runner.commands[0]
-    assert command.executable == "C:\\tools\\codex.exe"
+    assert command.executable == str((tmp_path / "vendor" / "codex.exe").resolve())
     assert command.args[:9] == (
         "exec",
         "--ephemeral",
@@ -291,25 +294,109 @@ def test_unknown_oversized_or_invalid_utf8_output_fails_safely(
 
 
 @pytest.mark.parametrize(
-    "executable",
+    "filename",
     [
-        Path("C:/tools/codex.cmd"),
-        Path("C:/tools/codex.ps1"),
-        Path("C:/tools/codex.bat"),
-        Path("codex.exe"),
+        "codex.cmd",
+        "codex.ps1",
+        "codex.bat",
+        "wrapper.exe",
+        "python.exe",
+        "renamed.exe",
     ],
 )
-def test_script_or_relative_launcher_is_rejected(
+def test_script_or_renamed_launcher_is_rejected(
     tmp_path: Path,
-    executable: Path,
+    filename: str,
 ) -> None:
+    executable = tmp_path / "untrusted" / filename
+    executable.parent.mkdir(exist_ok=True)
+    executable.touch()
     with pytest.raises(ValueError):
         adapter(
             tmp_path,
             FakeRunner(),
             codex_executable=executable,
-            launcher_validator=lambda _: True,
         )
+
+
+def test_relative_launcher_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        adapter(
+            tmp_path,
+            FakeRunner(),
+            codex_executable=Path("codex.exe"),
+        )
+
+
+def test_launcher_requires_existing_regular_file_named_codex_exe(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "missing" / "codex.exe"
+    with pytest.raises(ValueError):
+        adapter(tmp_path, FakeRunner(), codex_executable=missing)
+
+    directory = tmp_path / "directory" / "codex.exe"
+    directory.mkdir(parents=True)
+    with pytest.raises(ValueError):
+        adapter(tmp_path, FakeRunner(), codex_executable=directory)
+
+
+def test_launcher_accepts_case_insensitive_official_windows_basename(
+    tmp_path: Path,
+) -> None:
+    launcher = tmp_path / "official" / "CoDeX.ExE"
+    launcher.parent.mkdir()
+    launcher.touch()
+
+    instance = adapter(
+        tmp_path,
+        FakeRunner(payload()),
+        codex_executable=launcher,
+    )
+
+    assert instance.run_stage(request(tmp_path)).status == "passed"
+
+
+def test_launcher_rejects_symlink_even_when_named_codex_exe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "native" / "codex.exe"
+    target.parent.mkdir()
+    target.touch()
+    path_type = type(target)
+    original_is_symlink = path_type.is_symlink
+    monkeypatch.setattr(
+        path_type,
+        "is_symlink",
+        lambda value: value == target or original_is_symlink(value),
+    )
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        adapter(tmp_path, FakeRunner(), codex_executable=target)
+
+
+def test_launcher_rejects_windows_reparse_point(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "native-reparse" / "codex.exe"
+    target.parent.mkdir()
+    target.touch()
+    path_type = type(target)
+    original_lstat = path_type.lstat
+    monkeypatch.setattr(
+        path_type,
+        "lstat",
+        lambda value: (
+            SimpleNamespace(st_file_attributes=0x400)
+            if value == target
+            else original_lstat(value)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="link|reparse"):
+        adapter(tmp_path, FakeRunner(), codex_executable=target)
 
 
 def test_schema_must_exist_match_runtime_model_and_be_draft_valid(

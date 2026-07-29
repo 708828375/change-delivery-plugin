@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import threading
 import time
 from typing import Iterator, Literal
@@ -133,16 +133,12 @@ class CodexAdapter:
         result_root: Path,
         codex_executable: Path,
         *,
-        launcher_validator: Callable[[Path], bool] | None = None,
         limiter_timeout_seconds: float = 30.0,
     ) -> None:
         self._runner = runner
         self._schema_path = self._validate_schema(stage_schema_path)
         self._result_root = self._prepare_result_root(result_root)
-        self._codex_executable = self._validate_launcher(
-            codex_executable,
-            launcher_validator or self._native_launcher_exists,
-        )
+        self._codex_executable = self._validate_launcher(codex_executable)
         if limiter_timeout_seconds <= 0:
             raise ValueError("limiter timeout must be positive")
         self._limiter_timeout_seconds = limiter_timeout_seconds
@@ -365,23 +361,31 @@ class CodexAdapter:
         return stage_schema_path.resolve()
 
     @staticmethod
-    def _native_launcher_exists(path: Path) -> bool:
-        return path.is_file()
-
-    @staticmethod
-    def _validate_launcher(
-        path: Path,
-        validator: Callable[[Path], bool],
-    ) -> Path:
+    def _validate_launcher(path: Path) -> Path:
         if not path.is_absolute():
             raise ValueError("Codex launcher must be an absolute native binary")
         if path.suffix.casefold() in SCRIPT_SUFFIXES:
             raise ValueError("Codex shell wrappers are forbidden")
-        if os.name == "nt" and path.suffix.casefold() != ".exe":
-            raise ValueError("Windows Codex launcher must be an .exe")
-        if not validator(path):
-            raise ValueError("Codex native launcher does not exist")
-        return path
+        if not path.exists() or not path.is_file():
+            raise ValueError("Codex native launcher must be a regular file")
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        if (
+            attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ) or path.is_symlink():
+            raise ValueError("Codex launcher may not be a link or reparse point")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("Codex native launcher cannot be resolved") from error
+        expected_name = "codex.exe" if os.name == "nt" else "codex"
+        actual_name = resolved.name.casefold() if os.name == "nt" else resolved.name
+        if actual_name != expected_name:
+            raise ValueError(
+                f"Codex native launcher basename must be {expected_name}"
+            )
+        if not resolved.is_file() or resolved.is_symlink():
+            raise ValueError("Codex native launcher must be a regular file")
+        return resolved
 
 
 def _decode_bounded(raw: bytes) -> str:
