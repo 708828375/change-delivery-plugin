@@ -123,6 +123,53 @@ def test_runner_uses_direct_argv_isolated_env_and_redacts_output(
     assert result.duration_ms == 25
 
 
+def test_runner_passes_prompt_only_through_stdin_and_dynamic_fixed_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_prompt = "prompt-only-secret"
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = ProcessRunner(lambda names: {}, start_time_ns=lambda: 123).run(
+        command_spec(tmp_path, args=("exec", "-"), env_names=()),
+        stdin_text=secret_prompt,
+        fixed_environment={"CODEX_HOME": str(tmp_path / "isolated-home")},
+    )
+
+    assert captured["input"] == secret_prompt
+    assert "stdin" not in captured
+    assert captured["env"]["CODEX_HOME"] == str(tmp_path / "isolated-home")
+    assert secret_prompt not in repr(captured["argv"])
+    assert secret_prompt not in result.command_id
+
+
+@pytest.mark.parametrize(
+    "fixed_environment",
+    [
+        {"BAD=NAME": "value"},
+        {"BAD\x00NAME": "value"},
+        {"CODEX_HOME": "bad\x00value"},
+    ],
+)
+def test_dynamic_fixed_environment_is_strict_and_does_not_leak(
+    tmp_path: Path,
+    fixed_environment: Mapping[str, str],
+) -> None:
+    runner = ProcessRunner(lambda names: {})
+    with pytest.raises(ValueError) as caught:
+        runner.run(
+            command_spec(tmp_path, env_names=()),
+            fixed_environment=fixed_environment,
+        )
+    assert "bad\x00value" not in repr(caught.value)
+
+
 def test_runner_uses_minimal_base_environment_and_never_inherits_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -402,7 +449,11 @@ def test_safe_process_errors_have_no_raw_chain_or_sensitive_traceback_locals(
     )
 
     with pytest.raises(expected_error) as caught:
-        runner.run(command_spec(tmp_path, args=("-c", secret)))
+        runner.run(
+            command_spec(tmp_path, args=("-c", "safe-argv")),
+            stdin_text=f"stdin-{secret}",
+            fixed_environment={"CODEX_HOME": f"C:/isolated/{secret}"},
+        )
 
     error = caught.value
     assert error.__context__ is None

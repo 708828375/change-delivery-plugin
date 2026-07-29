@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -55,9 +56,30 @@ class FakeRunner:
     def __init__(self, *outcomes: str | bytes | Exception) -> None:
         self.outcomes = deque(outcomes)
         self.commands: list[CommandSpec] = []
+        self.stdins: list[str | None] = []
+        self.fixed_environments: list[dict[str, str]] = []
+        self.home_snapshots: list[tuple[str, ...]] = []
 
-    def run(self, spec: CommandSpec) -> ProcessResult:
+    def run(
+        self,
+        spec: CommandSpec,
+        *,
+        stdin_text: str | None = None,
+        fixed_environment: dict[str, str] | None = None,
+    ) -> ProcessResult:
         self.commands.append(spec)
+        self.stdins.append(stdin_text)
+        environment = dict(fixed_environment or {})
+        self.fixed_environments.append(environment)
+        home = Path(environment["CODEX_HOME"])
+        self.home_snapshots.append(
+            tuple(
+                sorted(
+                    str(path.relative_to(home)).replace("\\", "/")
+                    for path in home.rglob("*")
+                )
+            )
+        )
         if not self.outcomes:
             raise AssertionError("unexpected Codex invocation")
         outcome = self.outcomes.popleft()
@@ -82,7 +104,7 @@ class BlockingRunner:
         self.release = threading.Event()
         self.lock = threading.Lock()
 
-    def run(self, spec: CommandSpec) -> ProcessResult:
+    def run(self, spec: CommandSpec, **_: object) -> ProcessResult:
         with self.lock:
             self.active += 1
             self.maximum = max(self.maximum, self.active)
@@ -121,10 +143,19 @@ def adapter(
     launcher = tmp_path / "vendor" / "codex.exe"
     launcher.parent.mkdir(parents=True, exist_ok=True)
     launcher.touch(exist_ok=True)
+    result_root = tmp_path.parent / f"{tmp_path.name}-results"
+    result_root.mkdir(exist_ok=True)
+    sandbox_home_root = tmp_path.parent / f"{tmp_path.name}-homes"
+    sandbox_home_root.mkdir(exist_ok=True)
+    skill = tmp_path.parent / f"{tmp_path.name}-approved-skill"
+    skill.mkdir(exist_ok=True)
+    (skill / "SKILL.md").write_text("approved", encoding="utf-8")
     values: dict[str, object] = {
         "runner": runner,
         "stage_schema_path": schema,
-        "result_root": tmp_path / "results",
+        "result_root": result_root,
+        "sandbox_home_root": sandbox_home_root,
+        "approved_skill_registry": {"requesting-code-review": skill},
         "codex_executable": launcher,
         "limiter_timeout_seconds": 0.05,
     }
@@ -161,20 +192,28 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
     assert result.status == "passed"
     command = runner.commands[0]
     assert command.executable == str((tmp_path / "vendor" / "codex.exe").resolve())
-    assert command.args[:9] == (
+    assert command.args[:4] == (
         "exec",
-        "--ephemeral",
-        "--sandbox",
-        "read-only",
-        "--cd",
-        str(tmp_path),
-        "--output-schema",
-        str(Path(__file__).parents[2] / "schemas" / "stage-result.schema.json"),
-        "-o",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
     )
+    for setting in (
+        'approval_policy="never"',
+        'shell_environment_policy.inherit="none"',
+        "shell_environment_policy.include_only=[]",
+        "allow_login_shell=false",
+        "agents.enabled=false",
+        "sandbox_workspace_write.network_access=false",
+        "sandbox_workspace_write.writable_roots=[]",
+    ):
+        index = command.args.index(setting)
+        assert command.args[index - 1] == "-c"
+    assert command.args[-1] == "-"
+    assert command.args[command.args.index("--sandbox") + 1] == "read-only"
     assert command.workdir == tmp_path
-    assert command.env_names == ("OPENAI_API_KEY", "CODEX_HOME")
-    joined = "\n".join(command.args)
+    assert command.env_names == ("OPENAI_API_KEY",)
+    joined = runner.stdins[0] or ""
     for expected in (
         "run-123",
         "internal-review",
@@ -189,6 +228,14 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
     assert "danger-full-access" not in command.args
     assert "--dangerously-bypass-approvals-and-sandbox" not in command.args
     assert "--add-dir" not in command.args
+    assert "Review only the approved change." not in repr(command.args)
+    assert set(runner.fixed_environments[0]) == {"CODEX_HOME"}
+    assert not Path(runner.fixed_environments[0]["CODEX_HOME"]).exists()
+    assert runner.home_snapshots[0] == (
+        "skills",
+        "skills/requesting-code-review",
+        "skills/requesting-code-review/SKILL.md",
+    )
 
 
 def test_writer_uses_workspace_write_and_output_file(tmp_path: Path) -> None:
@@ -199,10 +246,11 @@ def test_writer_uses_workspace_write_and_output_file(tmp_path: Path) -> None:
     )
 
     assert result.status == "passed"
-    assert runner.commands[0].args[3] == "workspace-write"
+    command = runner.commands[0]
+    assert command.args[command.args.index("--sandbox") + 1] == "workspace-write"
 
 
-def test_stdout_fallback_is_allowed_but_conflicting_sources_fail_closed(
+def test_output_file_is_authoritative_and_stdout_is_only_diagnostic(
     tmp_path: Path,
 ) -> None:
     assert adapter(tmp_path, FakeRunner(payload())).run_stage(
@@ -210,43 +258,88 @@ def test_stdout_fallback_is_allowed_but_conflicting_sources_fail_closed(
     ).status == "passed"
 
     class ConflictRunner(FakeRunner):
-        def run(self, spec: CommandSpec) -> ProcessResult:
+        def run(self, spec: CommandSpec, **kwargs: object) -> ProcessResult:
             self.commands.append(spec)
+            self.stdins.append(str(kwargs.get("stdin_text")))
+            environment = dict(kwargs.get("fixed_environment") or {})
+            self.fixed_environments.append(environment)
+            self.home_snapshots.append(())
             path = Path(spec.args[spec.args.index("-o") + 1])
             path.write_text(payload(status="failed"), encoding="utf-8")
             return process_result(payload())
 
-    with pytest.raises(BlockedError, match="conflict"):
-        adapter(tmp_path, ConflictRunner()).run_stage(request(tmp_path))
+    result = adapter(tmp_path, ConflictRunner()).run_stage(request(tmp_path))
+    assert result.status == "failed"
 
 
 def test_invalid_json_gets_one_read_only_repair_in_isolated_directory(
     tmp_path: Path,
 ) -> None:
-    runner = FakeRunner("{not json", payload())
+    runner = FakeRunner("{not json", payload(status="failed"))
 
     result = adapter(tmp_path, runner).run_stage(request(tmp_path))
 
-    assert result.status == "passed"
+    assert result.status == "failed"
     assert len(runner.commands) == 2
     repair = runner.commands[1]
-    assert repair.args[3] == "read-only"
+    assert repair.args[repair.args.index("--sandbox") + 1] == "read-only"
     repair_workdir = Path(repair.args[repair.args.index("--cd") + 1])
     assert repair_workdir != tmp_path
     assert repair_workdir.is_dir()
     assert tuple(repair_workdir.iterdir()) == ()
-    repair_prompt = repair.args[-1]
+    repair_prompt = runner.stdins[1] or ""
     assert "{not json" in repair_prompt
     assert "Do not execute tools" in repair_prompt
     assert "Review only the approved change." not in repair_prompt
+    assert runner.home_snapshots[1] == ()
 
 
 def test_second_invalid_result_blocks_without_third_call(tmp_path: Path) -> None:
     runner = FakeRunner("{bad", '{"still":"bad"}')
 
-    with pytest.raises(BlockedError, match="format"):
+    with pytest.raises(BlockedError, match="format|schema"):
         adapter(tmp_path, runner).run_stage(request(tmp_path))
 
+    assert len(runner.commands) == 2
+
+
+def test_single_fenced_json_is_extracted_without_model_repair(tmp_path: Path) -> None:
+    runner = FakeRunner(f"```json\n{payload()}\n```")
+    result = adapter(tmp_path, runner).run_stage(request(tmp_path))
+    assert result.status == "passed"
+    assert len(runner.commands) == 1
+
+
+def test_schema_invalid_primary_output_blocks_without_repair(tmp_path: Path) -> None:
+    runner = FakeRunner(payload(extra=True))
+    with pytest.raises(BlockedError, match="schema|format"):
+        adapter(tmp_path, runner).run_stage(request(tmp_path))
+    assert len(runner.commands) == 1
+
+
+@pytest.mark.parametrize(
+    "repaired",
+    [
+        payload(),
+        json.dumps(
+            {
+                "status": "blocked",
+                "summary": "diagnostic",
+                "evidence": [EVIDENCE],
+                "findings": [],
+                "next_action": "stop",
+            }
+        ),
+    ],
+    ids=["passed-cannot-authorize", "diagnostic-cannot-claim-evidence"],
+)
+def test_repair_output_cannot_authorize_or_claim_evidence(
+    tmp_path: Path,
+    repaired: str,
+) -> None:
+    runner = FakeRunner("not json", repaired)
+    with pytest.raises(BlockedError, match="repair"):
+        adapter(tmp_path, runner).run_stage(request(tmp_path))
     assert len(runner.commands) == 2
 
 
@@ -259,7 +352,7 @@ def test_format_failure_redacts_repair_prompt_and_exception_chain(
     with pytest.raises(BlockedError) as caught:
         adapter(tmp_path, runner).run_stage(request(tmp_path))
 
-    assert secret not in runner.commands[1].args[-1]
+    assert secret not in (runner.stdins[1] or "")
     error: BaseException | None = caught.value
     while error is not None:
         assert secret not in repr(error)
@@ -289,7 +382,7 @@ def test_unknown_oversized_or_invalid_utf8_output_fails_safely(
 ) -> None:
     runner = FakeRunner(bad_output, '{"still":"bad"}')
 
-    with pytest.raises(BlockedError, match="format"):
+    with pytest.raises(BlockedError, match="format|schema"):
         adapter(tmp_path, runner).run_stage(request(tmp_path))
 
 
@@ -421,8 +514,72 @@ def test_prompt_never_reads_environment_secret(
 
     adapter(tmp_path, runner).run_stage(request(tmp_path))
 
-    assert "must-not-leak" not in runner.commands[0].args[-1]
-    assert "SUPER_SECRET" not in runner.commands[0].args[-1]
+    assert "must-not-leak" not in (runner.stdins[0] or "")
+    assert "SUPER_SECRET" not in (runner.stdins[0] or "")
+
+
+def test_isolated_home_copies_only_auth_and_selected_approved_skill(
+    tmp_path: Path,
+) -> None:
+    user_home = tmp_path / "user-codex"
+    user_home.mkdir()
+    (user_home / "auth.json").write_text('{"token":"opaque"}', encoding="utf-8")
+    (user_home / "config.toml").write_text("danger=true", encoding="utf-8")
+    (user_home / "rules").mkdir()
+    (user_home / "rules" / "default.rules").write_text("allow", encoding="utf-8")
+    runner = FakeRunner(payload())
+
+    adapter(
+        tmp_path,
+        runner,
+        auth_source=user_home / "auth.json",
+    ).run_stage(request(tmp_path))
+
+    assert runner.home_snapshots[0] == (
+        "auth.json",
+        "skills",
+        "skills/requesting-code-review",
+        "skills/requesting-code-review/SKILL.md",
+    )
+    assert not Path(runner.fixed_environments[0]["CODEX_HOME"]).exists()
+
+
+def test_result_root_must_exist_and_not_overlap_worktree(tmp_path: Path) -> None:
+    missing = tmp_path.parent / f"{tmp_path.name}-missing-results"
+    with pytest.raises(ValueError):
+        adapter(tmp_path, FakeRunner(), result_root=missing)
+
+    contained = tmp_path / "contained-results"
+    contained.mkdir()
+    instance = adapter(tmp_path, FakeRunner(payload()), result_root=contained)
+    with pytest.raises(BlockedError, match="overlap"):
+        instance.run_stage(request(tmp_path))
+
+
+def test_primary_prompt_over_16k_is_blocked_before_process(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    with pytest.raises(BlockedError, match="prompt"):
+        adapter(tmp_path, runner).run_stage(
+            request(tmp_path, instructions="x" * 17_000)
+        )
+    assert runner.commands == []
+
+
+def test_runner_failure_traceback_does_not_retain_primary_prompt(
+    tmp_path: Path,
+) -> None:
+    secret_prompt = "prompt-deep-secret"
+    with pytest.raises(RuntimeError) as caught:
+        adapter(tmp_path, FakeRunner(RuntimeError("safe failure"))).run_stage(
+            request(tmp_path, instructions=secret_prompt)
+        )
+    traceback = caught.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith(
+            "change_delivery\\adapters\\codex.py"
+        ):
+            assert secret_prompt not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
 
 
 def test_result_path_is_unique_and_stays_under_controlled_root(
@@ -439,8 +596,29 @@ def test_result_path_is_unique_and_stays_under_controlled_root(
     ]
     assert paths[0] != paths[1]
     assert all(
-        path.is_relative_to((tmp_path / "results").resolve()) for path in paths
+        path.is_relative_to(
+            (tmp_path.parent / f"{tmp_path.name}-results").resolve()
+        )
+        for path in paths
     )
+    assert not any(path.exists() for path in paths)
+
+
+def test_hardlinked_result_file_is_rejected(tmp_path: Path) -> None:
+    class HardlinkRunner(FakeRunner):
+        def run(self, spec: CommandSpec, **kwargs: object) -> ProcessResult:
+            result = super().run(spec, **kwargs)
+            output = Path(spec.args[spec.args.index("-o") + 1])
+            try:
+                os.link(output, output.with_suffix(".alias"))
+            except OSError:
+                pytest.skip("hardlink creation is unavailable")
+            return result
+
+    with pytest.raises(BlockedError, match="format"):
+        adapter(tmp_path, HardlinkRunner(f"FILE:{payload()}")).run_stage(
+            request(tmp_path)
+        )
 
 
 @pytest.mark.parametrize("existing", [-1, 2, 3])

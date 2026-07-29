@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
+import tempfile
 import threading
 import time
 from typing import Iterator, Literal
@@ -20,11 +23,22 @@ from change_delivery.process import ProcessResult
 
 
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_PRIMARY_PROMPT_BYTES = 16 * 1024
+MAX_REPAIR_INPUT_BYTES = 64 * 1024
 CONTROL_CHARACTER = re.compile(r"[\x00-\x1f\x7f]")
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 THREAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 SCRIPT_SUFFIXES = {".cmd", ".ps1", ".bat", ".sh"}
-AUTH_ENV_NAMES = ("OPENAI_API_KEY", "CODEX_HOME")
+AUTH_ENV_NAMES = ("OPENAI_API_KEY",)
+FIXED_CONFIG = (
+    'approval_policy="never"',
+    'shell_environment_policy.inherit="none"',
+    "shell_environment_policy.include_only=[]",
+    "allow_login_shell=false",
+    "agents.enabled=false",
+    "sandbox_workspace_write.network_access=false",
+    "sandbox_workspace_write.writable_roots=[]",
+)
 
 
 class StageExecutionRequest(FrozenModel):
@@ -118,12 +132,15 @@ class _UnrepairableOutput(ValueError):
     pass
 
 
+class _NeedsRepair(ValueError):
+    pass
+
+
 class CodexAdapter:
     """Execute schema-bound Codex stages without a shell.
 
-    Result files are intentionally retained below ``result_root`` so later
-    orchestration tasks can register them as evidence. They are never read
-    from any location selected by model output.
+    Result files are read once through a bounded verified handle and removed.
+    They are never read from any location selected by model output.
     """
 
     def __init__(
@@ -132,12 +149,23 @@ class CodexAdapter:
         stage_schema_path: Path,
         result_root: Path,
         codex_executable: Path,
+        sandbox_home_root: Path,
         *,
+        auth_source: Path | None = None,
+        approved_skill_registry: Mapping[str, Path] | None = None,
         limiter_timeout_seconds: float = 30.0,
     ) -> None:
         self._runner = runner
         self._schema_path = self._validate_schema(stage_schema_path)
         self._result_root = self._prepare_result_root(result_root)
+        self._sandbox_home_root = self._prepare_controlled_root(
+            sandbox_home_root,
+            "sandbox home root",
+        )
+        self._auth_source = self._validate_auth_source(auth_source)
+        self._approved_skills = self._validate_skill_registry(
+            approved_skill_registry or {},
+        )
         self._codex_executable = self._validate_launcher(codex_executable)
         if limiter_timeout_seconds <= 0:
             raise ValueError("limiter timeout must be positive")
@@ -147,20 +175,36 @@ class CodexAdapter:
 
     def run_stage(self, request: StageExecutionRequest) -> StageResult:
         worktree = request.worktree.resolve()
+        role = request.role
+        expected_skill = request.expected_skill
+        run_id = request.run_id
+        stage = request.stage
         if not worktree.is_dir():
             raise ValueError("stage worktree must be an existing directory")
-        output_path = self._new_result_path(request.run_id, request.stage)
+        if (
+            worktree.is_relative_to(self._result_root)
+            or self._result_root.is_relative_to(worktree)
+        ):
+            raise BlockedError("worktree and result root overlap")
+        prompt = self._render_prompt(request)
+        if len(prompt.encode("utf-8")) > MAX_PRIMARY_PROMPT_BYTES:
+            raise BlockedError("Codex primary prompt exceeds 16 KiB")
+        output_path = self._new_result_path(run_id, stage)
         command = self._command(
-            role=request.role,
+            role=role,
             workdir=worktree,
             output_path=output_path,
-            prompt=self._render_prompt(request),
         )
-        with _SHARED_LIMITER.acquire(
-            request.role,
-            self._limiter_timeout_seconds,
-        ):
-            outcome = self._runner.run(command)
+        del request
+        try:
+            outcome = self._invoke(
+                command,
+                prompt,
+                role,
+                expected_skill=expected_skill,
+            )
+        finally:
+            del prompt
         if not isinstance(outcome, ProcessResult):
             raise TypeError("runner returned an unsupported result")
         if outcome.exit_code != 0:
@@ -169,21 +213,26 @@ class CodexAdapter:
             )
         try:
             raw = self._select_output(output_path, outcome.stdout)
-            return self._parse_result(raw)
-        except _OutputConflict as error:
-            raise BlockedError("Codex output source conflict") from None
+            return self._parse_primary_result(raw)
         except (_UnrepairableOutput, UnicodeError):
             raise BlockedError("Codex result format repair failed") from None
+        except _NeedsRepair:
+            return self._repair_once(
+                run_id,
+                stage,
+                raw if "raw" in locals() else b"",
+            )
         except (ValueError, SchemaValidationError):
-            return self._repair_once(request, raw if "raw" in locals() else b"")
+            raise BlockedError("Codex primary result failed schema validation") from None
 
     def _repair_once(
         self,
-        request: StageExecutionRequest,
+        run_id: str,
+        stage: str,
         invalid_output: bytes,
     ) -> StageResult:
         repair_directory = self._new_repair_directory()
-        output_path = self._new_result_path(request.run_id, request.stage)
+        output_path = self._new_result_path(run_id, stage)
         try:
             prompt = self._repair_prompt(invalid_output)
         except (ValueError, UnicodeError):
@@ -192,18 +241,26 @@ class CodexAdapter:
             role="read_only",
             workdir=repair_directory,
             output_path=output_path,
-            prompt=prompt,
         )
-        with _SHARED_LIMITER.acquire(
-            "read_only",
-            self._limiter_timeout_seconds,
-        ):
-            outcome = self._runner.run(command)
+        try:
+            outcome = self._invoke(
+                command,
+                prompt,
+                "read_only",
+                expected_skill=None,
+            )
+        finally:
+            del prompt
         if not isinstance(outcome, ProcessResult) or outcome.exit_code != 0:
             raise BlockedError("Codex result format repair failed")
         try:
             raw = self._select_output(output_path, outcome.stdout)
-            return self._parse_result(raw)
+            repaired = self._parse_primary_result(raw)
+            if repaired.status == "passed" or repaired.evidence:
+                raise BlockedError("Codex repair output cannot authorize or claim evidence")
+            return repaired
+        except BlockedError:
+            raise
         except (ValueError, UnicodeError, SchemaValidationError):
             raise BlockedError("Codex result format repair failed") from None
 
@@ -213,13 +270,16 @@ class CodexAdapter:
         role: Literal["read_only", "writer"],
         workdir: Path,
         output_path: Path,
-        prompt: str,
     ) -> CommandSpec:
         sandbox = "read-only" if role == "read_only" else "workspace-write"
         return CommandSpec(
             executable=str(self._codex_executable),
             args=(
                 "exec",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--strict-config",
+                *(item for setting in FIXED_CONFIG for item in ("-c", setting)),
                 "--ephemeral",
                 "--sandbox",
                 sandbox,
@@ -229,12 +289,69 @@ class CodexAdapter:
                 str(self._schema_path),
                 "-o",
                 str(output_path),
-                prompt,
+                "-",
             ),
             workdir=workdir,
             timeout_seconds=7200,
             env_names=AUTH_ENV_NAMES,
         )
+
+    def _invoke(
+        self,
+        command: CommandSpec,
+        prompt: str,
+        role: Literal["read_only", "writer"],
+        *,
+        expected_skill: str | None,
+    ) -> ProcessResult:
+        home = self._create_sandbox_home(expected_skill)
+        try:
+            with _SHARED_LIMITER.acquire(role, self._limiter_timeout_seconds):
+                return self._runner.run(
+                    command,
+                    stdin_text=prompt,
+                    fixed_environment={"CODEX_HOME": str(home)},
+                )
+        finally:
+            del prompt
+            self._remove_sandbox_home(home)
+
+    def _create_sandbox_home(self, expected_skill: str | None) -> Path:
+        raw = Path(
+            tempfile.mkdtemp(
+                prefix="codex-",
+                dir=self._sandbox_home_root,
+            )
+        )
+        home = raw.resolve()
+        if raw.is_symlink() or not home.is_relative_to(self._sandbox_home_root):
+            raise BlockedError("unsafe isolated CODEX_HOME")
+        try:
+            os.chmod(home, 0o700)
+            if self._auth_source is not None:
+                shutil.copyfile(self._auth_source, home / "auth.json")
+                os.chmod(home / "auth.json", 0o600)
+            if expected_skill is not None:
+                source = self._approved_skills.get(expected_skill)
+                if source is None:
+                    raise BlockedError("expected skill is not in approved registry")
+                destination = home / "skills" / expected_skill
+                destination.parent.mkdir()
+                shutil.copytree(source, destination)
+            return home
+        except Exception:
+            shutil.rmtree(home, ignore_errors=True)
+            raise
+
+    def _remove_sandbox_home(self, home: Path) -> None:
+        try:
+            if home.is_symlink() or not home.resolve().is_relative_to(
+                self._sandbox_home_root
+            ):
+                raise OSError("unsafe isolated home cleanup target")
+            shutil.rmtree(home)
+        except OSError:
+            raise BlockedError("isolated CODEX_HOME cleanup failed") from None
 
     @staticmethod
     def _render_prompt(request: StageExecutionRequest) -> str:
@@ -259,7 +376,9 @@ class CodexAdapter:
 
     @staticmethod
     def _repair_prompt(invalid_output: bytes) -> str:
-        safe = _decode_bounded(invalid_output)
+        if len(invalid_output) > MAX_REPAIR_INPUT_BYTES:
+            raise ValueError("repair input exceeds 64 KiB")
+        safe = invalid_output.decode("utf-8", errors="strict")
         safe = re.sub(
             r"(?i)(?:bearer\s+|sk-|gh[pousr]_)[A-Za-z0-9._-]{8,}",
             "[REDACTED]",
@@ -276,37 +395,106 @@ class CodexAdapter:
             "--- end output ---"
         )
 
-    def _parse_result(self, raw: bytes) -> StageResult:
+    def _parse_primary_result(self, raw: bytes) -> StageResult:
         text = _decode_bounded(raw)
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as error:
-            raise ValueError("invalid stage JSON") from error
+        data = self._extract_single_json_object(text)
         self._schema_validator.validate(data)
         return StageResult.model_validate(data)
 
+    @staticmethod
+    def _extract_single_json_object(text: str) -> object:
+        try:
+            direct = json.loads(text)
+            if isinstance(direct, dict):
+                return direct
+        except json.JSONDecodeError:
+            pass
+        decoder = json.JSONDecoder()
+        objects: list[object] = []
+        index = 0
+        while index < len(text):
+            if text[index] != "{":
+                index += 1
+                continue
+            try:
+                candidate, consumed = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                index += 1
+                continue
+            if isinstance(candidate, dict):
+                objects.append(candidate)
+                index += consumed
+                continue
+            index += 1
+        if len(objects) == 1:
+            return objects[0]
+        raise _NeedsRepair("no unambiguous JSON object")
+
     def _select_output(self, output_path: Path, stdout: str) -> bytes:
-        if output_path.exists() and (
-            output_path.is_symlink()
-            or not output_path.resolve().is_relative_to(self._result_root)
-        ):
-            raise _UnrepairableOutput("unsafe Codex output path")
-        if output_path.exists() and output_path.stat().st_size > MAX_OUTPUT_BYTES:
-            raise _UnrepairableOutput("Codex output exceeds size limit")
         if output_path.exists():
-            with output_path.open("rb") as result_file:
-                file_output = result_file.read(MAX_OUTPUT_BYTES + 1)
+            try:
+                file_output = self._read_and_remove_output(output_path)
+            except OSError:
+                raise _UnrepairableOutput("Codex output could not be read safely") from None
         else:
             file_output = b""
         stdout_output = stdout.encode("utf-8") if stdout else b""
-        if file_output and stdout_output and file_output != stdout_output:
-            raise _OutputConflict("output file and stdout differ")
         selected = file_output or stdout_output
         if not selected:
             raise ValueError("Codex produced no output")
         if len(selected) > MAX_OUTPUT_BYTES:
             raise _UnrepairableOutput("Codex output exceeds size limit")
         return selected
+
+    def _read_and_remove_output(self, output_path: Path) -> bytes:
+        before = output_path.lstat()
+        attributes = getattr(before, "st_file_attributes", 0)
+        if (
+            output_path.is_symlink()
+            or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            or not output_path.resolve().is_relative_to(self._result_root)
+            or before.st_nlink != 1
+            or before.st_size > MAX_OUTPUT_BYTES
+        ):
+            raise _UnrepairableOutput("unsafe Codex output file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(output_path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            chunks = bytearray()
+            while len(chunks) <= MAX_OUTPUT_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, MAX_OUTPUT_BYTES + 1 - len(chunks)),
+                )
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            data = bytes(chunks)
+            after_handle = os.fstat(descriptor)
+            after_path = output_path.stat()
+            identities = (
+                (before.st_dev, before.st_ino),
+                (opened.st_dev, opened.st_ino),
+                (after_handle.st_dev, after_handle.st_ino),
+                (after_path.st_dev, after_path.st_ino),
+            )
+            if (
+                len(set(identities)) != 1
+                or before.st_size != opened.st_size
+                or before.st_mtime_ns != opened.st_mtime_ns
+                or opened.st_size != after_handle.st_size
+                or opened.st_mtime_ns != after_handle.st_mtime_ns
+                or opened.st_size != after_path.st_size
+                or opened.st_mtime_ns != after_path.st_mtime_ns
+                or len(data) > MAX_OUTPUT_BYTES
+            ):
+                raise _UnrepairableOutput("Codex output changed while reading")
+        finally:
+            os.close(descriptor)
+        output_path.unlink()
+        return data
 
     def _new_result_path(self, run_id: str, stage: str) -> Path:
         if not SAFE_COMPONENT.fullmatch(run_id) or not SAFE_COMPONENT.fullmatch(stage):
@@ -340,12 +528,48 @@ class CodexAdapter:
 
     @staticmethod
     def _prepare_result_root(result_root: Path) -> Path:
-        if not result_root.is_absolute():
-            raise ValueError("result root must be absolute")
-        if result_root.exists() and result_root.is_symlink():
-            raise ValueError("result root may not be a symlink")
-        result_root.mkdir(parents=True, exist_ok=True)
-        return result_root.resolve()
+        return CodexAdapter._prepare_controlled_root(result_root, "result root")
+
+    @staticmethod
+    def _prepare_controlled_root(path: Path, label: str) -> Path:
+        if not path.is_absolute() or not path.exists() or not path.is_dir():
+            raise ValueError(f"{label} must be an existing absolute directory")
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+        if path.is_symlink() or (
+            attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            raise ValueError(f"{label} may not be a link or reparse point")
+        return path.resolve(strict=True)
+
+    @staticmethod
+    def _validate_auth_source(path: Path | None) -> Path | None:
+        if path is None:
+            return None
+        if (
+            not path.is_absolute()
+            or path.name != "auth.json"
+            or not path.is_file()
+            or path.is_symlink()
+        ):
+            raise ValueError("auth source must be an absolute regular auth.json")
+        return path.resolve(strict=True)
+
+    @staticmethod
+    def _validate_skill_registry(
+        registry: Mapping[str, Path],
+    ) -> dict[str, Path]:
+        approved: dict[str, Path] = {}
+        for name, source in registry.items():
+            if (
+                not SAFE_COMPONENT.fullmatch(name)
+                or not source.is_absolute()
+                or not source.is_dir()
+                or source.is_symlink()
+                or any(item.is_symlink() for item in source.rglob("*"))
+            ):
+                raise ValueError("approved skill registry contains an unsafe source")
+            approved[name] = source.resolve(strict=True)
+        return approved
 
     @staticmethod
     def _validate_schema(stage_schema_path: Path) -> Path:

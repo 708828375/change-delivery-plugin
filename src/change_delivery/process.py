@@ -68,6 +68,11 @@ def _validate_environment_entry(name: str, value: str) -> None:
         raise ValueError("invalid environment entry")
 
 
+def _validate_environment_mapping(environment: Mapping[str, str]) -> None:
+    for name, value in environment.items():
+        _validate_environment_entry(name, value)
+
+
 def _environment_name(name: str) -> str:
     return name.casefold() if os.name == "nt" else name
 
@@ -92,20 +97,27 @@ def _invoke_process(
     workdir: Path,
     child_environment: dict[str, str],
     secrets: Mapping[str, str],
+    stdin_text: str | None,
 ) -> subprocess.CompletedProcess[str] | _ProcessFailure:
     try:
+        kwargs: dict[str, object] = {
+            "cwd": str(workdir),
+            "env": child_environment,
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": spec.timeout_seconds,
+            "shell": False,
+            "check": False,
+        }
+        if stdin_text is None:
+            kwargs["stdin"] = subprocess.DEVNULL
+        else:
+            kwargs["input"] = stdin_text
         return subprocess.run(
             [spec.executable, *spec.args],
-            cwd=str(workdir),
-            env=child_environment,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=spec.timeout_seconds,
-            stdin=subprocess.DEVNULL,
-            shell=False,
-            check=False,
+            **kwargs,
         )
     except subprocess.TimeoutExpired as raw_error:
         failure = _ProcessFailure(
@@ -154,18 +166,37 @@ class ProcessRunner:
         self._start_time_ns = start_time_ns
         self._monotonic = monotonic
 
-    def run(self, spec: CommandSpec) -> ProcessResult:
+    def run(
+        self,
+        spec: CommandSpec,
+        *,
+        stdin_text: str | None = None,
+        fixed_environment: Mapping[str, str] | None = None,
+    ) -> ProcessResult:
+        if stdin_text is not None and (
+            not isinstance(stdin_text, str) or "\x00" in stdin_text
+        ):
+            raise ValueError("invalid stdin text")
         workdir = self._resolve_workdir(spec.workdir)
         start_time_ns = self._start_time_ns()
         command_id = self._command_id(spec, workdir, start_time_ns)
         secrets = self._requested_secrets(spec.env_names)
         environment = self._requested_environment(spec.env_names)
+        dynamic_environment = dict(fixed_environment or {})
+        _validate_environment_mapping(dynamic_environment)
         child_environment = _safe_base_environment(spec.env_names)
         child_environment.update(environment)
+        child_environment.update(dynamic_environment)
         child_environment.update(secrets)
         started = self._monotonic()
 
-        outcome = _invoke_process(spec, workdir, child_environment, secrets)
+        outcome = _invoke_process(
+            spec,
+            workdir,
+            child_environment,
+            secrets,
+            stdin_text,
+        )
         duration_ms = max(0, round((self._monotonic() - started) * 1000))
         if isinstance(outcome, _ProcessFailure):
             failure_kind = outcome.kind
@@ -173,8 +204,11 @@ class ProcessRunner:
             safe_stderr = outcome.stderr
             del outcome
             del child_environment
+            del dynamic_environment
             del environment
             del secrets
+            del stdin_text
+            del fixed_environment
             del spec
             del self
             if failure_kind == "timeout":
@@ -190,8 +224,11 @@ class ProcessRunner:
         safe_stderr = redact_text(_as_text(outcome.stderr), secrets)
         del outcome
         del child_environment
+        del dynamic_environment
         del environment
         del secrets
+        del stdin_text
+        del fixed_environment
         return ProcessResult(
             command_id=command_id,
             exit_code=exit_code,
