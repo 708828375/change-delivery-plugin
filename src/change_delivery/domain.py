@@ -414,6 +414,39 @@ class EventRecord(FrozenModel):
         return data
 
 
+class StepOutcome(FrozenModel):
+    state: RunState
+    action: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
+    blocked_reason: str | None = None
+    evidence_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+
+class EvidenceRecord(FrozenModel):
+    evidence_id: str = Field(pattern=EVIDENCE_IDENTIFIER_PATTERN)
+    run_id: str
+    kind: str = Field(pattern=EVIDENCE_IDENTIFIER_PATTERN)
+    payload_json: str
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    created_at: datetime
+
+    @property
+    def reference(self) -> EvidenceRef:
+        return EvidenceRef(
+            evidence_id=self.evidence_id,
+            kind=self.kind,
+            sha256=self.sha256,
+        )
+
+
+class RemoteOperationRecord(FrozenModel):
+    operation_key: str
+    run_id: str
+    operation_type: str
+    remote_identity: str
+    status: Literal["PENDING", "CONFIRMED", "FAILED"]
+    updated_at: datetime
+
+
 class CommandSpec(FrozenModel):
 
     executable: str = Field(

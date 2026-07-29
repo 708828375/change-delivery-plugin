@@ -372,7 +372,7 @@ def save_approval(path: str | os.PathLike[str], approval: ApprovalSnapshot) -> N
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-    ) + "\n"
+    )
     temporary_path: Path | None = None
     primary_error: BaseException | None = None
     try:
