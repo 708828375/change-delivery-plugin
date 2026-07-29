@@ -40,6 +40,17 @@ FIXED_CONFIG = (
 )
 
 
+def _is_link_or_reparse(path: Path, info: os.stat_result | object | None = None) -> bool:
+    metadata = info if info is not None else path.lstat()
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    ) or (
+        hasattr(metadata, "st_mode")
+        and stat.S_ISLNK(getattr(metadata, "st_mode"))
+    )
+
+
 class StageExecutionRequest(FrozenModel):
     run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     stage: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -543,10 +554,7 @@ class CodexAdapter:
     def _prepare_controlled_root(path: Path, label: str) -> Path:
         if not path.is_absolute() or not path.exists() or not path.is_dir():
             raise ValueError(f"{label} must be an existing absolute directory")
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
-        if path.is_symlink() or (
-            attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        ):
+        if _is_link_or_reparse(path):
             raise ValueError(f"{label} may not be a link or reparse point")
         return path.resolve(strict=True)
 
@@ -554,16 +562,24 @@ class CodexAdapter:
     def _validate_auth_source(path: Path | None) -> Path | None:
         if path is None:
             return None
-        attributes = getattr(path.lstat(), "st_file_attributes", 0) if path.exists() else 0
-        if (
-            not path.is_absolute()
-            or path.name != "auth.json"
-            or not path.is_file()
-            or path.is_symlink()
-            or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        ):
+        if not path.is_absolute() or path.name != "auth.json" or not path.exists():
             raise ValueError("auth source must be an absolute regular auth.json")
-        return path.resolve(strict=True)
+        before = path.lstat()
+        if _is_link_or_reparse(path, before) or not stat.S_ISREG(before.st_mode):
+            raise ValueError("auth source must be an absolute regular auth.json")
+        try:
+            resolved = path.resolve(strict=True)
+            after = resolved.lstat()
+        except OSError:
+            raise ValueError("auth source cannot be resolved safely") from None
+        if (
+            resolved.name != "auth.json"
+            or _is_link_or_reparse(resolved, after)
+            or not stat.S_ISREG(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise ValueError("auth source identity changed during validation")
+        return resolved
 
     @staticmethod
     def _validate_skill_registry(
@@ -603,10 +619,7 @@ class CodexAdapter:
             raise ValueError("Codex shell wrappers are forbidden")
         if not path.exists() or not path.is_file():
             raise ValueError("Codex native launcher must be a regular file")
-        attributes = getattr(path.lstat(), "st_file_attributes", 0)
-        if (
-            attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        ) or path.is_symlink():
+        if _is_link_or_reparse(path):
             raise ValueError("Codex launcher may not be a link or reparse point")
         try:
             resolved = path.resolve(strict=True)
@@ -619,7 +632,9 @@ class CodexAdapter:
                 f"Codex native launcher basename must be {expected_name}"
             )
         if not resolved.is_file() or resolved.is_symlink():
-            raise ValueError("Codex native launcher must be a regular file")
+            raise ValueError(
+                "Codex native launcher must be a regular non-link file"
+            )
         return resolved
 
 

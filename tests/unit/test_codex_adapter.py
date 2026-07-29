@@ -600,6 +600,61 @@ def test_auth_modes_are_explicit_mutually_exclusive_and_set_exact_env(
     assert "auth.json" not in key_runner.home_snapshots[0]
 
 
+def test_auth_source_rejects_windows_reparse_point_without_privileges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    path_type = type(auth)
+    original_lstat = path_type.lstat
+    monkeypatch.setattr(
+        path_type,
+        "lstat",
+        lambda value: (
+            SimpleNamespace(st_file_attributes=0x400)
+            if value == auth
+            else original_lstat(value)
+        ),
+    )
+    with pytest.raises(ValueError, match="auth"):
+        adapter(
+            tmp_path,
+            FakeRunner(),
+            auth_mode="auth_file",
+            auth_source=auth,
+        )
+
+
+def test_auth_source_rejects_resolve_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text("{}", encoding="utf-8")
+    replacement = tmp_path / "replacement" / "auth.json"
+    replacement.parent.mkdir()
+    replacement.write_text("{}", encoding="utf-8")
+    path_type = type(auth)
+    original_resolve = path_type.resolve
+    monkeypatch.setattr(
+        path_type,
+        "resolve",
+        lambda value, *args, **kwargs: (
+            replacement
+            if value == auth
+            else original_resolve(value, *args, **kwargs)
+        ),
+    )
+    with pytest.raises(ValueError, match="auth"):
+        adapter(
+            tmp_path,
+            FakeRunner(),
+            auth_mode="auth_file",
+            auth_source=auth,
+        )
+
+
 def test_result_root_must_exist_and_not_overlap_worktree(tmp_path: Path) -> None:
     missing = tmp_path.parent / f"{tmp_path.name}-missing-results"
     with pytest.raises(ValueError):
