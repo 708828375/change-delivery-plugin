@@ -4,6 +4,7 @@ from collections.abc import Callable
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from change_delivery.adapters.git import (
     LeaseConflict,
     RemoteIdentityChanged,
 )
+from change_delivery.cli import RuntimeGitPort
 from change_delivery.domain import CommandSpec
 from change_delivery.process import (
     ProcessResult,
@@ -232,7 +234,12 @@ def test_commit_and_feature_push_are_direct_non_force_argv(
     (worktree / "feature.txt").write_text("feature\n", encoding="utf-8")
 
     commit_sha = adapter.commit_all(worktree, "feat: local integration")
-    pushed_sha = adapter.push_feature(worktree, "origin", "feature/push")
+    pushed_sha = adapter.push_feature(
+        worktree,
+        "origin",
+        "feature/push",
+        commit_sha,
+    )
 
     assert pushed_sha == commit_sha
     assert git(repo, "ls-remote", "origin", "refs/heads/feature/push").stdout.split()[0] == commit_sha
@@ -245,12 +252,175 @@ def test_commit_and_feature_push_are_direct_non_force_argv(
         "push",
         "-u",
         str(remote),
-        "HEAD:refs/heads/feature/push",
+        f"{commit_sha}:refs/heads/feature/push",
     )
     assert not any(
         "force" in argument
         for argument in git_operation_args(push_specs[-1].args)
     )
+
+
+def test_runtime_feature_push_does_not_write_when_head_differs_from_expected(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    remote, _, repo, base_sha = local_remote
+    plugin_root = tmp_path / "plugin"
+    worktree = plugin_root / "worktrees" / "stale-runtime"
+    adapter = adapter_for(repo)
+    adapter.fetch("origin")
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/stale-runtime",
+        worktree,
+    )
+    commit_file(worktree, "feature.txt", "changed\n", "changed")
+    config = SimpleNamespace(
+        repo_path=repo,
+        remote="origin",
+        base_branch="develop",
+        test_branch="test",
+        remote_fetch_url=str(remote),
+        remote_push_url=str(remote),
+    )
+    runtime = RuntimeGitPort(config, plugin_root)
+
+    with pytest.raises((GitError, ValueError), match="head changed"):
+        runtime.push_feature("feature/stale-runtime", base_sha)
+
+    assert (
+        git(
+            repo,
+            "ls-remote",
+            str(remote),
+            "refs/heads/feature/stale-runtime",
+        ).stdout
+        == ""
+    )
+
+
+def test_feature_push_rejects_stale_expected_sha_before_any_push(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    remote, _, repo, base_sha = local_remote
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner)
+    adapter.fetch("origin")
+    worktree = tmp_path / "stale-feature"
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/stale-head",
+        worktree,
+    )
+    commit_file(worktree, "feature.txt", "changed\n", "changed")
+
+    with pytest.raises(GitError, match="head changed"):
+        adapter.push_feature(
+            worktree,
+            "origin",
+            "feature/stale-head",
+            base_sha,
+        )
+
+    assert not any(
+        git_operation_args(spec.args)[:1] == ("push",)
+        for spec in runner.specs
+    )
+    assert (
+        git(
+            repo,
+            "ls-remote",
+            str(remote),
+            "refs/heads/feature/stale-head",
+        ).stdout
+        == ""
+    )
+
+
+def test_feature_push_uses_frozen_expected_sha_when_head_changes_during_push(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    remote, _, repo, _ = local_remote
+    runner = HookedRunner()
+    adapter = adapter_for(repo, runner=runner)
+    adapter.fetch("origin")
+    worktree = tmp_path / "frozen-feature"
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/frozen-head",
+        worktree,
+    )
+    expected_sha = commit_file(worktree, "feature.txt", "expected\n", "expected")
+    runner.arm(
+        "push",
+        lambda: commit_file(worktree, "later.txt", "later\n", "later"),
+    )
+
+    pushed_sha = adapter.push_feature(
+        worktree,
+        "origin",
+        "feature/frozen-head",
+        expected_sha,
+    )
+
+    assert pushed_sha == expected_sha
+    assert git(worktree, "rev-parse", "HEAD").stdout.strip() != expected_sha
+    assert (
+        git(
+            repo,
+            "ls-remote",
+            str(remote),
+            "refs/heads/feature/frozen-head",
+        ).stdout.split()[0]
+        == expected_sha
+    )
+    push_spec = [
+        spec
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:1] == ("push",)
+    ][-1]
+    assert git_operation_args(push_spec.args) == (
+        "push",
+        "-u",
+        str(remote),
+        f"{expected_sha}:refs/heads/feature/frozen-head",
+    )
+
+
+def test_feature_push_rejects_remote_sha_changed_before_post_write_verification(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    remote, _, repo, base_sha = local_remote
+    runner = HookedRunner()
+    adapter = adapter_for(repo, runner=runner)
+    adapter.fetch("origin")
+    worktree = tmp_path / "verified-feature"
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/verified-head",
+        worktree,
+    )
+    expected_sha = commit_file(worktree, "feature.txt", "expected\n", "expected")
+    runner.arm(
+        "ls-remote",
+        lambda: git(
+            remote,
+            "update-ref",
+            "refs/heads/feature/verified-head",
+            base_sha,
+        ),
+    )
+
+    with pytest.raises(GitError, match="remote SHA verification failed"):
+        adapter.push_feature(
+            worktree,
+            "origin",
+            "feature/verified-head",
+            expected_sha,
+        )
 
 
 def test_commit_all_rejects_empty_commit_and_unsafe_message(
@@ -268,6 +438,100 @@ def test_commit_all_rejects_empty_commit_and_unsafe_message(
     for message in ("", " \t", "subject\nbody", "subject\x00body"):
         with pytest.raises(ValueError):
             adapter.commit_all(worktree, message)
+
+
+def test_worktree_facts_and_commit_tree_cas_return_exact_commit_fact(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    _, _, repo, base_sha = local_remote
+    adapter = adapter_for(repo)
+    adapter.fetch("origin")
+    worktree = tmp_path / "exact-commit"
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/exact-commit",
+        worktree,
+    )
+    (worktree / "exact.txt").write_text("exact\n", encoding="utf-8")
+
+    expected_tree = adapter.staged_tree(worktree, stage_all=True)
+    new_sha = adapter.commit_tree_cas(
+        worktree,
+        "feat: exact commit",
+        expected_parent=base_sha,
+        expected_tree=expected_tree,
+    )
+
+    assert adapter.worktree_head(worktree) == new_sha
+    assert adapter.worktree_branch(worktree) == "feature/exact-commit"
+    assert adapter.staged_tree(worktree, stage_all=False) == expected_tree
+    assert adapter.head_commit_fact(worktree) == {
+        "new_head_sha": new_sha,
+        "parent_sha": base_sha,
+        "commit_tree_sha": expected_tree,
+        "message": "feat: exact commit",
+    }
+    assert git(worktree, "status", "--short").stdout == ""
+
+
+def test_commit_tree_cas_does_not_overwrite_a_concurrent_head_change(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    _, _, repo, base_sha = local_remote
+    runner = HookedRunner()
+    adapter = adapter_for(repo, runner=runner)
+    adapter.fetch("origin")
+    worktree = tmp_path / "commit-cas-race"
+    adapter.create_worktree(
+        "origin/develop",
+        "feature/commit-cas-race",
+        worktree,
+    )
+    (worktree / "ours.txt").write_text("ours\n", encoding="utf-8")
+    expected_tree = adapter.staged_tree(worktree, stage_all=True)
+    competing_sha: list[str] = []
+    runner.arm(
+        "update-ref",
+        lambda: competing_sha.append(
+            commit_file(worktree, "theirs.txt", "theirs\n", "theirs")
+        ),
+    )
+
+    with pytest.raises(GitError):
+        adapter.commit_tree_cas(
+            worktree,
+            "feat: ours",
+            expected_parent=base_sha,
+            expected_tree=expected_tree,
+        )
+
+    assert adapter.worktree_head(worktree) == competing_sha[0]
+
+
+@pytest.mark.parametrize("parent_count", [0, 2])
+def test_head_commit_fact_rejects_non_single_parent_commits(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+    parent_count: int,
+) -> None:
+    _, _, repo, base_sha = local_remote
+    adapter = adapter_for(repo)
+    adapter.fetch("origin")
+    worktree = tmp_path / f"parent-count-{parent_count}"
+    branch = f"feature/parent-count-{parent_count}"
+    adapter.create_worktree("origin/develop", branch, worktree)
+    tree_sha = git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip()
+    args = ["commit-tree", tree_sha, "-m", "invalid parent shape"]
+    if parent_count == 2:
+        second_parent = commit_file(worktree, "second.txt", "second\n", "second")
+        args.extend(("-p", base_sha, "-p", second_parent))
+    invalid_sha = git(worktree, *args).stdout.strip()
+    git(worktree, "update-ref", f"refs/heads/{branch}", invalid_sha)
+
+    with pytest.raises(GitError, match="exactly one parent"):
+        adapter.head_commit_fact(worktree)
 
 
 def test_test_push_uses_exact_lease_and_returns_verified_sha(
@@ -353,7 +617,10 @@ def test_stale_test_lease_never_overwrites_remote_or_retries(
         ("fetch", ("-p",)),
         ("remote_sha", ("origin", "-develop")),
         ("create_worktree", ("origin/develop", "-feature", Path("unused"))),
-        ("push_feature", (Path("unused"), "origin", "bad branch")),
+        (
+            "push_feature",
+            (Path("unused"), "origin", "bad branch", "a" * 40),
+        ),
         ("push_test_with_lease", ("origin", "test\nbranch", "a" * 40, "b" * 40)),
         ("push_test_with_lease", ("origin", "test", "-c" + "a" * 38, "b" * 40)),
     ],
@@ -398,7 +665,7 @@ def test_adapter_binds_remote_and_protects_base_test_and_standard_branches(
     with pytest.raises(ValueError, match="bound remote"):
         adapter.fetch("upstream")
     with pytest.raises(ValueError, match="protected"):
-        adapter.push_feature(worktree, "origin", "develop")
+        adapter.push_feature(worktree, "origin", "develop", "a" * 40)
     with pytest.raises(ValueError, match="bound test"):
         adapter.push_test_with_lease("origin", "main", "a" * 40, "b" * 40)
     with pytest.raises(ValueError, match="protected"):
@@ -436,7 +703,12 @@ def test_remote_identity_change_blocks_fetch_and_push_without_writing(
     adapter.fetch("origin")
     worktree = tmp_path / "identity-worktree"
     adapter.create_worktree("origin/develop", "feature/identity", worktree)
-    commit_file(worktree, "identity.txt", "candidate\n", "candidate")
+    expected_sha = commit_file(
+        worktree,
+        "identity.txt",
+        "candidate\n",
+        "candidate",
+    )
     fetch_count = sum(
         git_operation_args(spec.args)[:1] == ("fetch",)
         for spec in runner.specs
@@ -451,7 +723,12 @@ def test_remote_identity_change_blocks_fetch_and_push_without_writing(
     with pytest.raises(RemoteIdentityChanged):
         adapter.fetch("origin")
     with pytest.raises(RemoteIdentityChanged):
-        adapter.push_feature(worktree, "origin", "feature/identity")
+        adapter.push_feature(
+            worktree,
+            "origin",
+            "feature/identity",
+            expected_sha,
+        )
 
     assert sum(
         git_operation_args(spec.args)[:1] == ("fetch",)
@@ -525,6 +802,7 @@ def test_command_scope_remote_identity_wins_fetch_and_push_races(
             worktree,
             "origin",
             "feature/race-proof",
+            source_sha,
         )
         == source_sha
     )

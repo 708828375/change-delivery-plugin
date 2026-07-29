@@ -222,25 +222,145 @@ class GitAdapter:
 
     def commit_all(self, workdir: Path, message: str) -> str:
         resolved = self._require_secondary_worktree(workdir)
-        if (
-            not isinstance(message, str)
-            or not message.strip()
-            or any(character in message for character in "\r\n\x00")
-        ):
-            raise ValueError("commit message must be non-empty and single-line")
+        self._validate_commit_message(message)
         self._run("add", ("add", "-A"), workdir=resolved)
         if not self.status_short(resolved).strip():
             raise GitError("commit", reason="no changes to commit")
         self._run("commit", ("commit", "-m", message), workdir=resolved)
         return self._head_sha(resolved)
 
-    def push_feature(self, workdir: Path, remote: str, branch: str) -> str:
+    def worktree_head(self, workdir: Path) -> str:
+        return self._head_sha(self._require_secondary_worktree(workdir))
+
+    def worktree_branch(self, workdir: Path) -> str:
+        resolved = self._require_secondary_worktree(workdir)
+        branch = self._single_line(
+            self._run(
+                "worktree_branch",
+                ("symbolic-ref", "--quiet", "--short", "HEAD"),
+                workdir=resolved,
+            ).stdout,
+            "worktree_branch",
+        )
+        self._validate_branch(branch)
+        return branch
+
+    def staged_tree(self, workdir: Path, *, stage_all: bool) -> str:
+        resolved = self._require_secondary_worktree(workdir)
+        if not isinstance(stage_all, bool):
+            raise TypeError("stage_all must be a boolean")
+        if stage_all:
+            self._run("add", ("add", "-A"), workdir=resolved)
+        result = self._run("write_tree", ("write-tree",), workdir=resolved)
+        return self._parse_single_sha(result.stdout, "write_tree")
+
+    def commit_tree_cas(
+        self,
+        workdir: Path,
+        message: str,
+        *,
+        expected_parent: str,
+        expected_tree: str,
+    ) -> str:
+        resolved = self._require_secondary_worktree(workdir)
+        self._validate_commit_message(message)
+        parent = self._normalize_sha(expected_parent)
+        tree = self._normalize_sha(expected_tree)
+        if self._head_sha(resolved) != parent:
+            raise GitError("commit_tree_cas", reason="worktree head changed")
+        if self.staged_tree(resolved, stage_all=False) != tree:
+            raise GitError("commit_tree_cas", reason="staged tree changed")
+        branch = self.worktree_branch(resolved)
+        commit = self._parse_single_sha(
+            self._run(
+                "commit_tree",
+                (
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    parent,
+                    "-m",
+                    message,
+                ),
+                workdir=resolved,
+            ).stdout,
+            "commit_tree",
+        )
+        self._run(
+            "update_ref",
+            (
+                "update-ref",
+                f"refs/heads/{branch}",
+                commit,
+                parent,
+            ),
+            workdir=resolved,
+        )
+        fact = self.head_commit_fact(resolved)
+        if fact != {
+            "new_head_sha": commit,
+            "parent_sha": parent,
+            "commit_tree_sha": tree,
+            "message": message,
+        }:
+            raise GitError(
+                "commit_tree_cas",
+                reason="created commit fact verification failed",
+            )
+        return commit
+
+    def head_commit_fact(self, workdir: Path) -> dict[str, str]:
+        resolved = self._require_secondary_worktree(workdir)
+        head = self._head_sha(resolved)
+        ancestry = self._run(
+            "head_commit_parents",
+            ("rev-list", "--parents", "--max-count=1", head),
+            workdir=resolved,
+        ).stdout.split()
+        if len(ancestry) != 2 or self._normalize_sha(ancestry[0]) != head:
+            raise GitError(
+                "head_commit_fact",
+                reason="head commit must have exactly one parent",
+            )
+        parent = self._normalize_sha(ancestry[1])
+        tree = self._parse_single_sha(
+            self._run(
+                "head_commit_tree",
+                ("rev-parse", "--verify", f"{head}^{{tree}}"),
+                workdir=resolved,
+            ).stdout,
+            "head_commit_tree",
+        )
+        message = self._run(
+            "head_commit_message",
+            ("show", "-s", "--format=%B", head),
+            workdir=resolved,
+        ).stdout.rstrip("\r\n")
+        return {
+            "new_head_sha": head,
+            "parent_sha": parent,
+            "commit_tree_sha": tree,
+            "message": message,
+        }
+
+    def push_feature(
+        self,
+        workdir: Path,
+        remote: str,
+        branch: str,
+        expected_sha: str,
+    ) -> str:
         self._require_bound_remote(remote)
         self._validate_branch(branch)
         if branch.casefold() in self._protected_branches:
             raise ValueError("protected branch cannot receive a feature push")
         resolved = self._require_secondary_worktree(workdir)
-        source_sha = self._head_sha(resolved)
+        expected = self._normalize_sha(expected_sha)
+        if self._head_sha(resolved) != expected:
+            raise GitError(
+                "push_feature",
+                reason="worktree head changed before push",
+            )
         self._assert_remote_identity()
         self._run(
             "push_feature",
@@ -249,15 +369,15 @@ class GitAdapter:
                     "push",
                     "-u",
                     self._push_url,
-                    f"HEAD:refs/heads/{branch}",
+                    f"{expected}:refs/heads/{branch}",
                 )
             ),
             workdir=resolved,
         )
         pushed_sha = self._remote_head_sha(remote, branch)
-        if pushed_sha != source_sha:
+        if pushed_sha != expected:
             raise GitError("push_feature", reason="remote SHA verification failed")
-        return source_sha
+        return expected
 
     def push_test_with_lease(
         self,
@@ -517,6 +637,15 @@ class GitAdapter:
             workdir=workdir,
         )
         return self._parse_single_sha(result.stdout, "head_sha")
+
+    @staticmethod
+    def _validate_commit_message(message: str) -> None:
+        if (
+            not isinstance(message, str)
+            or not message.strip()
+            or any(character in message for character in "\r\n\x00")
+        ):
+            raise ValueError("commit message must be non-empty and single-line")
 
     def _remote_head_sha(self, remote: str, branch: str) -> str:
         self._require_bound_remote(remote)

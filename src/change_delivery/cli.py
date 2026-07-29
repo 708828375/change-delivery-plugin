@@ -192,9 +192,8 @@ class RuntimeGitPort:
             worktree,
             self._config.remote,
             branch,
+            expected_sha,
         )
-        if not hmac.compare_digest(pushed, expected_sha):
-            raise ValueError("local feature head changed before push")
         return pushed
 
 
