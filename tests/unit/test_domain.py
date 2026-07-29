@@ -316,6 +316,15 @@ def test_project_config_normalizes_uppercase_https_scheme() -> None:
     config = ProjectConfig.model_validate(data)
 
     assert config.version_endpoint == "https://example.test/version"
+
+
+@pytest.mark.parametrize("suffix", ("?token=secret", "#token"))
+def test_project_config_rejects_secret_bearing_version_endpoint(suffix) -> None:
+    data = valid_project_data()
+    data["version_endpoint"] = f"https://example.test/version{suffix}"
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
     schema_data = valid_project_json_data()
     schema_data["version_endpoint"] = "HTTPS://example.test/version"
     project_schema_validator().validate(schema_data)

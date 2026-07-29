@@ -10,6 +10,7 @@ import pytest
 
 from change_delivery.adapters.git import (
     GitAdapter,
+    GitDiscoveryAttestation,
     GitError,
     LeaseConflict,
     RemoteIdentityChanged,
@@ -219,6 +220,50 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
         )
         for spec in runner.specs
     )
+
+
+def test_discovery_attestation_binds_repo_remote_and_branch_shas(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    remote, seed, repo, develop_sha = local_remote
+    git(seed, "branch", "test")
+    git(seed, "push", "origin", "test")
+    git(repo, "fetch", "origin")
+    adapter = adapter_for(repo)
+
+    attestation = adapter.discovery_attestation(
+        "origin",
+        ("develop", "test"),
+    )
+
+    assert isinstance(attestation, GitDiscoveryAttestation)
+    assert attestation.repository.canonical_path == repo.resolve()
+    assert attestation.repository.inode > 0
+    assert attestation.remote_fetch_url == str(remote)
+    assert attestation.remote_push_url == str(remote)
+    assert attestation.branch_shas == {
+        "develop": develop_sha,
+        "test": develop_sha,
+    }
+
+
+def test_discovery_attestation_rejects_repository_identity_replacement(
+    local_remote: tuple[Path, Path, Path, str],
+    monkeypatch,
+) -> None:
+    _, _, repo, _ = local_remote
+    adapter = adapter_for(repo)
+    original = adapter._repository_identity
+    changed = original.model_copy(update={"inode": original.inode + 1})
+    identities = iter((original, changed))
+    monkeypatch.setattr(
+        adapter,
+        "_capture_repository_identity",
+        lambda: next(identities),
+    )
+
+    with pytest.raises(RemoteIdentityChanged, match="repository identity"):
+        adapter.discovery_attestation("origin", ("develop",))
 
 
 def test_worktree_creation_uses_frozen_expected_base_sha(

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 from typing import Literal, Self
+from urllib.parse import urlsplit
 
 from pydantic import (
     AnyUrl,
@@ -627,6 +628,9 @@ class ProjectConfig(FrozenModel):
         parsed = AnyUrl(endpoint)
         if parsed.scheme.casefold() != "https" or not parsed.host:
             raise ValueError("版本接口必须是 HTTPS URL")
+        split = urlsplit(endpoint)
+        if split.query or split.fragment:
+            raise ValueError("版本接口禁止 query 和 fragment，凭据必须使用环境变量")
         return endpoint
 
     @model_validator(mode="after")

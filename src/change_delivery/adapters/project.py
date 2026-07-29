@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 
 from pydantic import Field
 
+from change_delivery.adapters.git import GitDiscoveryAttestation
+from change_delivery.adapters.http import validate_read_url
 from change_delivery.domain import CommandSpec, FrozenModel, ProjectConfig
 
 
@@ -30,12 +32,11 @@ class HttpReader(Protocol):
 
 
 class GitReader(Protocol):
-    repo_path: Path
-    remote: str
-    base_branch: str
-    test_branch: str
-
-    def remote_sha(self, remote: str, branch: str) -> str: ...
+    def discovery_attestation(
+        self,
+        remote: str,
+        branches: tuple[str, ...],
+    ) -> GitDiscoveryAttestation: ...
 
 
 class DiscoveryReport(FrozenModel):
@@ -74,16 +75,17 @@ class ExampleProjectAdapter:
         self._file_exists = file_exists
 
     def discover(self, *, dry_run: bool) -> DiscoveryReport:
-        if not dry_run:
+        if dry_run is not True:
             raise ValueError("ExampleProject discovery is read-only and requires dry_run")
-        self._verify_git_binding()
-
+        branches = (self.config.base_branch, self.config.test_branch)
+        attestation = self.git.discovery_attestation(
+            self.config.remote,
+            branches,
+        )
+        self._verify_git_attestation(attestation)
         remote_shas = {
-            f"{self.config.remote}/{branch}": self.git.remote_sha(
-                self.config.remote,
-                branch,
-            )
-            for branch in (self.config.base_branch, self.config.test_branch)
+            f"{self.config.remote}/{branch}": attestation.branch_shas[branch]
+            for branch in branches
         }
         for sha in remote_shas.values():
             if not _SHA.fullmatch(sha):
@@ -135,40 +137,42 @@ class ExampleProjectAdapter:
             expected_sha.lower(),
         )
 
-    def _verify_git_binding(self) -> None:
+    def _verify_git_attestation(
+        self,
+        attestation: GitDiscoveryAttestation,
+    ) -> None:
         expected_path = os.path.normcase(
             str(self.config.repo_path.resolve(strict=False))
         )
         actual_path = os.path.normcase(
-            str(Path(self.git.repo_path).resolve(strict=False))
+            str(attestation.repository.canonical_path)
         )
         if actual_path != expected_path:
-            raise ValueError("Git probe repository path does not match config")
-        for attribute, expected, label in (
-            ("remote", self.config.remote, "remote"),
-            ("base_branch", self.config.base_branch, "base branch"),
-            ("test_branch", self.config.test_branch, "test branch"),
+            raise ValueError("Git attestation repository path does not match config")
+        for actual, expected, label in (
+            (attestation.remote, self.config.remote, "remote"),
             (
-                "remote_fetch_url",
+                attestation.remote_fetch_url,
                 self.config.remote_fetch_url,
                 "remote fetch URL",
             ),
             (
-                "remote_push_url",
+                attestation.remote_push_url,
                 self.config.remote_push_url,
                 "remote push URL",
             ),
         ):
-            actual = getattr(self.git, attribute, None)
-            if actual is None and attribute == "remote_fetch_url":
-                actual = getattr(self.git, "_fetch_url", None)
-            if actual is None and attribute == "remote_push_url":
-                actual = getattr(self.git, "_push_url", None)
             if not isinstance(actual, str) or not hmac.compare_digest(
                 actual,
                 expected,
             ):
-                raise ValueError(f"Git probe {label} does not match config")
+                raise ValueError(f"Git attestation {label} does not match config")
+        expected_branches = {
+            self.config.base_branch,
+            self.config.test_branch,
+        }
+        if set(attestation.branch_shas) != expected_branches:
+            raise ValueError("Git attestation branches do not match config")
 
 
 def discover_registration(
@@ -176,6 +180,8 @@ def discover_registration(
     *,
     dry_run: bool,
 ) -> RegistrationReport:
+    if not isinstance(dry_run, bool):
+        raise TypeError("dry_run must be a boolean")
     raw = dict(registration)
     endpoint = raw.get("version_endpoint")
     if not isinstance(endpoint, str) or not endpoint.strip():
@@ -184,7 +190,22 @@ def discover_registration(
             config=None,
             missing_fields=("version_endpoint",),
         )
-    hostname = urlsplit(endpoint).hostname
+    try:
+        validate_read_url(endpoint)
+    except ValueError:
+        return RegistrationReport(
+            status="blocked",
+            config=None,
+            missing_fields=("version_endpoint",),
+        )
+    parsed_endpoint = urlsplit(endpoint)
+    if parsed_endpoint.query or parsed_endpoint.fragment:
+        return RegistrationReport(
+            status="blocked",
+            config=None,
+            missing_fields=("version_endpoint",),
+        )
+    hostname = parsed_endpoint.hostname
     normalized_hostname = (
         hostname.rstrip(".").casefold() if hostname is not None else None
     )

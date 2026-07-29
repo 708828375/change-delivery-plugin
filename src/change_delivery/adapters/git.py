@@ -5,6 +5,7 @@ import hmac
 import os
 from pathlib import Path
 import re
+import threading
 from typing import Protocol
 
 from pydantic import Field
@@ -38,6 +39,20 @@ class WorktreeResult(FrozenModel):
     path: Path
     branch: str
     base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+
+
+class RepositoryIdentity(FrozenModel):
+    canonical_path: Path
+    device: int
+    inode: int
+
+
+class GitDiscoveryAttestation(FrozenModel):
+    repository: RepositoryIdentity
+    remote: str
+    remote_fetch_url: str
+    remote_push_url: str
+    branch_shas: dict[str, str]
 
 
 def _safe_output(value: str) -> str:
@@ -98,7 +113,9 @@ class GitAdapter:
         runner: Runner | None = None,
         git_executable: str = "git",
     ) -> None:
-        resolved_repo = Path(repo_path).resolve()
+        unresolved_repo = Path(repo_path).absolute()
+        self._reject_reparse_components(unresolved_repo)
+        resolved_repo = unresolved_repo.resolve()
         if not resolved_repo.is_dir():
             raise NotADirectoryError("Git repository path must be an existing directory")
         if (
@@ -108,6 +125,8 @@ class GitAdapter:
         ):
             raise ValueError("invalid Git executable")
         self.repo_path = resolved_repo
+        self._attestation_lock = threading.RLock()
+        self._repository_identity = self._capture_repository_identity()
         self._runner = runner or ProcessRunner(
             lambda names: {},
             fixed_environment_provider=_git_environment,
@@ -142,6 +161,11 @@ class GitAdapter:
             )
         self._fetch_url = expected_fetch_url
         self._push_url = expected_push_url
+        if self._capture_repository_identity() != self._repository_identity:
+            raise RemoteIdentityChanged(
+                "initialize",
+                reason="repository identity changed during initialization",
+            )
 
     def fetch(self, remote: str) -> None:
         self._require_bound_remote(remote)
@@ -174,6 +198,63 @@ class GitAdapter:
             ),
         )
         return self._parse_single_sha(result.stdout, "remote_sha")
+
+    def discovery_attestation(
+        self,
+        remote: str,
+        branches: tuple[str, ...],
+    ) -> GitDiscoveryAttestation:
+        self._require_bound_remote(remote)
+        if (
+            not isinstance(branches, tuple)
+            or not branches
+            or len(set(branches)) != len(branches)
+        ):
+            raise ValueError("discovery branches must be a non-empty unique tuple")
+        for branch in branches:
+            self._validate_branch(branch)
+        with self._attestation_lock:
+            if self._capture_repository_identity() != self._repository_identity:
+                raise RemoteIdentityChanged(
+                    "discovery_attestation",
+                    reason="repository identity changed before discovery",
+                )
+            self._assert_remote_identity()
+            branch_shas = {
+                branch: self._parse_single_sha(
+                    self._run(
+                        "discovery_remote_sha",
+                        (
+                            "rev-parse",
+                            "--verify",
+                            f"refs/remotes/{remote}/{branch}^{{commit}}",
+                        ),
+                    ).stdout,
+                    "discovery_remote_sha",
+                )
+                for branch in branches
+            }
+            if self._capture_repository_identity() != self._repository_identity:
+                raise RemoteIdentityChanged(
+                    "discovery_attestation",
+                    reason="repository identity changed during discovery",
+                )
+            fetch_url, push_url = self._read_remote_identity()
+            if not (
+                hmac.compare_digest(fetch_url, self._fetch_url)
+                and hmac.compare_digest(push_url, self._push_url)
+            ):
+                raise RemoteIdentityChanged(
+                    "discovery_attestation",
+                    reason="remote identity changed during discovery",
+                )
+            return GitDiscoveryAttestation(
+                repository=self._repository_identity,
+                remote=remote,
+                remote_fetch_url=self._fetch_url,
+                remote_push_url=self._push_url,
+                branch_shas=branch_shas,
+            )
 
     def create_worktree(
         self,
@@ -696,6 +777,42 @@ class GitAdapter:
         if not resolved.is_dir():
             raise NotADirectoryError("Git workdir must be an existing directory")
         return resolved
+
+    def _capture_repository_identity(self) -> RepositoryIdentity:
+        self._reject_reparse_components(self.repo_path)
+        try:
+            details = self.repo_path.stat()
+        except OSError as error:
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="repository identity is unavailable",
+            ) from error
+        if not self.repo_path.is_dir():
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="repository path is not a directory",
+            )
+        return RepositoryIdentity(
+            canonical_path=self.repo_path.resolve(strict=True),
+            device=details.st_dev,
+            inode=details.st_ino,
+        )
+
+    @staticmethod
+    def _reject_reparse_components(path: Path) -> None:
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            current /= component
+            try:
+                details = current.lstat()
+            except OSError:
+                continue
+            attributes = getattr(details, "st_file_attributes", 0)
+            if current.is_symlink() or attributes & 0x400:
+                raise RemoteIdentityChanged(
+                    "repository_identity",
+                    reason="repository path contains a reparse point",
+                )
 
     def _registered_worktrees(self) -> dict[str, Path]:
         return {
