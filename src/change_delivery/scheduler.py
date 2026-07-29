@@ -36,10 +36,12 @@ class SchedulerResult(FrozenModel):
         "already_running",
         "waiting_for_intervention",
         "unsafe_lock",
+        "concurrent_state_change",
     ]
     processed: int
     run_id: str | None = None
     outcome: StepOutcome | None = None
+    current_state: RunState | None = None
 
 
 class Scheduler:
@@ -135,22 +137,37 @@ class Scheduler:
 
             outcome = self.orchestrator.step(run.run_id)
             if outcome.action == "process_timeout":
-                current = self.repository.get_run(run.run_id)
-                if current.state is not RunState.BLOCKED:
-                    self.repository.block_for_scheduler(
-                        run.run_id,
-                        current.state,
-                        evidence_kind="process_timeout",
-                        event_type="SCHEDULER_PROCESS_TIMEOUT",
-                        reason_code="configured_process_timeout",
-                        occurred_at=now,
-                        evidence_details={
-                            "configured_timeout_seconds": (
-                                outcome.configured_timeout_seconds
-                            ),
-                            "operation_hash": outcome.operation_hash,
-                            "command_hash": outcome.command_hash,
-                        },
+                observed = self.repository.get_run(run.run_id)
+                if observed.state is not outcome.state:
+                    return SchedulerResult(
+                        status="concurrent_state_change",
+                        processed=1,
+                        run_id=run.run_id,
+                        current_state=observed.state,
+                    )
+                event = self.repository.block_for_scheduler(
+                    run.run_id,
+                    observed.state,
+                    evidence_kind="process_timeout",
+                    event_type="SCHEDULER_PROCESS_TIMEOUT",
+                    reason_code="configured_process_timeout",
+                    occurred_at=now,
+                    observed_updated_at=observed.updated_at,
+                    evidence_details={
+                        "configured_timeout_seconds": (
+                            outcome.configured_timeout_seconds
+                        ),
+                        "operation_hash": outcome.operation_hash,
+                        "command_hash": outcome.command_hash,
+                    },
+                )
+                if event is None:
+                    authoritative = self.repository.get_run(run.run_id)
+                    return SchedulerResult(
+                        status="concurrent_state_change",
+                        processed=1,
+                        run_id=run.run_id,
+                        current_state=authoritative.state,
                     )
                 outcome = StepOutcome(
                     state=RunState.BLOCKED,

@@ -262,11 +262,16 @@ class RunRepository:
                 activity_at = datetime.fromisoformat(stored_updated_at)
                 if activity_at != observed_updated_at:
                     return None
-                threshold = inactivity_threshold
-                if not isinstance(threshold, timedelta):
-                    raise ValueError("inactivity threshold is required")
-                if occurred_at.astimezone(UTC) - activity_at.astimezone(UTC) <= threshold:
-                    return None
+                if inactivity_threshold is not None:
+                    threshold = inactivity_threshold
+                    if not isinstance(threshold, timedelta):
+                        raise ValueError("inactivity threshold must be timedelta")
+                    if (
+                        occurred_at.astimezone(UTC)
+                        - activity_at.astimezone(UTC)
+                        <= threshold
+                    ):
+                        return None
             assert_transition(
                 current,
                 RunState.BLOCKED,

@@ -359,3 +359,85 @@ def test_tick_holds_non_replaceable_lock_handle(tmp_path: Path) -> None:
     scheduler.tick()
 
     assert replaced == [False]
+
+
+def timeout_outcome(state: RunState) -> StepOutcome:
+    return StepOutcome(
+        state=state,
+        action="process_timeout",
+        blocked_reason="configured process timeout exceeded",
+        configured_timeout_seconds=321,
+        operation_hash="a" * 64,
+        command_hash="b" * 64,
+    )
+
+
+def test_process_timeout_does_not_overwrite_terminal_state_from_step(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+
+    class TerminalOrchestrator:
+        def step(self, run_id: str) -> StepOutcome:
+            fixture.repository.transition(
+                run_id,
+                RunState.DRAFT,
+                RunState.CANCELLED,
+                "MANUAL_CANCEL",
+            )
+            return timeout_outcome(RunState.DRAFT)
+
+    scheduler = Scheduler(
+        runtime_root=tmp_path,
+        repository=fixture.repository,
+        orchestrator=TerminalOrchestrator(),
+        clock=lambda: NOW,
+    )
+
+    result = scheduler.tick()
+
+    assert result.status == "concurrent_state_change"
+    assert result.current_state is RunState.CANCELLED
+    assert fixture.repository.get_run("run-1").state is RunState.CANCELLED
+    assert fixture.repository.list_evidence("run-1") == []
+
+
+def test_process_timeout_cas_loss_reports_authoritative_terminal_state(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+
+    class RacingRepository:
+        def __getattr__(self, name: str) -> object:
+            return getattr(fixture.repository, name)
+
+        def block_for_scheduler(self, run_id: str, expected: RunState, **kwargs: object):
+            fixture.repository.transition(
+                run_id,
+                expected,
+                RunState.CANCELLED,
+                "MANUAL_CANCEL",
+            )
+            return fixture.repository.block_for_scheduler(
+                run_id,
+                expected,
+                **kwargs,
+            )
+
+    scheduler = Scheduler(
+        runtime_root=tmp_path,
+        repository=RacingRepository(),  # type: ignore[arg-type]
+        orchestrator=FakeOrchestrator(
+            {"run-1": timeout_outcome(RunState.DRAFT)}
+        ),
+        clock=lambda: NOW,
+    )
+
+    result = scheduler.tick()
+
+    assert result.status == "concurrent_state_change"
+    assert result.current_state is RunState.CANCELLED
+    assert fixture.repository.get_run("run-1").state is RunState.CANCELLED
+    assert fixture.repository.list_evidence("run-1") == []
