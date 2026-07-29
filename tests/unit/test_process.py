@@ -111,6 +111,7 @@ def test_runner_uses_direct_argv_isolated_env_and_redacts_output(
     assert captured["errors"] == "replace"
     assert captured["timeout"] == 12
     assert captured["cwd"] == str(tmp_path.resolve())
+    assert captured["stdin"] is subprocess.DEVNULL
     child_env = captured["env"]
     assert isinstance(child_env, dict)
     assert child_env["DELIVERY_TEST_SECRET"] == "s3cr.et[值]"
@@ -183,6 +184,59 @@ def test_missing_provider_value_does_not_fall_back_to_parent_environment(
     assert isinstance(child_env, dict)
     assert "PATH" not in child_env
     assert "HOME" not in child_env
+
+
+def test_fixed_non_secret_environment_is_injected_without_output_redaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["env"] = kwargs["env"]
+        return subprocess.CompletedProcess(argv, 0, "mode=never", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = ProcessRunner(
+        lambda names: {},
+        fixed_environment_provider=lambda names: {"DELIVERY_MODE": "never"},
+    )
+
+    result = runner.run(
+        command_spec(
+            tmp_path,
+            env_names=("DELIVERY_MODE",),
+        )
+    )
+
+    child_env = captured["env"]
+    assert isinstance(child_env, dict)
+    assert child_env["DELIVERY_MODE"] == "never"
+    assert result.stdout == "mode=never"
+
+
+@pytest.mark.parametrize(
+    "provided",
+    [
+        {"BAD=NAME": "value"},
+        {"BAD\x00NAME": "value"},
+        {"UNREQUESTED": "bad\x00value"},
+    ],
+)
+def test_fixed_environment_validates_every_entry_without_leaking_value(
+    tmp_path: Path,
+    provided: Mapping[str, str],
+) -> None:
+    runner = ProcessRunner(
+        lambda names: {},
+        fixed_environment_provider=lambda names: provided,
+    )
+
+    with pytest.raises(ValueError) as caught:
+        runner.run(command_spec(tmp_path, env_names=("DELIVERY_MODE",)))
+
+    assert "bad\x00value" not in str(caught.value)
+    assert "value" not in str(caught.value)
 
 
 def test_sensitive_home_can_only_enter_through_explicit_provider(

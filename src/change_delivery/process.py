@@ -18,6 +18,7 @@ from change_delivery.redaction import redact_text
 
 
 SecretProvider = Callable[[tuple[str, ...]], Mapping[str, str]]
+FixedEnvironmentProvider = Callable[[tuple[str, ...]], Mapping[str, str]]
 
 
 class ProcessResult(FrozenModel):
@@ -102,6 +103,7 @@ def _invoke_process(
             encoding="utf-8",
             errors="replace",
             timeout=spec.timeout_seconds,
+            stdin=subprocess.DEVNULL,
             shell=False,
             check=False,
         )
@@ -130,14 +132,25 @@ def _invoke_process(
 
 
 class ProcessRunner:
+    """Run direct argv with isolated environment and redacted secret output.
+
+    ``fixed_environment_provider`` is only for non-secret, process-control
+    constants owned by the caller. Project credentials must be supplied through
+    ``secret_provider`` so their values are redacted from all captured output.
+    """
+
     def __init__(
         self,
         secret_provider: SecretProvider,
         *,
+        fixed_environment_provider: FixedEnvironmentProvider | None = None,
         start_time_ns: Callable[[], int] = time.time_ns,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._secret_provider = secret_provider
+        self._fixed_environment_provider = (
+            fixed_environment_provider or (lambda names: {})
+        )
         self._start_time_ns = start_time_ns
         self._monotonic = monotonic
 
@@ -146,7 +159,9 @@ class ProcessRunner:
         start_time_ns = self._start_time_ns()
         command_id = self._command_id(spec, workdir, start_time_ns)
         secrets = self._requested_secrets(spec.env_names)
+        environment = self._requested_environment(spec.env_names)
         child_environment = _safe_base_environment(spec.env_names)
+        child_environment.update(environment)
         child_environment.update(secrets)
         started = self._monotonic()
 
@@ -158,6 +173,7 @@ class ProcessRunner:
             safe_stderr = outcome.stderr
             del outcome
             del child_environment
+            del environment
             del secrets
             del spec
             del self
@@ -174,6 +190,7 @@ class ProcessRunner:
         safe_stderr = redact_text(_as_text(outcome.stderr), secrets)
         del outcome
         del child_environment
+        del environment
         del secrets
         return ProcessResult(
             command_id=command_id,
@@ -193,6 +210,26 @@ class ProcessRunner:
         for name in env_names:
             _validate_environment_entry(name, "")
         provided = self._secret_provider(env_names)
+        provided_by_name = {
+            _environment_name(name): value
+            for name, value in provided.items()
+        }
+        requested: dict[str, str] = {}
+        for name in env_names:
+            normalized_name = _environment_name(name)
+            if normalized_name not in provided_by_name:
+                continue
+            value = provided_by_name[normalized_name]
+            _validate_environment_entry(name, value)
+            requested[name] = value
+        return requested
+
+    def _requested_environment(self, env_names: tuple[str, ...]) -> dict[str, str]:
+        for name in env_names:
+            _validate_environment_entry(name, "")
+        provided = self._fixed_environment_provider(env_names)
+        for name, value in provided.items():
+            _validate_environment_entry(name, value)
         provided_by_name = {
             _environment_name(name): value
             for name, value in provided.items()

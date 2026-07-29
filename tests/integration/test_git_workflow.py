@@ -10,6 +10,7 @@ from change_delivery.adapters.git import (
     GitAdapter,
     GitError,
     LeaseConflict,
+    RemoteIdentityChanged,
 )
 from change_delivery.domain import CommandSpec
 from change_delivery.process import (
@@ -82,17 +83,34 @@ class RecordingRunner:
     def __init__(self) -> None:
         self.specs: list[CommandSpec] = []
         self.delegate = ProcessRunner(
-            lambda names: {
+            lambda names: {},
+            fixed_environment_provider=lambda names: {
                 "GIT_CONFIG_NOSYSTEM": "true",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_TERMINAL_PROMPT": "false",
                 "GCM_INTERACTIVE": "never",
+                "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
             }
         )
 
     def run(self, spec: CommandSpec) -> ProcessResult:
         self.specs.append(spec)
         return self.delegate.run(spec)
+
+
+def adapter_for(
+    repo: Path,
+    *,
+    runner: RecordingRunner | None = None,
+    **overrides: object,
+) -> GitAdapter:
+    arguments: dict[str, object] = {
+        "remote": "origin",
+        "base_branch": "develop",
+        "test_branch": "test",
+    }
+    arguments.update(overrides)
+    return GitAdapter(repo, runner=runner, **arguments)
 
 
 def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
@@ -117,7 +135,7 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
     git(repo, "worktree", "remove", str(colliding))
     worktree = tmp_path / "worktrees" / "feature-one"
     runner = RecordingRunner()
-    adapter = GitAdapter(repo, runner=runner)
+    adapter = adapter_for(repo, runner=runner)
 
     adapter.fetch("origin")
     assert adapter.remote_sha("origin", "develop") == latest_sha
@@ -161,7 +179,7 @@ def test_commit_and_feature_push_are_direct_non_force_argv(
 ) -> None:
     _, _, repo, _ = local_remote
     runner = RecordingRunner()
-    adapter = GitAdapter(repo, runner=runner)
+    adapter = adapter_for(repo, runner=runner)
     adapter.fetch("origin")
     worktree = tmp_path / "feature"
     adapter.create_worktree("origin/develop", "feature/push", worktree)
@@ -187,7 +205,7 @@ def test_commit_all_rejects_empty_commit_and_unsafe_message(
     tmp_path: Path,
 ) -> None:
     _, _, repo, _ = local_remote
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
     adapter.fetch("origin")
     worktree = tmp_path / "feature"
     adapter.create_worktree("origin/develop", "feature/empty", worktree)
@@ -206,7 +224,7 @@ def test_test_push_uses_exact_lease_and_returns_verified_sha(
     _, seed, repo, base_sha = local_remote
     git(seed, "push", "origin", f"{base_sha}:refs/heads/test")
     runner = RecordingRunner()
-    adapter = GitAdapter(repo, runner=runner)
+    adapter = adapter_for(repo, runner=runner)
     adapter.fetch("origin")
     worktree = tmp_path / "feature"
     adapter.create_worktree("origin/develop", "feature/test-deploy", worktree)
@@ -234,7 +252,7 @@ def test_stale_test_lease_never_overwrites_remote_or_retries(
     remote, seed, repo, base_sha = local_remote
     git(seed, "push", "origin", f"{base_sha}:refs/heads/test")
     runner = RecordingRunner()
-    adapter = GitAdapter(repo, runner=runner)
+    adapter = adapter_for(repo, runner=runner)
     adapter.fetch("origin")
     observed_sha = adapter.remote_sha("origin", "test")
     worktree = tmp_path / "candidate"
@@ -274,7 +292,7 @@ def test_option_and_whitespace_injection_is_rejected_before_git(
     arguments: tuple[object, ...],
 ) -> None:
     _, _, repo, _ = local_remote
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
 
     with pytest.raises((ValueError, GitError)):
         getattr(adapter, method)(*arguments)
@@ -284,12 +302,96 @@ def test_remote_must_be_a_registered_name_not_a_url(
     local_remote: tuple[Path, Path, Path, str],
 ) -> None:
     remote, _, repo, _ = local_remote
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
 
     with pytest.raises(ValueError):
         adapter.fetch(str(remote))
-    with pytest.raises(GitError, match="registered"):
+    with pytest.raises(ValueError, match="bound remote"):
         adapter.fetch("upstream")
+
+
+def test_adapter_binds_remote_and_protects_base_test_and_standard_branches(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    _, _, repo, _ = local_remote
+
+    with pytest.raises(ValueError, match="different"):
+        adapter_for(repo, base_branch="develop", test_branch="develop")
+    adapter = adapter_for(repo)
+    adapter.fetch("origin")
+    worktree = tmp_path / "protected-push"
+    adapter.create_worktree("origin/develop", "feature/protected", worktree)
+
+    with pytest.raises(ValueError, match="bound remote"):
+        adapter.fetch("upstream")
+    with pytest.raises(ValueError, match="protected"):
+        adapter.push_feature(worktree, "origin", "develop")
+    with pytest.raises(ValueError, match="bound test"):
+        adapter.push_test_with_lease("origin", "main", "a" * 40, "b" * 40)
+    with pytest.raises(ValueError, match="protected"):
+        adapter.delete_merged_local_branch("develop")
+
+
+def test_adapter_can_only_be_constructed_from_primary_worktree(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    _, _, repo, _ = local_remote
+    linked = tmp_path / "linked"
+    git(repo, "worktree", "add", "-b", "feature/linked-init", str(linked), "develop")
+
+    with pytest.raises(GitError, match="primary"):
+        adapter_for(linked)
+
+    primary_adapter = adapter_for(repo)
+    (repo / "must-not-commit.txt").write_text("primary dirty\n", encoding="utf-8")
+    with pytest.raises(GitError, match="secondary"):
+        primary_adapter.commit_all(repo, "must not commit primary")
+    assert git(repo, "status", "--short").stdout.strip() == "?? must-not-commit.txt"
+
+
+def test_remote_identity_change_blocks_fetch_and_push_without_writing(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    _, _, repo, _ = local_remote
+    replacement = tmp_path / "replacement.git"
+    replacement.mkdir()
+    git(replacement, "init", "--bare")
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner)
+    adapter.fetch("origin")
+    worktree = tmp_path / "identity-worktree"
+    adapter.create_worktree("origin/develop", "feature/identity", worktree)
+    commit_file(worktree, "identity.txt", "candidate\n", "candidate")
+    fetch_count = sum(spec.args[:1] == ("fetch",) for spec in runner.specs)
+    push_count = sum(spec.args[:1] == ("push",) for spec in runner.specs)
+
+    git(repo, "remote", "set-url", "origin", str(replacement))
+
+    with pytest.raises(RemoteIdentityChanged):
+        adapter.fetch("origin")
+    with pytest.raises(RemoteIdentityChanged):
+        adapter.push_feature(worktree, "origin", "feature/identity")
+
+    assert sum(spec.args[:1] == ("fetch",) for spec in runner.specs) == fetch_count
+    assert sum(spec.args[:1] == ("push",) for spec in runner.specs) == push_count
+    assert git(repo, "ls-remote", str(replacement), "refs/heads/feature/identity").stdout == ""
+
+
+def test_expected_remote_identity_must_match_at_construction(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, repo, _ = local_remote
+
+    adapter_for(
+        repo,
+        expected_remote_url=str(remote),
+        expected_push_url=str(remote),
+    )
+    with pytest.raises(RemoteIdentityChanged):
+        adapter_for(repo, expected_remote_url="C:/unexpected/origin.git")
 
 
 def test_worktree_base_must_name_a_registered_remote_ref(
@@ -297,12 +399,12 @@ def test_worktree_base_must_name_a_registered_remote_ref(
     tmp_path: Path,
 ) -> None:
     _, _, repo, _ = local_remote
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
     adapter.fetch("origin")
 
     with pytest.raises(ValueError, match="remote base"):
         adapter.create_worktree("develop", "feature/local-base", tmp_path / "local")
-    with pytest.raises(GitError, match="registered"):
+    with pytest.raises(ValueError, match="bound remote"):
         adapter.create_worktree(
             "upstream/develop",
             "feature/unregistered-base",
@@ -327,7 +429,7 @@ def test_remove_worktree_refuses_dirty_and_removes_only_registered_clean_path(
     tmp_path: Path,
 ) -> None:
     _, _, repo, _ = local_remote
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
     adapter.fetch("origin")
     worktree = tmp_path / "feature"
     adapter.create_worktree("origin/develop", "feature/remove", worktree)
@@ -351,7 +453,7 @@ def test_delete_local_branch_uses_safe_d_and_refuses_unmerged_or_protected(
 ) -> None:
     _, _, repo, _ = local_remote
     runner = RecordingRunner()
-    adapter = GitAdapter(repo, runner=runner)
+    adapter = adapter_for(repo, runner=runner)
     adapter.fetch("origin")
     worktree = tmp_path / "feature"
     adapter.create_worktree("origin/develop", "feature/unmerged", worktree)
@@ -373,7 +475,7 @@ def test_delete_merged_local_branch_succeeds_without_force(
     tmp_path: Path,
 ) -> None:
     _, _, repo, _ = local_remote
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
     adapter.fetch("origin")
     worktree = tmp_path / "merged"
     adapter.create_worktree("origin/develop", "feature/merged", worktree)
@@ -390,7 +492,7 @@ def test_git_failure_redacts_credentials_from_exception(
 ) -> None:
     _, _, repo, _ = local_remote
     git(repo, "remote", "set-url", "origin", "https://delivery:super-secret@example.invalid/repo.git")
-    adapter = GitAdapter(repo)
+    adapter = adapter_for(repo)
 
     with pytest.raises(GitError) as caught:
         adapter.fetch("origin")
@@ -412,10 +514,8 @@ def test_process_start_failure_is_wrapped_as_structured_git_error(
         def run(self, spec: CommandSpec) -> ProcessResult:
             raise ProcessStartError("0123456789abcdef")
 
-    adapter = GitAdapter(repo, runner=StartFailingRunner())
-
     with pytest.raises(GitError) as caught:
-        adapter.fetch("origin")
+        adapter_for(repo, runner=StartFailingRunner())  # type: ignore[arg-type]
 
-    assert caught.value.operation == "list_remotes"
+    assert caught.value.operation == "list_worktrees"
     assert caught.value.__cause__ is None

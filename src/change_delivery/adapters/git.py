@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import hmac
 import os
 from pathlib import Path
 import re
@@ -19,12 +20,13 @@ _SHA = re.compile(r"^[0-9A-Fa-f]{40}$")
 _URL_CREDENTIALS = re.compile(
     r"(?i)\b((?:https?|ssh|git)://)(?:[^/@\s]+)@"
 )
-_PROTECTED_BRANCHES = frozenset({"develop", "main", "master", "test"})
+_STANDARD_PROTECTED_BRANCHES = frozenset({"develop", "main", "master"})
 _GIT_ENV_NAMES = (
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_GLOBAL",
     "GIT_TERMINAL_PROMPT",
     "GCM_INTERACTIVE",
+    "GIT_SSH_COMMAND",
 )
 
 
@@ -68,12 +70,17 @@ class LeaseConflict(GitError):
     """The protected test branch changed after it was observed."""
 
 
+class RemoteIdentityChanged(GitError):
+    """The configured remote no longer has its registered fetch/push identity."""
+
+
 def _git_environment(names: tuple[str, ...]) -> dict[str, str]:
     values = {
         "GIT_CONFIG_NOSYSTEM": "true",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_TERMINAL_PROMPT": "false",
         "GCM_INTERACTIVE": "never",
+        "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
     }
     return {name: values[name] for name in names if name in values}
 
@@ -83,6 +90,11 @@ class GitAdapter:
         self,
         repo_path: Path,
         *,
+        remote: str,
+        base_branch: str,
+        test_branch: str,
+        expected_remote_url: str | None = None,
+        expected_push_url: str | None = None,
         runner: Runner | None = None,
         git_executable: str = "git",
     ) -> None:
@@ -96,15 +108,53 @@ class GitAdapter:
         ):
             raise ValueError("invalid Git executable")
         self.repo_path = resolved_repo
-        self._runner = runner or ProcessRunner(_git_environment)
+        self._runner = runner or ProcessRunner(
+            lambda names: {},
+            fixed_environment_provider=_git_environment,
+        )
         self._git_executable = git_executable
+        self._require_primary_repo()
+        self._validate_remote_name(remote)
+        self._require_registered_remote(remote)
+        self._validate_branch(base_branch)
+        self._validate_branch(test_branch)
+        if base_branch.casefold() == test_branch.casefold():
+            raise ValueError("base and test branches must be different")
+        self.remote = remote
+        self.base_branch = base_branch
+        self.test_branch = test_branch
+        self._protected_branches = (
+            _STANDARD_PROTECTED_BRANCHES
+            | {base_branch.casefold(), test_branch.casefold()}
+        )
+        fetch_url, push_url = self._read_remote_identity()
+        if (
+            expected_remote_url is not None
+            and not hmac.compare_digest(fetch_url, expected_remote_url)
+        ):
+            raise RemoteIdentityChanged(
+                "initialize",
+                reason="registered fetch URL does not match expected identity",
+            )
+        if (
+            expected_push_url is not None
+            and not hmac.compare_digest(push_url, expected_push_url)
+        ):
+            raise RemoteIdentityChanged(
+                "initialize",
+                reason="registered push URL does not match expected identity",
+            )
+        self._fetch_url = fetch_url
+        self._push_url = push_url
 
     def fetch(self, remote: str) -> None:
-        self._require_registered_remote(remote)
+        self._require_bound_remote(remote)
+        self._assert_remote_identity()
         self._run("fetch", ("fetch", "--prune", remote))
 
     def remote_sha(self, remote: str, branch: str) -> str:
-        self._require_registered_remote(remote)
+        self._require_bound_remote(remote)
+        self._assert_remote_identity()
         self._validate_branch(branch)
         result = self._run(
             "remote_sha",
@@ -176,10 +226,13 @@ class GitAdapter:
         return self._head_sha(resolved)
 
     def push_feature(self, workdir: Path, remote: str, branch: str) -> str:
-        self._require_registered_remote(remote)
+        self._require_bound_remote(remote)
         self._validate_branch(branch)
+        if branch.casefold() in self._protected_branches:
+            raise ValueError("protected branch cannot receive a feature push")
         resolved = self._require_secondary_worktree(workdir)
         source_sha = self._head_sha(resolved)
+        self._assert_remote_identity()
         self._run(
             "push_feature",
             ("push", "-u", remote, f"HEAD:refs/heads/{branch}"),
@@ -197,10 +250,13 @@ class GitAdapter:
         source_sha: str,
         observed_sha: str,
     ) -> str:
-        self._require_registered_remote(remote)
+        self._require_bound_remote(remote)
         self._validate_branch(test_branch)
+        if test_branch != self.test_branch:
+            raise ValueError("test branch must equal the bound test branch")
         source = self._normalize_sha(source_sha)
         observed = self._normalize_sha(observed_sha)
+        self._assert_remote_identity()
         args = (
             "push",
             remote,
@@ -253,7 +309,7 @@ class GitAdapter:
 
     def delete_merged_local_branch(self, branch: str) -> None:
         self._validate_branch(branch)
-        if branch.casefold() in _PROTECTED_BRANCHES:
+        if branch.casefold() in self._protected_branches:
             raise ValueError("protected branch cannot be deleted")
         current_result = self._run(
             "current_branch",
@@ -314,15 +370,59 @@ class GitAdapter:
         )
 
     def _require_registered_remote(self, remote: str) -> None:
+        self._validate_remote_name(remote)
+        result = self._run("list_remotes", ("remote",))
+        if remote not in result.stdout.splitlines():
+            raise GitError("remote", reason="remote is not registered")
+
+    @staticmethod
+    def _validate_remote_name(remote: str) -> None:
         if (
             not isinstance(remote, str)
             or not _REMOTE_NAME.fullmatch(remote)
             or remote.startswith("-")
         ):
             raise ValueError("remote must be a safe registered name")
-        result = self._run("list_remotes", ("remote",))
-        if remote not in result.stdout.splitlines():
-            raise GitError("remote", reason="remote is not registered")
+
+    def _require_bound_remote(self, remote: str) -> None:
+        self._validate_remote_name(remote)
+        if remote != self.remote:
+            raise ValueError("remote must equal the bound remote")
+
+    def _read_remote_identity(self) -> tuple[str, str]:
+        fetch_url = self._single_line(
+            self._run(
+                "remote_fetch_url",
+                ("remote", "get-url", self.remote),
+            ).stdout,
+            "remote_fetch_url",
+        )
+        push_url = self._single_line(
+            self._run(
+                "remote_push_url",
+                ("remote", "get-url", "--push", self.remote),
+            ).stdout,
+            "remote_push_url",
+        )
+        return fetch_url, push_url
+
+    def _assert_remote_identity(self) -> None:
+        # Task 12's single-writer lock must enclose this recheck and its operation.
+        try:
+            fetch_url, push_url = self._read_remote_identity()
+        except GitError:
+            raise RemoteIdentityChanged(
+                "remote_identity",
+                reason="registered remote identity is unavailable",
+            ) from None
+        if not (
+            hmac.compare_digest(fetch_url, self._fetch_url)
+            and hmac.compare_digest(push_url, self._push_url)
+        ):
+            raise RemoteIdentityChanged(
+                "remote_identity",
+                reason="registered remote identity changed",
+            )
 
     def _validate_branch(self, branch: str) -> None:
         if (
@@ -355,8 +455,10 @@ class GitAdapter:
         remote, branch = remote_branch.split("/", 1)
         if not remote or not branch:
             raise ValueError("worktree base must be a remote base ref")
-        self._require_registered_remote(remote)
+        self._require_bound_remote(remote)
         self._validate_branch(branch)
+        if branch != self.base_branch:
+            raise ValueError("worktree base must equal the bound base branch")
         return f"refs/remotes/{remote}/{branch}"
 
     def _head_sha(self, workdir: Path) -> str:
@@ -368,6 +470,8 @@ class GitAdapter:
         return self._parse_single_sha(result.stdout, "head_sha")
 
     def _remote_head_sha(self, remote: str, branch: str) -> str:
+        self._require_bound_remote(remote)
+        self._assert_remote_identity()
         result = self._run(
             "verify_remote",
             ("ls-remote", "--heads", remote, f"refs/heads/{branch}"),
@@ -398,17 +502,41 @@ class GitAdapter:
         return resolved
 
     def _registered_worktrees(self) -> dict[str, Path]:
+        return {
+            self._path_key(path): path
+            for path in self._worktrees_in_order()
+        }
+
+    def _worktrees_in_order(self) -> list[Path]:
         result = self._run(
             "list_worktrees",
             ("worktree", "list", "--porcelain"),
         )
-        paths: dict[str, Path] = {}
+        paths: list[Path] = []
         for line in result.stdout.splitlines():
             if not line.startswith("worktree "):
                 continue
             path = Path(line[len("worktree ") :]).resolve()
-            paths[self._path_key(path)] = path
+            paths.append(path)
         return paths
+
+    def _require_primary_repo(self) -> None:
+        worktrees = self._worktrees_in_order()
+        if (
+            not worktrees
+            or self._path_key(worktrees[0]) != self._path_key(self.repo_path)
+        ):
+            raise GitError(
+                "initialize",
+                reason="adapter repository must be the primary worktree",
+            )
+
+    @staticmethod
+    def _single_line(value: str, operation: str) -> str:
+        lines = value.splitlines()
+        if len(lines) != 1 or not lines[0]:
+            raise GitError(operation, reason="Git did not return one identity value")
+        return lines[0]
 
     def _require_secondary_worktree(self, path: Path) -> Path:
         resolved = self._existing_directory(path)
