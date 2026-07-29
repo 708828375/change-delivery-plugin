@@ -7,6 +7,7 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+from filelock import FileLock
 
 from change_delivery.adapters.git import (
     GitAdapter,
@@ -17,6 +18,7 @@ from change_delivery.adapters.git import (
 )
 from change_delivery.cli import RuntimeGitPort
 from change_delivery.domain import CommandSpec
+from change_delivery.errors import BlockedError
 from change_delivery.process import (
     ProcessResult,
     ProcessRunner,
@@ -229,7 +231,8 @@ def test_discovery_attestation_binds_repo_remote_and_branch_shas(
     git(seed, "branch", "test")
     git(seed, "push", "origin", "test")
     git(repo, "fetch", "origin")
-    adapter = adapter_for(repo)
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner)
 
     attestation = adapter.discovery_attestation(
         "origin",
@@ -245,6 +248,26 @@ def test_discovery_attestation_binds_repo_remote_and_branch_shas(
         "develop": develop_sha,
         "test": develop_sha,
     }
+    ref_snapshots = [
+        git_operation_args(spec.args)
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:1] == ("for-each-ref",)
+    ]
+    assert ref_snapshots == [
+        (
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/remotes/origin/develop",
+            "refs/remotes/origin/test",
+        )
+    ]
+    remote_snapshots = [
+        git_operation_args(spec.args)
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:2]
+        == ("config", "--get-regexp")
+    ]
+    assert len(remote_snapshots) == 2
 
 
 def test_discovery_attestation_rejects_repository_identity_replacement(
@@ -256,13 +279,59 @@ def test_discovery_attestation_rejects_repository_identity_replacement(
     original = adapter._repository_identity
     changed = original.model_copy(update={"inode": original.inode + 1})
     identities = iter((original, changed))
-    monkeypatch.setattr(
-        adapter,
-        "_capture_repository_identity",
-        lambda: next(identities),
-    )
+
+    class Handle:
+        def __init__(self):
+            self.identity = next(identities)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(adapter, "_open_repository_handle", Handle)
 
     with pytest.raises(RemoteIdentityChanged, match="repository identity"):
+        adapter.discovery_attestation("origin", ("develop",))
+
+
+def test_discovery_attestation_blocks_on_cross_process_project_lock(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, repo, _ = local_remote
+    adapter = adapter_for(repo)
+    lock = FileLock(adapter.discovery_lock_path, timeout=0)
+
+    with lock:
+        with pytest.raises(BlockedError, match="lock"):
+            adapter.discovery_attestation("origin", ("develop",))
+
+
+def test_discovery_attestation_fails_closed_for_zero_file_identity(
+    local_remote: tuple[Path, Path, Path, str],
+    monkeypatch,
+) -> None:
+    _, _, repo, _ = local_remote
+    adapter = adapter_for(repo)
+    invalid = adapter._repository_identity.model_copy(update={"inode": 0})
+
+    class InvalidHandle:
+        identity = invalid
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        adapter,
+        "_open_repository_handle",
+        lambda: InvalidHandle(),
+    )
+
+    with pytest.raises(RemoteIdentityChanged, match="reliable"):
         adapter.discovery_attestation("origin", ("develop",))
 
 

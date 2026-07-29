@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from email.message import Message
 from pathlib import Path
-from urllib.error import HTTPError, URLError
+import time
+from urllib.error import URLError
 
 import pytest
 
@@ -11,7 +12,9 @@ from change_delivery.adapters.git import GitDiscoveryAttestation, RepositoryIden
 from change_delivery.adapters.http import (
     HttpMethodNotAllowed,
     HttpReadError,
+    PinnedHttpsTransport,
     ReadOnlyHttpClient,
+    SecureHttpTransport,
 )
 from change_delivery.adapters.project import (
     ExampleProjectAdapter,
@@ -253,6 +256,8 @@ class FakeResponse:
         *,
         url: str = "https://example.invalid/version",
         content_length: int | None = None,
+        status: int = 200,
+        retry_after: str | None = None,
     ) -> None:
         self._body = (
             body if isinstance(body, bytes) else json.dumps(body).encode()
@@ -260,8 +265,12 @@ class FakeResponse:
         self._offset = 0
         self._url = url
         self.headers = Message()
+        self.status = status
+        self.timeout_calls: list[float] = []
         if content_length is not None:
             self.headers["Content-Length"] = str(content_length)
+        if retry_after is not None:
+            self.headers["Retry-After"] = retry_after
 
     def __enter__(self):
         return self
@@ -279,31 +288,106 @@ class FakeResponse:
     def geturl(self) -> str:
         return self._url
 
+    def set_read_timeout(self, timeout: float) -> None:
+        self.timeout_calls.append(timeout)
 
-def test_http_client_uses_get_ten_second_timeout_and_three_attempts() -> None:
-    calls: list[tuple[str, str, float]] = []
-    sleeps: list[float] = []
 
-    def opener(request, timeout):
-        calls.append((request.get_method(), request.full_url, timeout))
-        if len(calls) < 3:
-            raise URLError("temporary")
+class FakeTransport(SecureHttpTransport):
+    def __init__(self, outcomes) -> None:
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def get(self, url: str, *, timeout: float):
+        self.calls.append((url, timeout))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+@pytest.mark.parametrize(
+    "hostname,addresses",
+    (
+        ("localhost", ("127.0.0.1",)),
+        ("127.0.0.1.nip.io", ("127.0.0.1",)),
+        ("mixed.example", ("93.184.216.34", "169.254.169.254")),
+    ),
+)
+def test_pinned_transport_rejects_any_non_public_resolution(
+    hostname,
+    addresses,
+) -> None:
+    def resolver(_host, port, **_kwargs):
+        return [
+            (2, 1, 6, "", (address, port))
+            for address in addresses
+        ]
+
+    transport = PinnedHttpsTransport(
+        resolver=resolver,
+        connector=lambda *_args, **_kwargs: pytest.fail("must not connect"),
+    )
+
+    with pytest.raises(HttpReadError, match="public"):
+        transport.get(f"https://{hostname}/version", timeout=10)
+
+
+def test_pinned_transport_resolves_once_and_connects_to_frozen_ip() -> None:
+    resolutions = iter(
+        (
+            ("93.184.216.34",),
+            ("127.0.0.1",),
+        )
+    )
+    resolve_calls = 0
+    attestations = []
+
+    def resolver(_host, port, **_kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return [
+            (2, 1, 6, "", (address, port))
+            for address in next(resolutions)
+        ]
+
+    def connector(attestation, timeout):
+        attestations.append((attestation, timeout))
         return FakeResponse({"ok": True})
 
-    client = ReadOnlyHttpClient(opener=opener, sleep=sleeps.append)
+    transport = PinnedHttpsTransport(
+        resolver=resolver,
+        connector=connector,
+    )
+    with transport.get("https://example.com/version", timeout=10):
+        pass
+
+    assert resolve_calls == 1
+    assert attestations[0][0].hostname == "example.com"
+    assert attestations[0][0].pinned_ip == "93.184.216.34"
+    assert attestations[0][0].addresses == ("93.184.216.34",)
+
+
+def test_http_client_uses_get_ten_second_timeout_and_three_attempts() -> None:
+    sleeps: list[float] = []
+    transport = FakeTransport(
+        (URLError("temporary"), URLError("temporary"), FakeResponse({"ok": True}))
+    )
+    client = ReadOnlyHttpClient(
+        transport=transport,
+        sleep=sleeps.append,
+        monotonic=lambda: 0.0,
+    )
 
     assert client.get_json("https://example.invalid/version") == {"ok": True}
-    assert calls == [
-        ("GET", "https://example.invalid/version", 10.0),
-        ("GET", "https://example.invalid/version", 10.0),
-        ("GET", "https://example.invalid/version", 10.0),
-    ]
+    assert transport.calls == [
+        ("https://example.invalid/version", 10.0),
+    ] * 3
     assert sleeps == [1.0, 2.0]
 
 
 def test_http_client_exposes_no_non_get_request() -> None:
     client = ReadOnlyHttpClient(
-        opener=lambda *_args, **_kwargs: FakeResponse({}),
+        transport=FakeTransport((FakeResponse({}),)),
     )
 
     with pytest.raises(HttpMethodNotAllowed):
@@ -321,7 +405,9 @@ def test_http_client_exposes_no_non_get_request() -> None:
     ),
 )
 def test_http_client_rejects_dangerous_or_secret_bearing_urls(url) -> None:
-    client = ReadOnlyHttpClient(opener=lambda *_args, **_kwargs: FakeResponse({}))
+    client = ReadOnlyHttpClient(
+        transport=FakeTransport((FakeResponse({}),))
+    )
 
     with pytest.raises(ValueError):
         client.get_json(url)
@@ -349,31 +435,24 @@ def test_registration_blocks_dangerous_ip_literal(fixture_config) -> None:
 
 
 def test_http_client_rejects_redirect_without_retry() -> None:
-    calls = 0
-
-    def opener(request, timeout):
-        nonlocal calls
-        calls += 1
-        raise HTTPError(
-            request.full_url,
-            302,
-            "Found",
-            {"Location": "http://127.0.0.1/version"},
-            None,
-        )
+    transport = FakeTransport((FakeResponse({}, status=302),))
 
     with pytest.raises(HttpReadError, match="redirect"):
-        ReadOnlyHttpClient(opener=opener, sleep=lambda _delay: None).get_json(
+        ReadOnlyHttpClient(transport=transport).get_json(
             "https://example.invalid/version"
         )
-    assert calls == 1
+    assert len(transport.calls) == 1
 
 
 def test_http_client_rejects_opener_that_followed_redirect() -> None:
     client = ReadOnlyHttpClient(
-        opener=lambda *_args, **_kwargs: FakeResponse(
-            {"git_sha": TEST_SHA},
-            url="http://127.0.0.1/version",
+        transport=FakeTransport(
+            (
+                FakeResponse(
+                    {"git_sha": TEST_SHA},
+                    url="http://127.0.0.1/version",
+                ),
+            )
         )
     )
 
@@ -384,13 +463,12 @@ def test_http_client_rejects_opener_that_followed_redirect() -> None:
 def test_http_client_rejects_declared_and_streamed_oversize_bodies() -> None:
     too_large = 65_537
     declared = ReadOnlyHttpClient(
-        opener=lambda *_args, **_kwargs: FakeResponse(
-            {},
-            content_length=too_large,
+        transport=FakeTransport(
+            (FakeResponse({}, content_length=too_large),)
         )
     )
     streamed = ReadOnlyHttpClient(
-        opener=lambda *_args, **_kwargs: FakeResponse(b"x" * too_large)
+        transport=FakeTransport((FakeResponse(b"x" * too_large),))
     )
 
     with pytest.raises(HttpReadError, match="too large"):
@@ -402,7 +480,7 @@ def test_http_client_rejects_declared_and_streamed_oversize_bodies() -> None:
 def test_http_client_enforces_total_deadline_while_streaming() -> None:
     ticks = iter((0.0, 0.0, 0.0, 11.0))
     client = ReadOnlyHttpClient(
-        opener=lambda *_args, **_kwargs: FakeResponse(b"{}"),
+        transport=FakeTransport((FakeResponse(b"{}"),)),
         monotonic=lambda: next(ticks),
     )
 
@@ -410,39 +488,63 @@ def test_http_client_enforces_total_deadline_while_streaming() -> None:
         client.get_json("https://example.invalid/version")
 
 
+def test_http_client_fails_closed_without_read_timeout_control() -> None:
+    response = FakeResponse(b"{}")
+    response.set_read_timeout = None
+    client = ReadOnlyHttpClient(transport=FakeTransport((response,)))
+
+    with pytest.raises(HttpReadError, match="enforce read deadline"):
+        client.get_json("https://example.invalid/version")
+
+
+def test_http_client_slow_stream_stops_near_wall_clock_deadline() -> None:
+    class SlowResponse(FakeResponse):
+        def __init__(self):
+            super().__init__(b"{}")
+            self.remaining = 0.0
+
+        def set_read_timeout(self, timeout: float) -> None:
+            self.remaining = timeout
+
+        def read(self, size: int = -1) -> bytes:
+            time.sleep(self.remaining)
+            raise TimeoutError("simulated socket deadline")
+
+    client = ReadOnlyHttpClient(
+        timeout_seconds=0.05,
+        transport=FakeTransport((SlowResponse(),)),
+    )
+    started = time.monotonic()
+    with pytest.raises(HttpReadError, match="deadline"):
+        client.get_json("https://example.invalid/version")
+    elapsed = time.monotonic() - started
+    assert 0.04 <= elapsed < 0.2
+
+
 @pytest.mark.parametrize("status", (401, 403, 404))
 def test_http_client_does_not_retry_permanent_http_errors(status) -> None:
-    calls = 0
-
-    def opener(request, timeout):
-        nonlocal calls
-        calls += 1
-        raise HTTPError(request.full_url, status, "failure", {}, None)
+    transport = FakeTransport((FakeResponse({}, status=status),))
 
     with pytest.raises(HttpReadError):
-        ReadOnlyHttpClient(opener=opener).get_json(
+        ReadOnlyHttpClient(transport=transport).get_json(
             "https://example.invalid/version"
         )
-    assert calls == 1
+    assert len(transport.calls) == 1
 
 
 def test_http_client_retries_retryable_status_and_caps_retry_after() -> None:
-    calls = 0
     sleeps = []
-
-    def opener(request, timeout):
-        nonlocal calls
-        calls += 1
-        if calls < 3:
-            raise HTTPError(
-                request.full_url,
-                429,
-                "busy",
-                {"Retry-After": "999"},
-                None,
-            )
-        return FakeResponse({"ok": True})
-
-    client = ReadOnlyHttpClient(opener=opener, sleep=sleeps.append)
+    transport = FakeTransport(
+        (
+            FakeResponse({}, status=429, retry_after="999"),
+            FakeResponse({}, status=429, retry_after="999"),
+            FakeResponse({"ok": True}),
+        )
+    )
+    client = ReadOnlyHttpClient(
+        transport=transport,
+        sleep=sleeps.append,
+        monotonic=lambda: 0.0,
+    )
     assert client.get_json("https://example.invalid/version") == {"ok": True}
     assert sleeps == [5.0, 5.0]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import ctypes
 import hmac
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ from pydantic import Field
 
 from change_delivery.domain import CommandSpec, FrozenModel
 from change_delivery.errors import DeliveryError
+from change_delivery.locking import project_lock_path, project_read_lock
 from change_delivery.process import ProcessResult, ProcessRunner
 from change_delivery.redaction import redact_text
 
@@ -53,6 +55,113 @@ class GitDiscoveryAttestation(FrozenModel):
     remote_fetch_url: str
     remote_push_url: str
     branch_shas: dict[str, str]
+
+
+class _StableDirectoryHandle:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: object | None = None
+        self.identity: RepositoryIdentity | None = None
+
+    def __enter__(self) -> _StableDirectoryHandle:
+        if os.name == "nt":
+            self._open_windows()
+        else:
+            self._open_posix()
+        assert self.identity is not None
+        if self.identity.device <= 0 or self.identity.inode <= 0:
+            self.__exit__()
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="repository has no reliable stable file identity",
+            )
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        if os.name == "nt":
+            ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            os.close(int(handle))
+
+    def _open_posix(self) -> None:
+        descriptor = os.open(self._path, os.O_RDONLY)
+        details = os.fstat(descriptor)
+        self._handle = descriptor
+        self.identity = RepositoryIdentity(
+            canonical_path=self._path.resolve(strict=True),
+            device=details.st_dev,
+            inode=details.st_ino,
+        )
+
+    def _open_windows(self) -> None:
+        if str(self._path).startswith("\\\\"):
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="UNC repository identity is not supported",
+            )
+
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", ctypes.c_ulong),
+                ("creation_time_low", ctypes.c_ulong),
+                ("creation_time_high", ctypes.c_ulong),
+                ("access_time_low", ctypes.c_ulong),
+                ("access_time_high", ctypes.c_ulong),
+                ("write_time_low", ctypes.c_ulong),
+                ("write_time_high", ctypes.c_ulong),
+                ("volume_serial", ctypes.c_ulong),
+                ("file_size_high", ctypes.c_ulong),
+                ("file_size_low", ctypes.c_ulong),
+                ("link_count", ctypes.c_ulong),
+                ("file_index_high", ctypes.c_ulong),
+                ("file_index_low", ctypes.c_ulong),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        handle = kernel32.CreateFileW(
+            str(self._path),
+            0x0001,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="stable repository handle is unavailable",
+            )
+        information = FileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            handle,
+            ctypes.byref(information),
+        ):
+            kernel32.CloseHandle(handle)
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="stable repository identity is unavailable",
+            )
+        if information.attributes & 0x400:
+            kernel32.CloseHandle(handle)
+            raise RemoteIdentityChanged(
+                "repository_identity",
+                reason="repository handle targets a reparse point",
+            )
+        self._handle = handle
+        self.identity = RepositoryIdentity(
+            canonical_path=self._path.resolve(strict=True),
+            device=information.volume_serial,
+            inode=(
+                (information.file_index_high << 32)
+                | information.file_index_low
+            ),
+        )
 
 
 def _safe_output(value: str) -> str:
@@ -112,6 +221,7 @@ class GitAdapter:
         expected_push_url: str,
         runner: Runner | None = None,
         git_executable: str = "git",
+        lock_root: Path | None = None,
     ) -> None:
         unresolved_repo = Path(repo_path).absolute()
         self._reject_reparse_components(unresolved_repo)
@@ -125,8 +235,15 @@ class GitAdapter:
         ):
             raise ValueError("invalid Git executable")
         self.repo_path = resolved_repo
+        self._lock_root = lock_root
+        self.discovery_lock_path = project_lock_path(
+            self.repo_path,
+            lock_root=lock_root,
+        )
         self._attestation_lock = threading.RLock()
-        self._repository_identity = self._capture_repository_identity()
+        with self._open_repository_handle() as repository_handle:
+            assert repository_handle.identity is not None
+            self._repository_identity = repository_handle.identity
         self._runner = runner or ProcessRunner(
             lambda names: {},
             fixed_environment_provider=_git_environment,
@@ -161,11 +278,12 @@ class GitAdapter:
             )
         self._fetch_url = expected_fetch_url
         self._push_url = expected_push_url
-        if self._capture_repository_identity() != self._repository_identity:
-            raise RemoteIdentityChanged(
-                "initialize",
-                reason="repository identity changed during initialization",
-            )
+        with self._open_repository_handle() as repository_handle:
+            if repository_handle.identity != self._repository_identity:
+                raise RemoteIdentityChanged(
+                    "initialize",
+                    reason="repository identity changed during initialization",
+                )
 
     def fetch(self, remote: str) -> None:
         self._require_bound_remote(remote)
@@ -213,37 +331,38 @@ class GitAdapter:
             raise ValueError("discovery branches must be a non-empty unique tuple")
         for branch in branches:
             self._validate_branch(branch)
-        with self._attestation_lock:
-            if self._capture_repository_identity() != self._repository_identity:
+        with project_read_lock(
+            self.repo_path,
+            lock_root=self._lock_root,
+        ), self._attestation_lock, self._open_repository_handle() as handle:
+            if (
+                handle.identity is None
+                or handle.identity.device <= 0
+                or handle.identity.inode <= 0
+            ):
+                raise RemoteIdentityChanged(
+                    "discovery_attestation",
+                    reason="repository has no reliable stable file identity",
+                )
+            if handle.identity != self._repository_identity:
                 raise RemoteIdentityChanged(
                     "discovery_attestation",
                     reason="repository identity changed before discovery",
                 )
-            self._assert_remote_identity()
-            branch_shas = {
-                branch: self._parse_single_sha(
-                    self._run(
-                        "discovery_remote_sha",
-                        (
-                            "rev-parse",
-                            "--verify",
-                            f"refs/remotes/{remote}/{branch}^{{commit}}",
-                        ),
-                    ).stdout,
-                    "discovery_remote_sha",
-                )
-                for branch in branches
-            }
-            if self._capture_repository_identity() != self._repository_identity:
-                raise RemoteIdentityChanged(
-                    "discovery_attestation",
-                    reason="repository identity changed during discovery",
-                )
-            fetch_url, push_url = self._read_remote_identity()
-            if not (
-                hmac.compare_digest(fetch_url, self._fetch_url)
-                and hmac.compare_digest(push_url, self._push_url)
-            ):
+            initial_remote = self._read_remote_snapshot()
+            branch_shas = self._read_branch_snapshot(remote, branches)
+            final_remote = self._read_remote_snapshot()
+            with self._open_repository_handle() as current:
+                if (
+                    current.identity != handle.identity
+                    or current.identity != self._repository_identity
+                ):
+                    raise RemoteIdentityChanged(
+                        "discovery_attestation",
+                        reason="repository identity changed during discovery",
+                    )
+            expected_remote = (self._fetch_url, self._push_url)
+            if initial_remote != expected_remote or final_remote != expected_remote:
                 raise RemoteIdentityChanged(
                     "discovery_attestation",
                     reason="remote identity changed during discovery",
@@ -797,6 +916,83 @@ class GitAdapter:
             device=details.st_dev,
             inode=details.st_ino,
         )
+
+    def _open_repository_handle(self) -> _StableDirectoryHandle:
+        self._reject_reparse_components(self.repo_path)
+        return _StableDirectoryHandle(self.repo_path)
+
+    def _read_remote_snapshot(self) -> tuple[str, str]:
+        escaped_remote = re.escape(self.remote)
+        result = self._run(
+            "remote_snapshot",
+            (
+                "config",
+                "--get-regexp",
+                f"^remote\\.{escaped_remote}\\.(url|pushurl)$",
+            ),
+        )
+        fetch_urls: list[str] = []
+        push_urls: list[str] = []
+        for line in result.stdout.splitlines():
+            fields = line.split(maxsplit=1)
+            if len(fields) != 2:
+                raise GitError(
+                    "remote_snapshot",
+                    reason="remote config snapshot is malformed",
+                )
+            key, value = fields
+            if key == f"remote.{self.remote}.url":
+                fetch_urls.append(value)
+            elif key == f"remote.{self.remote}.pushurl":
+                push_urls.append(value)
+            else:
+                raise GitError(
+                    "remote_snapshot",
+                    reason="remote config snapshot contains an unexpected key",
+                )
+        if len(fetch_urls) != 1 or len(push_urls) > 1:
+            raise GitError(
+                "remote_snapshot",
+                reason="remote config must have one frozen fetch/push identity",
+            )
+        return fetch_urls[0], push_urls[0] if push_urls else fetch_urls[0]
+
+    def _read_branch_snapshot(
+        self,
+        remote: str,
+        branches: tuple[str, ...],
+    ) -> dict[str, str]:
+        refs = tuple(f"refs/remotes/{remote}/{branch}" for branch in branches)
+        result = self._run(
+            "discovery_refs_snapshot",
+            (
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                *refs,
+            ),
+        )
+        expected = dict(zip(refs, branches, strict=True))
+        observed: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or fields[0] not in expected:
+                raise GitError(
+                    "discovery_refs_snapshot",
+                    reason="remote refs snapshot is malformed",
+                )
+            branch = expected[fields[0]]
+            if branch in observed:
+                raise GitError(
+                    "discovery_refs_snapshot",
+                    reason="remote refs snapshot contains duplicates",
+                )
+            observed[branch] = self._normalize_sha(fields[1])
+        if set(observed) != set(branches):
+            raise GitError(
+                "discovery_refs_snapshot",
+                reason="remote refs snapshot is incomplete",
+            )
+        return observed
 
     @staticmethod
     def _reject_reparse_components(path: Path) -> None:
