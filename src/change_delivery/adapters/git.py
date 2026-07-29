@@ -93,8 +93,8 @@ class GitAdapter:
         remote: str,
         base_branch: str,
         test_branch: str,
-        expected_remote_url: str | None = None,
-        expected_push_url: str | None = None,
+        expected_fetch_url: str,
+        expected_push_url: str,
         runner: Runner | None = None,
         git_executable: str = "git",
     ) -> None:
@@ -127,30 +127,39 @@ class GitAdapter:
             _STANDARD_PROTECTED_BRANCHES
             | {base_branch.casefold(), test_branch.casefold()}
         )
+        self._validate_expected_identity(expected_fetch_url)
+        self._validate_expected_identity(expected_push_url)
         fetch_url, push_url = self._read_remote_identity()
-        if (
-            expected_remote_url is not None
-            and not hmac.compare_digest(fetch_url, expected_remote_url)
-        ):
+        if not hmac.compare_digest(fetch_url, expected_fetch_url):
             raise RemoteIdentityChanged(
                 "initialize",
                 reason="registered fetch URL does not match expected identity",
             )
-        if (
-            expected_push_url is not None
-            and not hmac.compare_digest(push_url, expected_push_url)
-        ):
+        if not hmac.compare_digest(push_url, expected_push_url):
             raise RemoteIdentityChanged(
                 "initialize",
                 reason="registered push URL does not match expected identity",
             )
-        self._fetch_url = fetch_url
-        self._push_url = push_url
+        self._fetch_url = expected_fetch_url
+        self._push_url = expected_push_url
 
     def fetch(self, remote: str) -> None:
         self._require_bound_remote(remote)
         self._assert_remote_identity()
-        self._run("fetch", ("fetch", "--prune", remote))
+        self._run(
+            "fetch",
+            self._fetch_scoped(
+                (
+                    "fetch",
+                    "--prune",
+                    self._fetch_url,
+                    (
+                        "+refs/heads/*:"
+                        f"refs/remotes/{self.remote}/*"
+                    ),
+                )
+            ),
+        )
 
     def remote_sha(self, remote: str, branch: str) -> str:
         self._require_bound_remote(remote)
@@ -235,7 +244,14 @@ class GitAdapter:
         self._assert_remote_identity()
         self._run(
             "push_feature",
-            ("push", "-u", remote, f"HEAD:refs/heads/{branch}"),
+            self._push_scoped(
+                (
+                    "push",
+                    "-u",
+                    self._push_url,
+                    f"HEAD:refs/heads/{branch}",
+                )
+            ),
             workdir=resolved,
         )
         pushed_sha = self._remote_head_sha(remote, branch)
@@ -257,11 +273,13 @@ class GitAdapter:
         source = self._normalize_sha(source_sha)
         observed = self._normalize_sha(observed_sha)
         self._assert_remote_identity()
-        args = (
-            "push",
-            remote,
-            f"{source}:refs/heads/{test_branch}",
-            f"--force-with-lease=refs/heads/{test_branch}:{observed}",
+        args = self._push_scoped(
+            (
+                "push",
+                self._push_url,
+                f"{source}:refs/heads/{test_branch}",
+                f"--force-with-lease=refs/heads/{test_branch}:{observed}",
+            )
         )
         result = self._execute(
             args,
@@ -424,6 +442,37 @@ class GitAdapter:
                 reason="registered remote identity changed",
             )
 
+    @staticmethod
+    def _validate_expected_identity(identity: str) -> None:
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or identity.startswith("-")
+            or any(character in identity for character in "\r\n\x00")
+        ):
+            raise ValueError("expected remote identity is invalid")
+
+    def _fetch_scoped(self, operation: Sequence[str]) -> tuple[str, ...]:
+        return (
+            "-c",
+            f"remote.{self.remote}.url={self._fetch_url}",
+            "-c",
+            (
+                f"remote.{self.remote}.fetch="
+                f"+refs/heads/*:refs/remotes/{self.remote}/*"
+            ),
+            *operation,
+        )
+
+    def _push_scoped(self, operation: Sequence[str]) -> tuple[str, ...]:
+        return (
+            "-c",
+            f"remote.{self.remote}.url={self._fetch_url}",
+            "-c",
+            f"remote.{self.remote}.pushurl={self._push_url}",
+            *operation,
+        )
+
     def _validate_branch(self, branch: str) -> None:
         if (
             not isinstance(branch, str)
@@ -471,10 +520,16 @@ class GitAdapter:
 
     def _remote_head_sha(self, remote: str, branch: str) -> str:
         self._require_bound_remote(remote)
-        self._assert_remote_identity()
         result = self._run(
             "verify_remote",
-            ("ls-remote", "--heads", remote, f"refs/heads/{branch}"),
+            self._push_scoped(
+                (
+                    "ls-remote",
+                    "--heads",
+                    self._push_url,
+                    f"refs/heads/{branch}",
+                )
+            ),
         )
         fields = result.stdout.split()
         if len(fields) != 2 or fields[1] != f"refs/heads/{branch}":

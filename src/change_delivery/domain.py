@@ -32,6 +32,37 @@ HTTPS_URL_PATTERN = (
 GITHUB_REPOSITORY_PATTERN = (
     r"^[^\s/\x00-\x1f\x7f]+/[^\s/\x00-\x1f\x7f]+$"
 )
+REMOTE_HTTPS_IDENTITY_PATTERN = (
+    r"^[Hh][Tt][Tt][Pp][Ss]://"
+    r"(?:[^/?#@\s\x00-\x1f\x7f]+@)?"
+    r"(?:\[[^/?#\s\x00-\x1f\x7f]+\]|"
+    r"[^/?#:@\s\x00-\x1f\x7f]+)"
+    r"(?::[0-9]+)?(?:[/?#][^\s\x00-\x1f\x7f]*)?$"
+)
+REMOTE_SSH_IDENTITY_PATTERN = (
+    r"^[Ss][Ss][Hh]://"
+    r"(?:[^/?#@\s\x00-\x1f\x7f]+@)?"
+    r"(?:\[[^/?#\s\x00-\x1f\x7f]+\]|"
+    r"[^/?#:@\s\x00-\x1f\x7f]+)"
+    r"(?::[0-9]+)?(?:[/?#][^\s\x00-\x1f\x7f]*)?$"
+)
+REMOTE_SCP_IDENTITY_PATTERN = (
+    r"^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\s\x00-\x1f\x7f]+$"
+)
+REMOTE_WINDOWS_PATH_PATTERN = (
+    r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/\x00-\x1f\x7f]+"
+    r"[\\/][^\\/\x00-\x1f\x7f]+)[^\x00-\x1f\x7f]*$"
+)
+REMOTE_POSIX_PATH_PATTERN = r"^/[^\x00-\x1f\x7f]*$"
+REMOTE_IDENTITY_SCHEMA_EXTRA = {
+    "anyOf": [
+        {"pattern": REMOTE_HTTPS_IDENTITY_PATTERN},
+        {"pattern": REMOTE_SSH_IDENTITY_PATTERN},
+        {"pattern": REMOTE_SCP_IDENTITY_PATTERN},
+        {"pattern": REMOTE_WINDOWS_PATH_PATTERN},
+        {"pattern": REMOTE_POSIX_PATH_PATTERN},
+    ]
+}
 SHELL_OR_SCRIPT_EXECUTABLE_PATTERN = (
     r"(?:^|[\\/])(?:(?:"
     r"[Pp][Oo][Ww][Ee][Rr][Ss][Hh][Ee][Ll][Ll]|"
@@ -462,6 +493,14 @@ class ProjectConfig(FrozenModel):
         json_schema_extra={"pattern": WINDOWS_ABSOLUTE_PATH_PATTERN}
     )
     remote: str = Field(pattern=r"^[A-Za-z0-9._-]+$")
+    remote_fetch_url: str = Field(
+        min_length=1,
+        json_schema_extra=REMOTE_IDENTITY_SCHEMA_EXTRA,
+    )
+    remote_push_url: str = Field(
+        min_length=1,
+        json_schema_extra=REMOTE_IDENTITY_SCHEMA_EXTRA,
+    )
     base_branch: str = Field(
         pattern=BRANCH_PATTERN,
         json_schema_extra=BRANCH_SCHEMA_EXTRA,
@@ -490,6 +529,22 @@ class ProjectConfig(FrozenModel):
         if not repo_path.is_absolute():
             raise ValueError("仓库目录必须是绝对路径")
         return repo_path
+
+    @field_validator("remote_fetch_url", "remote_push_url")
+    @classmethod
+    def require_supported_remote_identity(cls, identity: str) -> str:
+        patterns = (
+            REMOTE_HTTPS_IDENTITY_PATTERN,
+            REMOTE_SSH_IDENTITY_PATTERN,
+            REMOTE_SCP_IDENTITY_PATTERN,
+            REMOTE_WINDOWS_PATH_PATTERN,
+            REMOTE_POSIX_PATH_PATTERN,
+        )
+        if identity.startswith("-") or not any(
+            re.fullmatch(pattern, identity) for pattern in patterns
+        ):
+            raise ValueError("远端身份必须是 HTTPS/SSH Git URL 或本地绝对路径")
+        return identity
 
     @field_validator("base_branch", "test_branch")
     @classmethod

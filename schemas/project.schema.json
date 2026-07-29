@@ -72,6 +72,50 @@
       "title": "Remote",
       "type": "string"
     },
+    "remote_fetch_url": {
+      "anyOf": [
+        {
+          "pattern": "^[Hh][Tt][Tt][Pp][Ss]://(?:[^/?#@\\s\\x00-\\x1f\\x7f]+@)?(?:\\[[^/?#\\s\\x00-\\x1f\\x7f]+\\]|[^/?#:@\\s\\x00-\\x1f\\x7f]+)(?::[0-9]+)?(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$"
+        },
+        {
+          "pattern": "^[Ss][Ss][Hh]://(?:[^/?#@\\s\\x00-\\x1f\\x7f]+@)?(?:\\[[^/?#\\s\\x00-\\x1f\\x7f]+\\]|[^/?#:@\\s\\x00-\\x1f\\x7f]+)(?::[0-9]+)?(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$"
+        },
+        {
+          "pattern": "^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\\s\\x00-\\x1f\\x7f]+$"
+        },
+        {
+          "pattern": "^(?:[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/\\x00-\\x1f\\x7f]+[\\\\/][^\\\\/\\x00-\\x1f\\x7f]+)[^\\x00-\\x1f\\x7f]*$"
+        },
+        {
+          "pattern": "^/[^\\x00-\\x1f\\x7f]*$"
+        }
+      ],
+      "minLength": 1,
+      "title": "Remote Fetch Url",
+      "type": "string"
+    },
+    "remote_push_url": {
+      "anyOf": [
+        {
+          "pattern": "^[Hh][Tt][Tt][Pp][Ss]://(?:[^/?#@\\s\\x00-\\x1f\\x7f]+@)?(?:\\[[^/?#\\s\\x00-\\x1f\\x7f]+\\]|[^/?#:@\\s\\x00-\\x1f\\x7f]+)(?::[0-9]+)?(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$"
+        },
+        {
+          "pattern": "^[Ss][Ss][Hh]://(?:[^/?#@\\s\\x00-\\x1f\\x7f]+@)?(?:\\[[^/?#\\s\\x00-\\x1f\\x7f]+\\]|[^/?#:@\\s\\x00-\\x1f\\x7f]+)(?::[0-9]+)?(?:[/?#][^\\s\\x00-\\x1f\\x7f]*)?$"
+        },
+        {
+          "pattern": "^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\\s\\x00-\\x1f\\x7f]+$"
+        },
+        {
+          "pattern": "^(?:[A-Za-z]:[\\\\/]|\\\\\\\\[^\\\\/\\x00-\\x1f\\x7f]+[\\\\/][^\\\\/\\x00-\\x1f\\x7f]+)[^\\x00-\\x1f\\x7f]*$"
+        },
+        {
+          "pattern": "^/[^\\x00-\\x1f\\x7f]*$"
+        }
+      ],
+      "minLength": 1,
+      "title": "Remote Push Url",
+      "type": "string"
+    },
     "base_branch": {
       "allOf": [
         {
@@ -345,6 +389,8 @@
     "project_id",
     "repo_path",
     "remote",
+    "remote_fetch_url",
+    "remote_push_url",
     "base_branch",
     "test_branch",
     "github_repository",

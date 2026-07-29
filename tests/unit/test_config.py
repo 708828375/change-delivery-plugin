@@ -13,6 +13,8 @@ def valid_config_data() -> dict[str, object]:
         "project_id": "example-backend",
         "repo_path": "C:/workspace/example-project",
         "remote": "origin",
+        "remote_fetch_url": "https://github.com/example-org/example_backend.git",
+        "remote_push_url": "git@github.com:example-org/example_backend.git",
         "base_branch": "develop",
         "test_branch": "test",
         "github_repository": "example-org/example_backend",
@@ -50,6 +52,12 @@ def test_load_project_config_returns_expected_model(tmp_path: Path) -> None:
         "C:/workspace/example-project"
     )
     assert loaded.config.remote == "origin"
+    assert loaded.config.remote_fetch_url == (
+        "https://github.com/example-org/example_backend.git"
+    )
+    assert loaded.config.remote_push_url == (
+        "git@github.com:example-org/example_backend.git"
+    )
     assert loaded.config.base_branch == "develop"
     assert loaded.config.test_branch == "test"
     assert loaded.config.github_repository == "example-org/example_backend"
@@ -100,6 +108,21 @@ def test_hash_changes_when_configuration_semantics_change(tmp_path: Path) -> Non
     first = valid_config_data()
     second = valid_config_data()
     second["test_branch"] = "staging"
+    write_yaml(first_file, first)
+    write_yaml(second_file, second)
+
+    assert (
+        load_project_config(first_file).config_hash
+        != load_project_config(second_file).config_hash
+    )
+
+
+def test_hash_changes_when_remote_identity_changes(tmp_path: Path) -> None:
+    first_file = tmp_path / "first.yaml"
+    second_file = tmp_path / "second.yaml"
+    first = valid_config_data()
+    second = valid_config_data()
+    second["remote_push_url"] = "ssh://git@example.test/other.git"
     write_yaml(first_file, first)
     write_yaml(second_file, second)
 

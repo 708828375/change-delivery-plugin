@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 from pathlib import Path
 import subprocess
@@ -98,6 +99,34 @@ class RecordingRunner:
         return self.delegate.run(spec)
 
 
+def git_operation_args(args: tuple[str, ...]) -> tuple[str, ...]:
+    index = 0
+    while index + 1 < len(args) and args[index] == "-c":
+        index += 2
+    return args[index:]
+
+
+class HookedRunner(RecordingRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self._hook_command: str | None = None
+        self._hook: Callable[[], None] | None = None
+
+    def arm(self, command: str, hook: Callable[[], None]) -> None:
+        self._hook_command = command
+        self._hook = hook
+
+    def run(self, spec: CommandSpec) -> ProcessResult:
+        operation = git_operation_args(spec.args)
+        if operation and operation[0] == self._hook_command:
+            hook = self._hook
+            self._hook_command = None
+            self._hook = None
+            assert hook is not None
+            hook()
+        return super().run(spec)
+
+
 def adapter_for(
     repo: Path,
     *,
@@ -108,6 +137,14 @@ def adapter_for(
         "remote": "origin",
         "base_branch": "develop",
         "test_branch": "test",
+        "expected_fetch_url": git(repo, "remote", "get-url", "origin").stdout.strip(),
+        "expected_push_url": git(
+            repo,
+            "remote",
+            "get-url",
+            "--push",
+            "origin",
+        ).stdout.strip(),
     }
     arguments.update(overrides)
     return GitAdapter(repo, runner=runner, **arguments)
@@ -149,7 +186,16 @@ def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
     assert not (worktree / "local-only.txt").exists()
     assert git(repo, "rev-parse", "HEAD").stdout.strip().lower() == initial_sha
     assert (repo / "dirty.txt").exists()
-    assert any(spec.args == ("fetch", "--prune", "origin") for spec in runner.specs)
+    assert any(
+        git_operation_args(spec.args)
+        == (
+            "fetch",
+            "--prune",
+            str(local_remote[0]),
+            "+refs/heads/*:refs/remotes/origin/*",
+        )
+        for spec in runner.specs
+    )
     assert any(
         spec.args
         == (
@@ -177,7 +223,7 @@ def test_commit_and_feature_push_are_direct_non_force_argv(
     local_remote: tuple[Path, Path, Path, str],
     tmp_path: Path,
 ) -> None:
-    _, _, repo, _ = local_remote
+    remote, _, repo, _ = local_remote
     runner = RecordingRunner()
     adapter = adapter_for(repo, runner=runner)
     adapter.fetch("origin")
@@ -190,14 +236,21 @@ def test_commit_and_feature_push_are_direct_non_force_argv(
 
     assert pushed_sha == commit_sha
     assert git(repo, "ls-remote", "origin", "refs/heads/feature/push").stdout.split()[0] == commit_sha
-    push_specs = [spec for spec in runner.specs if spec.args and spec.args[0] == "push"]
-    assert push_specs[-1].args == (
+    push_specs = [
+        spec
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:1] == ("push",)
+    ]
+    assert git_operation_args(push_specs[-1].args) == (
         "push",
         "-u",
-        "origin",
+        str(remote),
         "HEAD:refs/heads/feature/push",
     )
-    assert not any("force" in argument for argument in push_specs[-1].args)
+    assert not any(
+        "force" in argument
+        for argument in git_operation_args(push_specs[-1].args)
+    )
 
 
 def test_commit_all_rejects_empty_commit_and_unsafe_message(
@@ -221,7 +274,7 @@ def test_test_push_uses_exact_lease_and_returns_verified_sha(
     local_remote: tuple[Path, Path, Path, str],
     tmp_path: Path,
 ) -> None:
-    _, seed, repo, base_sha = local_remote
+    remote, seed, repo, base_sha = local_remote
     git(seed, "push", "origin", f"{base_sha}:refs/heads/test")
     runner = RecordingRunner()
     adapter = adapter_for(repo, runner=runner)
@@ -234,15 +287,19 @@ def test_test_push_uses_exact_lease_and_returns_verified_sha(
     result = adapter.push_test_with_lease("origin", "test", source_sha, observed_sha)
 
     assert result == source_sha
-    push_spec = [spec for spec in runner.specs if spec.args and spec.args[0] == "push"][-1]
-    assert push_spec.args == (
+    push_spec = [
+        spec
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:1] == ("push",)
+    ][-1]
+    assert git_operation_args(push_spec.args) == (
         "push",
-        "origin",
+        str(remote),
         f"{source_sha}:refs/heads/test",
         f"--force-with-lease=refs/heads/test:{observed_sha}",
     )
-    assert "-f" not in push_spec.args
-    assert "--force" not in push_spec.args
+    assert "-f" not in git_operation_args(push_spec.args)
+    assert "--force" not in git_operation_args(push_spec.args)
 
 
 def test_stale_test_lease_never_overwrites_remote_or_retries(
@@ -269,10 +326,25 @@ def test_stale_test_lease_never_overwrites_remote_or_retries(
         adapter.push_test_with_lease("origin", "test", source_sha, observed_sha)
 
     assert git(repo, "ls-remote", "origin", "refs/heads/test").stdout.split()[0] == competing_sha
-    push_specs = [spec for spec in runner.specs if spec.args and spec.args[0] == "push"]
-    lease_pushes = [spec for spec in push_specs if any("force-with-lease" in arg for arg in spec.args)]
+    push_specs = [
+        spec
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:1] == ("push",)
+    ]
+    lease_pushes = [
+        spec
+        for spec in push_specs
+        if any(
+            "force-with-lease" in arg
+            for arg in git_operation_args(spec.args)
+        )
+    ]
     assert len(lease_pushes) == 1
-    assert all("-f" not in spec.args and "--force" not in spec.args for spec in push_specs)
+    assert all(
+        "-f" not in git_operation_args(spec.args)
+        and "--force" not in git_operation_args(spec.args)
+        for spec in push_specs
+    )
 
 
 @pytest.mark.parametrize(
@@ -365,8 +437,14 @@ def test_remote_identity_change_blocks_fetch_and_push_without_writing(
     worktree = tmp_path / "identity-worktree"
     adapter.create_worktree("origin/develop", "feature/identity", worktree)
     commit_file(worktree, "identity.txt", "candidate\n", "candidate")
-    fetch_count = sum(spec.args[:1] == ("fetch",) for spec in runner.specs)
-    push_count = sum(spec.args[:1] == ("push",) for spec in runner.specs)
+    fetch_count = sum(
+        git_operation_args(spec.args)[:1] == ("fetch",)
+        for spec in runner.specs
+    )
+    push_count = sum(
+        git_operation_args(spec.args)[:1] == ("push",)
+        for spec in runner.specs
+    )
 
     git(repo, "remote", "set-url", "origin", str(replacement))
 
@@ -375,8 +453,14 @@ def test_remote_identity_change_blocks_fetch_and_push_without_writing(
     with pytest.raises(RemoteIdentityChanged):
         adapter.push_feature(worktree, "origin", "feature/identity")
 
-    assert sum(spec.args[:1] == ("fetch",) for spec in runner.specs) == fetch_count
-    assert sum(spec.args[:1] == ("push",) for spec in runner.specs) == push_count
+    assert sum(
+        git_operation_args(spec.args)[:1] == ("fetch",)
+        for spec in runner.specs
+    ) == fetch_count
+    assert sum(
+        git_operation_args(spec.args)[:1] == ("push",)
+        for spec in runner.specs
+    ) == push_count
     assert git(repo, "ls-remote", str(replacement), "refs/heads/feature/identity").stdout == ""
 
 
@@ -387,11 +471,81 @@ def test_expected_remote_identity_must_match_at_construction(
 
     adapter_for(
         repo,
-        expected_remote_url=str(remote),
+        expected_fetch_url=str(remote),
         expected_push_url=str(remote),
     )
     with pytest.raises(RemoteIdentityChanged):
-        adapter_for(repo, expected_remote_url="C:/unexpected/origin.git")
+        adapter_for(repo, expected_fetch_url="C:/unexpected/origin.git")
+
+
+def test_command_scope_remote_identity_wins_fetch_and_push_races(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    remote, seed, repo, _ = local_remote
+    evil = tmp_path / "evil.git"
+    evil.mkdir()
+    git(evil, "init", "--bare")
+    runner = HookedRunner()
+    adapter = adapter_for(repo, runner=runner)
+    latest_sha = commit_file(seed, "race.txt", "bound fetch\n", "bound fetch")
+    git(seed, "push", "origin", "develop")
+    runner.arm(
+        "fetch",
+        lambda: git(repo, "remote", "set-url", "origin", str(evil)),
+    )
+
+    adapter.fetch("origin")
+
+    fetched = git(
+        repo,
+        "rev-parse",
+        "refs/remotes/origin/develop^{commit}",
+    ).stdout.strip()
+    assert fetched == latest_sha
+    assert git(repo, "ls-remote", str(evil)).stdout == ""
+
+    git(repo, "remote", "set-url", "origin", str(remote))
+    push_runner = HookedRunner()
+    push_adapter = adapter_for(repo, runner=push_runner)
+    worktree = tmp_path / "race-push"
+    push_adapter.create_worktree(
+        "origin/develop",
+        "feature/race-proof",
+        worktree,
+    )
+    source_sha = commit_file(worktree, "push.txt", "bound push\n", "bound push")
+    push_runner.arm(
+        "push",
+        lambda: git(repo, "remote", "set-url", "origin", str(evil)),
+    )
+
+    assert (
+        push_adapter.push_feature(
+            worktree,
+            "origin",
+            "feature/race-proof",
+        )
+        == source_sha
+    )
+    assert (
+        git(
+            repo,
+            "ls-remote",
+            str(remote),
+            "refs/heads/feature/race-proof",
+        ).stdout.split()[0]
+        == source_sha
+    )
+    assert (
+        git(
+            repo,
+            "ls-remote",
+            str(evil),
+            "refs/heads/feature/race-proof",
+        ).stdout
+        == ""
+    )
 
 
 def test_worktree_base_must_name_a_registered_remote_ref(

@@ -27,6 +27,8 @@ def valid_project_data() -> dict[str, object]:
         "project_id": "example-project",
         "repo_path": Path("C:/repo"),
         "remote": "origin",
+        "remote_fetch_url": "https://github.com/owner/repo.git",
+        "remote_push_url": "git@github.com:owner/repo.git",
         "base_branch": "develop",
         "test_branch": "test",
         "github_repository": "owner/repo",
@@ -42,6 +44,70 @@ def valid_project_json_data() -> dict[str, object]:
 
 def project_schema_validator() -> Draft202012Validator:
     return Draft202012Validator(ProjectConfig.model_json_schema())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["remote_fetch_url", "remote_push_url"],
+)
+def test_project_config_requires_explicit_remote_identity(field: str) -> None:
+    data = valid_project_data()
+    data.pop(field)
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "",
+        " ",
+        "-instead-of-a-url",
+        "relative/repository.git",
+        "https:///missing-host.git",
+        "ssh:///missing-host.git",
+        "https://example.test/repo.git\n--upload-pack=evil",
+        "ssh://git@example.test/repo.git\x00evil",
+    ],
+)
+@pytest.mark.parametrize("field", ["remote_fetch_url", "remote_push_url"])
+def test_project_config_and_schema_reject_invalid_remote_identity(
+    field: str,
+    identity: str,
+) -> None:
+    data = valid_project_data()
+    data[field] = identity
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
+
+    schema_data = valid_project_json_data()
+    schema_data[field] = identity
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "https://github.com/owner/repo.git",
+        "ssh://git@github.com/owner/repo.git",
+        "git@github.com:owner/repo.git",
+        "C:/test/remotes/origin.git",
+        r"\\server\share\origin.git",
+    ],
+)
+def test_project_config_accepts_supported_remote_identity(identity: str) -> None:
+    data = valid_project_data()
+    data["remote_fetch_url"] = identity
+    data["remote_push_url"] = identity
+
+    config = ProjectConfig.model_validate(data)
+    schema_data = config.model_dump(mode="json")
+    project_schema_validator().validate(schema_data)
+
+    assert config.remote_fetch_url == identity
+    assert config.remote_push_url == identity
 
 
 @pytest.mark.parametrize(
