@@ -8,7 +8,9 @@ import json
 
 import pytest
 
+import change_delivery.cli as cli_module
 from change_delivery.approval import build_approval, save_approval
+from change_delivery.adapters.github import PullRequestRef
 from change_delivery.database import Database
 from change_delivery.cli import CliServices, main
 from change_delivery.config import load_project_config
@@ -118,13 +120,23 @@ class FakeGitHub:
 
     def ensure_draft_pr(
         self, branch: str, base: str, title: str, body: str
-    ) -> int:
+    ) -> PullRequestRef:
         self.ensure_calls += 1
-        return self.pr_number
+        return self._pr(branch, base)
 
-    def find_pr(self, branch: str, base: str) -> int | None:
+    def find_pr(self, branch: str, base: str) -> PullRequestRef | None:
         self.find_calls += 1
-        return self.pr_number if self.pr_number else None
+        return self._pr(branch, base) if self.pr_number else None
+
+    def _pr(self, branch: str, base: str) -> PullRequestRef:
+        return PullRequestRef(
+            number=self.pr_number,
+            url=f"https://github.com/owner/repo/pull/{self.pr_number}",
+            base=base,
+            head=branch,
+            is_draft=self.is_draft,
+            head_sha=SHA,
+        )
 
     def snapshot(self, pr_number: int) -> object:
         assert self.snapshot_result is not None
@@ -162,8 +174,14 @@ class PrFact:
 
 
 class FakeStageExecutor:
-    def __init__(self, repository: RunRepository) -> None:
+    def __init__(
+        self,
+        repository: RunRepository,
+        *,
+        status: str = "passed",
+    ) -> None:
         self.repository = repository
+        self.status = status
         self.calls: list[str] = []
 
     def execute(
@@ -187,7 +205,7 @@ class FakeStageExecutor:
             {"sha": head_sha, "passed": True},
         )
         return StageResult(
-            status="passed",
+            status=self.status,
             summary=f"{stage} passed",
             evidence=(reference,),
             findings=(),
@@ -243,6 +261,11 @@ class FakeCommitPort:
         self.query_calls = 0
         self.execute_calls = 0
         self.review_tree_calls = 0
+        self.validation_tree_calls = 0
+
+    def validation_tree(self, run: object, project: object) -> str:
+        self.validation_tree_calls += 1
+        return self.tree_sha
 
     def review_tree(self, run: object, project: object) -> str:
         self.review_tree_calls += 1
@@ -301,6 +324,46 @@ def fixture(tmp_path: Path) -> Fixture:
     database = Database(tmp_path / "state.sqlite3")
     database.migrate()
     return Fixture(tmp_path, RunRepository(database))
+
+
+def approve_fixture_run(fixture: Fixture) -> tuple[str, Path]:
+    run_id = fixture.create(RunState.AWAITING_DESIGN_APPROVAL)
+    run_root = fixture.root / "runs" / run_id
+    snapshot = build_approval(
+        run_id=run_id,
+        project_id="test-project",
+        config_hash=CONFIG_HASH,
+        base_branch="develop",
+        base_sha=SHA,
+        test_branch="test",
+        files=tuple(
+            run_root / name
+            for name in ("requirement.md", "design.md", "implementation-plan.md")
+        ),
+        approved_user="tester",
+        user_provider=lambda: "tester",
+        clock=lambda: datetime(2026, 7, 29, tzinfo=UTC),
+    )
+    approval_file = run_root / "approval.json"
+    save_approval(approval_file, snapshot)
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    assert main(
+        [
+            "approve",
+            run_id,
+            "--approval-file",
+            str(approval_file),
+            "--json",
+        ],
+        services=services,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    ) == 0
+    return run_id, run_root
 
 
 def test_remote_operation_and_evidence_are_fail_closed(fixture: Fixture) -> None:
@@ -492,6 +555,49 @@ def test_pending_pr_only_queries_and_never_replays_create(fixture: Fixture) -> N
     assert fixture.github.ensure_calls == 0
 
 
+def test_confirmed_pr_operation_recovers_by_query_without_create(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.PR_DRAFT)
+    branch = f"feature/{run_id}"
+    identity = f"owner/repo:{branch}:{SHA}"
+    key = f"draft_pr:{run_id}:{identity}"
+    fixture.repository.begin_remote_operation(
+        key,
+        run_id,
+        "draft_pr",
+        identity,
+    )
+    fixture.repository.confirm_remote_operation(key)
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.DEPLOYING_TEST
+    assert fixture.github.find_calls == 1
+    assert fixture.github.ensure_calls == 0
+
+
+def test_pr_reconciliation_rejects_untyped_remote_fact(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.PR_DRAFT)
+    branch = f"feature/{run_id}"
+    identity = f"owner/repo:{branch}:{SHA}"
+    fixture.repository.begin_remote_operation(
+        f"draft_pr:{run_id}:{identity}",
+        run_id,
+        "draft_pr",
+        identity,
+    )
+    fixture.github.find_pr = lambda branch, base: object()  # type: ignore[method-assign]
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.PR_DRAFT
+    assert fixture.github.ensure_calls == 0
+    assert "ValueError" in (outcome.blocked_reason or "")
+
+
 def test_cancel_is_idempotent_and_preserves_resources(fixture: Fixture) -> None:
     run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
     orchestrator = fixture.orchestrator()
@@ -560,6 +666,40 @@ def test_cli_doctor_without_runtime_is_controlled_json(tmp_path: Path) -> None:
     payload = json.loads(stderr.getvalue())
     assert payload["ok"] is False
     assert not (tmp_path / "state.sqlite3").exists()
+
+
+def test_default_cli_wires_git_and_github_adapters(
+    fixture: Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_initializations: list[tuple[object, dict[str, object]]] = []
+    github_initializations: list[tuple[object, object]] = []
+
+    class StubGitAdapter:
+        def __init__(self, repo_path: object, **kwargs: object) -> None:
+            git_initializations.append((repo_path, kwargs))
+
+    class StubGitHubAdapter:
+        def __init__(self, runner: object, project: object) -> None:
+            github_initializations.append((runner, project))
+
+    monkeypatch.setattr(cli_module, "GitAdapter", StubGitAdapter)
+    monkeypatch.setattr(cli_module, "GitHubAdapter", StubGitHubAdapter)
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    orchestrator = services.get_orchestrator()
+    project = config(fixture.root)
+
+    git = orchestrator.git_factory(project)
+    github = orchestrator.github_factory(project)
+
+    assert isinstance(git, cli_module.RuntimeGitPort)
+    assert git_initializations
+    assert isinstance(github, StubGitHubAdapter)
+    assert github_initializations
 
 
 def test_cli_release_is_disabled_and_has_no_side_effect(tmp_path: Path) -> None:
@@ -865,7 +1005,6 @@ def test_default_services_support_resume_cancel_and_tick(tmp_path: Path) -> None
     [
         (RunState.IMPLEMENTING, "implementation", RunState.LOCAL_VALIDATION),
         (RunState.LOCAL_VALIDATION, "local_validation", RunState.INTERNAL_REVIEW),
-        (RunState.INTERNAL_REVIEW, "internal_review", RunState.COMMITTING),
         (RunState.FIXING_CI_REVIEW, "review_fix", RunState.LOCAL_VALIDATION),
     ],
 )
@@ -885,7 +1024,7 @@ def test_stage_handlers_call_once_rebind_and_advance(
         github_factory=lambda project: fixture.github,
         approval_validator=lambda run, project, root: True,
         stage_executor=executor,
-        commit_port=FakeCommitPort() if stage == "internal_review" else None,
+        commit_port=FakeCommitPort() if stage == "local_validation" else None,
     )
 
     outcome = orchestrator.step(run_id)
@@ -894,10 +1033,87 @@ def test_stage_handlers_call_once_rebind_and_advance(
     assert executor.calls == [stage]
 
 
+def test_local_validation_rejects_tree_change_during_stage(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    trees = iter((TREE_SHA, OTHER_TREE_SHA))
+    commit.validation_tree = lambda run, project: next(trees)  # type: ignore[method-assign]
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.LOCAL_VALIDATION
+    assert "during local validation" in (outcome.blocked_reason or "")
+    assert not any(
+        evidence.kind == "local_validation_attestation"
+        for evidence in fixture.repository.list_evidence(run_id)
+    )
+
+
+def test_failed_local_validation_returns_to_implementation(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    executor = FakeStageExecutor(fixture.repository, status="failed")
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=FakeCommitPort(),
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.IMPLEMENTING
+    assert fixture.repository.get_run(run_id).state is RunState.IMPLEMENTING
+
+
+def test_internal_review_rejects_validation_attestation_for_old_tree(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    commit.tree_sha = OTHER_TREE_SHA
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.INTERNAL_REVIEW
+    assert "changed after local validation" in (outcome.blocked_reason or "")
+    assert executor.calls == ["local_validation"]
+
+
 def test_internal_review_records_tree_bound_attestation(
     fixture: Fixture,
 ) -> None:
-    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
     executor = FakeStageExecutor(fixture.repository)
     commit = FakeCommitPort()
     orchestrator = Orchestrator(
@@ -911,6 +1127,7 @@ def test_internal_review_records_tree_bound_attestation(
         commit_port=commit,
     )
 
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
     outcome = orchestrator.step(run_id)
 
     assert outcome.state is RunState.COMMITTING
@@ -929,7 +1146,7 @@ def test_internal_review_records_tree_bound_attestation(
 def test_commit_derives_review_evidence_for_new_head(
     fixture: Fixture,
 ) -> None:
-    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
     executor = FakeStageExecutor(fixture.repository)
     commit = FakeCommitPort()
     orchestrator = Orchestrator(
@@ -942,6 +1159,7 @@ def test_commit_derives_review_evidence_for_new_head(
         stage_executor=executor,
         commit_port=commit,
     )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
     assert orchestrator.step(run_id).state is RunState.COMMITTING
 
     outcome = orchestrator.step(run_id)
@@ -965,7 +1183,7 @@ def test_commit_tree_mismatch_never_derives_review_pass(
     fixture: Fixture,
     pending: bool,
 ) -> None:
-    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
     executor = FakeStageExecutor(fixture.repository)
     commit = FakeCommitPort(commit_tree_sha=OTHER_TREE_SHA)
     orchestrator = Orchestrator(
@@ -978,6 +1196,7 @@ def test_commit_tree_mismatch_never_derives_review_pass(
         stage_executor=executor,
         commit_port=commit,
     )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
     assert orchestrator.step(run_id).state is RunState.COMMITTING
     if pending:
         commit.observed = commit.execute(
@@ -1043,7 +1262,7 @@ def test_forged_review_attestation_source_is_rejected(
 def test_monitor_uses_review_evidence_derived_from_commit(
     fixture: Fixture,
 ) -> None:
-    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
     executor = FakeStageExecutor(fixture.repository)
     commit = FakeCommitPort()
     orchestrator = Orchestrator(
@@ -1056,6 +1275,7 @@ def test_monitor_uses_review_evidence_derived_from_commit(
         stage_executor=executor,
         commit_port=commit,
     )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
     assert orchestrator.step(run_id).state is RunState.COMMITTING
     assert orchestrator.step(run_id).state is RunState.PUSHING_FEATURE
     with fixture.repository.database.transaction() as connection:
@@ -1174,7 +1394,7 @@ def test_worktree_and_commit_ports_reconcile_without_replay(
     assert worktree_orchestrator.step(worktree_id).state is RunState.IMPLEMENTING
     assert worktree.execute_calls == 1
 
-    commit_id = fixture.create(RunState.INTERNAL_REVIEW)
+    commit_id = fixture.create(RunState.LOCAL_VALIDATION)
     commit = FakeCommitPort()
     executor = FakeStageExecutor(fixture.repository)
     commit_orchestrator = Orchestrator(
@@ -1186,6 +1406,10 @@ def test_worktree_and_commit_ports_reconcile_without_replay(
         approval_validator=lambda run, project, root: True,
         stage_executor=executor,
         commit_port=commit,
+    )
+    assert (
+        commit_orchestrator.step(commit_id).state
+        is RunState.INTERNAL_REVIEW
     )
     assert commit_orchestrator.step(commit_id).state is RunState.COMMITTING
     assert commit_orchestrator.step(commit_id).state is RunState.PUSHING_FEATURE
@@ -1292,19 +1516,20 @@ def test_monitor_requires_all_six_gates_for_current_head(fixture: Fixture) -> No
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "expected_state"),
     [
-        ("checks_passed", False),
-        ("threads_resolved", False),
-        ("mergeable", False),
-        ("review_decision", False),
-        ("is_draft", True),
+        ("checks_passed", False, RunState.FIXING_CI_REVIEW),
+        ("threads_resolved", False, RunState.FIXING_CI_REVIEW),
+        ("mergeable", False, RunState.MONITORING_CI_REVIEW),
+        ("review_decision", False, RunState.FIXING_CI_REVIEW),
+        ("is_draft", True, RunState.MONITORING_CI_REVIEW),
     ],
 )
 def test_monitor_rejects_each_false_remote_gate(
     fixture: Fixture,
     field: str,
     value: bool,
+    expected_state: RunState,
 ) -> None:
     run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
     with fixture.repository.database.transaction() as connection:
@@ -1320,7 +1545,7 @@ def test_monitor_rejects_each_false_remote_gate(
 
     outcome = fixture.orchestrator().step(run_id)
 
-    assert outcome.state is RunState.MONITORING_CI_REVIEW
+    assert outcome.state is expected_state
 
 
 @pytest.mark.parametrize("bad_payload", [
@@ -1404,6 +1629,96 @@ def test_cli_approve_binds_exact_file_and_event_atomically(
     evidence = fixture.repository.get_evidence(event.evidence_ids[0])
     assert evidence.kind == "explicit_approval"
     assert evidence.sha256 == json.loads(stdout.getvalue())["approval_sha256"]
+
+
+def test_default_approval_validation_rejects_replaced_approved_scope(
+    fixture: Fixture,
+) -> None:
+    run_id, run_root = approve_fixture_run(fixture)
+    for name in ("requirement.md", "design.md", "implementation-plan.md"):
+        (run_root / name).write_text(f"changed-{name}", encoding="utf-8")
+    replacement = build_approval(
+        run_id=run_id,
+        project_id="test-project",
+        config_hash=CONFIG_HASH,
+        base_branch="develop",
+        base_sha=SHA,
+        test_branch="test",
+        files=tuple(
+            run_root / name
+            for name in ("requirement.md", "design.md", "implementation-plan.md")
+        ),
+        approved_user="tester",
+        user_provider=lambda: "tester",
+        clock=lambda: datetime(2026, 7, 29, tzinfo=UTC),
+    )
+    save_approval(run_root / "approval.json", replacement)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.APPROVED
+    assert outcome.action == "blocked"
+
+
+@pytest.mark.parametrize("table", ["approvals", "evidence"])
+def test_default_approval_validation_rejects_missing_audit_binding(
+    fixture: Fixture,
+    table: str,
+) -> None:
+    run_id, _ = approve_fixture_run(fixture)
+    with fixture.repository.database.transaction() as connection:
+        if table == "approvals":
+            connection.execute("DELETE FROM approvals WHERE run_id = ?", (run_id,))
+        else:
+            connection.execute(
+                "DELETE FROM evidence WHERE run_id = ? AND kind = ?",
+                (run_id, "explicit_approval"),
+            )
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.APPROVED
+    assert outcome.action == "blocked"
+
+
+def test_orchestrator_error_reason_does_not_echo_exception_secrets(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.PUSHING_FEATURE)
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (_ for _ in ()).throw(
+            ValueError(
+                f"{secret} https://user:password@example.invalid response-body"
+            )
+        ),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    reason = outcome.blocked_reason or ""
+    assert secret not in reason
+    assert "password" not in reason
+    assert "response-body" not in reason
 
 
 def test_cli_approve_rejects_path_escape(fixture: Fixture) -> None:

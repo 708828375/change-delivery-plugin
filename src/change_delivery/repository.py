@@ -235,6 +235,42 @@ class RunRepository:
             ).fetchall()
         return [EvidenceRecord.model_validate(dict(row)) for row in rows]
 
+    def get_approval_binding(
+        self,
+        run_id: str,
+    ) -> tuple[str, EvidenceRecord]:
+        with self.database.connection() as connection:
+            approval = connection.execute(
+                "SELECT approval_json FROM approvals WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if approval is None:
+                raise KeyError(f"approval:{run_id}")
+            rows = connection.execute(
+                """
+                SELECT e.* FROM evidence e
+                WHERE e.run_id = ? AND e.kind = 'explicit_approval'
+                ORDER BY e.created_at, e.evidence_id
+                """,
+                (run_id,),
+            ).fetchall()
+            events = connection.execute(
+                """
+                SELECT evidence_json FROM events
+                WHERE run_id = ? AND to_state = ?
+                """,
+                (run_id, RunState.APPROVED.value),
+            ).fetchall()
+        if len(rows) != 1:
+            raise ValueError("approval evidence binding is missing or ambiguous")
+        evidence = EvidenceRecord.model_validate(dict(rows[0]))
+        if not any(
+            evidence.evidence_id in json.loads(event["evidence_json"])
+            for event in events
+        ):
+            raise ValueError("approval evidence is not bound to approval event")
+        return approval["approval_json"], evidence
+
     def rebind_primary_stage_result(
         self,
         run_id: str,
@@ -620,6 +656,42 @@ class RunRepository:
                 or attestation["kind"] != "internal_review_attestation"
             ):
                 raise ValueError("review attestation is missing or forged")
+            try:
+                attestation_payload = json.loads(attestation["payload_json"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError("review attestation payload is invalid") from None
+            validation_id = (
+                attestation_payload.get("validation_attestation_id")
+                if type(attestation_payload) is dict
+                else None
+            )
+            if not isinstance(validation_id, str):
+                raise ValueError("review attestation lacks validation binding")
+            validation = connection.execute(
+                "SELECT * FROM evidence WHERE evidence_id = ?",
+                (validation_id,),
+            ).fetchone()
+            if (
+                validation is None
+                or validation["run_id"] != run_id
+                or validation["kind"] != "local_validation_attestation"
+            ):
+                raise ValueError("validation attestation is missing or forged")
+            try:
+                validation_payload = json.loads(validation["payload_json"])
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError(
+                    "validation attestation payload is invalid"
+                ) from None
+            if (
+                type(validation_payload) is not dict
+                or validation_payload.get("tested_tree_sha") != commit_tree_sha
+                or attestation_payload.get("reviewed_tree_sha")
+                != commit_tree_sha
+                or attestation_payload.get("expected_parent_sha")
+                != expected_parent_sha
+            ):
+                raise ValueError("commit tree is not bound to validation and review")
             for source_id in source_evidence_ids:
                 source = connection.execute(
                     "SELECT run_id FROM evidence WHERE evidence_id = ?",
@@ -638,7 +710,11 @@ class RunRepository:
                     RunState.COMMITTING.value,
                 ),
             ).fetchall()
-            required_review_ids = {attestation_id, *source_evidence_ids}
+            required_review_ids = {
+                attestation_id,
+                validation_id,
+                *source_evidence_ids,
+            }
             if not any(
                 required_review_ids
                 <= set(json.loads(event["evidence_json"]))

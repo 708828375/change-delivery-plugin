@@ -14,6 +14,8 @@ from pydantic import (
     model_validator,
 )
 
+from change_delivery.redaction import redact_text
+
 
 BRANCH_PATTERN = (
     r"^[^-./\x00-\x20\x7f~^:?*\[\\]"
@@ -419,6 +421,23 @@ class StepOutcome(FrozenModel):
     action: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
     blocked_reason: str | None = None
     evidence_ids: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("blocked_reason")
+    @classmethod
+    def sanitize_blocked_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        safe = redact_text(value, {})
+        safe = re.sub(
+            r"(?i)\b(https?://)(?:[^/@\s]+)@",
+            r"\1***@",
+            safe,
+        )
+        safe = "".join(
+            character if character in "\t" or ord(character) >= 32 else " "
+            for character in safe
+        )
+        return safe[:512]
 
 
 class EvidenceRecord(FrozenModel):

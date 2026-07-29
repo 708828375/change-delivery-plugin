@@ -19,7 +19,8 @@ from typing import Any, Iterator, TextIO
 from uuid import uuid4
 
 from change_delivery.config import load_project_config, load_project_config_bytes
-from change_delivery.adapters.git import GitAdapter
+from change_delivery.adapters.git import GitAdapter, GitError
+from change_delivery.adapters.github import GitHubAdapter
 from change_delivery.approval import (
     REQUIRED_ARTIFACT_NAMES,
     load_approval,
@@ -30,11 +31,8 @@ from change_delivery.database import Database
 from change_delivery.domain import LoadedProjectConfig, RunState
 from change_delivery.repository import RunRepository
 from change_delivery.redaction import redact_text
-from change_delivery.orchestrator import (
-    Orchestrator,
-    UnavailableGit,
-    UnavailableGitHub,
-)
+from change_delivery.orchestrator import Orchestrator
+from change_delivery.process import ProcessRunner
 
 
 MAX_REQUIREMENT_BYTES = 1_048_576
@@ -161,6 +159,57 @@ class LocalRegistrationVerifier:
         return True, "local repository and tool bindings verified"
 
 
+class RuntimeGitPort:
+    """Bind orchestrator feature-branch operations to the verified Git adapter."""
+
+    def __init__(self, config: Any, plugin_root: Path) -> None:
+        self._config = config
+        self._plugin_root = plugin_root
+        self._adapter = GitAdapter(
+            config.repo_path,
+            remote=config.remote,
+            base_branch=config.base_branch,
+            test_branch=config.test_branch,
+            expected_fetch_url=config.remote_fetch_url,
+            expected_push_url=config.remote_push_url,
+        )
+
+    def feature_sha(self, branch: str) -> str | None:
+        self._adapter.fetch(self._config.remote)
+        try:
+            return self._adapter.remote_sha(self._config.remote, branch)
+        except GitError as error:
+            if error.operation == "remote_sha":
+                return None
+            raise
+
+    def push_feature(self, branch: str, expected_sha: str) -> str:
+        run_id = branch.removeprefix("feature/")
+        if not run_id or branch != f"feature/{run_id}":
+            raise ValueError("feature branch is not bound to a run")
+        worktree = _child(self._plugin_root, "worktrees", run_id)
+        pushed = self._adapter.push_feature(
+            worktree,
+            self._config.remote,
+            branch,
+        )
+        if not hmac.compare_digest(pushed, expected_sha):
+            raise ValueError("local feature head changed before push")
+        return pushed
+
+
+def _environment_secrets(names: tuple[str, ...]) -> dict[str, str]:
+    return {
+        name: value
+        for name in names
+        if (value := os.environ.get(name)) is not None
+    }
+
+
+def _github_port(config: Any) -> GitHubAdapter:
+    return GitHubAdapter(ProcessRunner(_environment_secrets), config)
+
+
 @dataclass
 class CliServices:
     plugin_root: Path
@@ -203,8 +252,11 @@ class CliServices:
                 repository=repository,
                 plugin_root=self.plugin_root,
                 config_loader=self.load_project,
-                git_factory=lambda config: UnavailableGit(),
-                github_factory=lambda config: UnavailableGitHub(),
+                git_factory=lambda config: RuntimeGitPort(
+                    config,
+                    self.plugin_root,
+                ),
+                github_factory=_github_port,
             )
         return self.orchestrator
 
@@ -251,6 +303,11 @@ def _stable_snapshot(
     descriptor = os.open(path, flags)
     with os.fdopen(descriptor, "rb") as handle:
         before = os.fstat(handle.fileno())
+        if (before.st_dev, before.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise CliUsageError("input identity changed before validation")
         data = handle.read((limit + 1) if limit is not None else -1)
         after = os.fstat(handle.fileno())
     if (

@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 import hmac
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Protocol
 
 from change_delivery.approval import (
@@ -15,6 +17,7 @@ from change_delivery.approval import (
     load_approval,
     verify_approval,
 )
+from change_delivery.adapters.github import PullRequestRef
 from change_delivery.domain import (
     ProjectConfig,
     RunRecord,
@@ -66,27 +69,6 @@ class UnavailableGitHub:
         raise DependencyUnavailable(f"GitHub dependency unavailable for {name}")
 
 
-def _default_approval_validator(
-    run: RunRecord,
-    config: ProjectConfig,
-    run_root: Path,
-) -> bool:
-    approval_path = run_root / "approval.json"
-    try:
-        approval = load_approval(approval_path)
-    except (OSError, ValueError):
-        return False
-    if (
-        approval.run_id != run.run_id
-        or approval.project_id != run.project_id
-        or approval.base_branch != config.base_branch
-        or approval.test_branch != config.test_branch
-    ):
-        return False
-    files = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
-    return verify_approval(approval, files, run.config_hash)
-
-
 class Orchestrator:
     """A single-step, crash-recoverable delivery state driver."""
 
@@ -113,9 +95,7 @@ class Orchestrator:
         self.git_factory = git_factory
         self.github_factory = github_factory
         self.clock = clock or (lambda: datetime.now(UTC))
-        self.approval_validator = (
-            approval_validator or _default_approval_validator
-        )
+        self.approval_validator = approval_validator or self._validate_approval
         self.stage_executor = stage_executor
         self.test_environment = test_environment
         self.acceptance_executor = acceptance_executor
@@ -125,11 +105,86 @@ class Orchestrator:
 
     def _run_root(self, run_id: str) -> Path:
         candidate = self.plugin_root / "runs" / run_id
-        resolved_parent = candidate.parent.resolve(strict=True)
-        expected = (self.plugin_root / "runs").resolve(strict=True)
-        if resolved_parent != expected or candidate.is_symlink():
+        expected = self.plugin_root.resolve(strict=True)
+        resolved = candidate.resolve(strict=True)
+        try:
+            resolved.relative_to(expected)
+        except ValueError as error:
+            raise ValueError("run path escapes plugin root") from error
+        current = self.plugin_root / "runs"
+        for component in (current, candidate):
+            metadata = component.lstat()
+            if component.is_symlink() or (
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            ):
+                raise ValueError("run path contains a link or reparse point")
+        if resolved.parent != current.resolve(strict=True):
             raise ValueError("run path escapes plugin root")
-        return candidate.resolve(strict=True)
+        return resolved
+
+    def _validate_approval(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        run_root: Path,
+    ) -> bool:
+        try:
+            approval_path = run_root / "approval.json"
+            metadata = approval_path.lstat()
+            if approval_path.is_symlink() or (
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            ):
+                return False
+            descriptor = os.open(
+                approval_path,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            with os.fdopen(descriptor, "rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if (opened.st_dev, opened.st_ino) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ):
+                    return False
+                contents = handle.read()
+                after = os.fstat(handle.fileno())
+            if (
+                opened.st_size,
+                opened.st_mtime_ns,
+            ) != (after.st_size, after.st_mtime_ns):
+                return False
+            payload = json.loads(contents)
+            approval = ApprovalSnapshot.model_validate(payload)
+            stored_json, evidence = self.repository.get_approval_binding(
+                run.run_id
+            )
+            canonical = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            file_sha = hashlib.sha256(contents).hexdigest()
+            if (
+                canonical != stored_json
+                or evidence.payload_json != stored_json
+                or not hmac.compare_digest(evidence.sha256, file_sha)
+            ):
+                return False
+            if (
+                approval.run_id != run.run_id
+                or approval.project_id != run.project_id
+                or approval.base_branch != config.base_branch
+                or approval.test_branch != config.test_branch
+            ):
+                return False
+            files = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
+            return verify_approval(approval, files, run.config_hash)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
 
     def _context(self, run_id: str) -> tuple[RunRecord, ProjectConfig, Path]:
         run = self.repository.get_run(run_id)
@@ -269,7 +324,7 @@ class Orchestrator:
             return StepOutcome(
                 state=state,
                 action="blocked_dependency",
-                blocked_reason=str(error),
+                blocked_reason=f"{type(error).__name__}: dependency unavailable",
             )
         except Exception as error:
             try:
@@ -279,7 +334,7 @@ class Orchestrator:
             return StepOutcome(
                 state=state,
                 action="blocked",
-                blocked_reason=str(error),
+                blocked_reason=f"{type(error).__name__}: operation blocked",
             )
 
     resume = step
@@ -305,6 +360,24 @@ class Orchestrator:
         if self.stage_executor is None:
             return self._blocked_dependency(run, f"{stage} stage executor")
         reviewed_tree_sha: str | None = None
+        tested_tree_sha: str | None = None
+        validation_attestation_id: str | None = None
+        validation_attestation: object | None = None
+        if stage == "local_validation":
+            if self.commit_port is None:
+                return self._blocked_dependency(run, "validation tree fact adapter")
+            tested_tree_sha = self.commit_port.validation_tree(  # type: ignore[attr-defined]
+                run, config
+            )
+            if (
+                not isinstance(tested_tree_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", tested_tree_sha) is None
+            ):
+                return StepOutcome(
+                    state=run.state,
+                    action="local_validation_blocked",
+                    blocked_reason="validation tree SHA is invalid",
+                )
         if stage == "internal_review":
             if self.commit_port is None:
                 return self._blocked_dependency(run, "review tree fact adapter")
@@ -320,6 +393,17 @@ class Orchestrator:
                     action="internal_review_blocked",
                     blocked_reason="review tree SHA is invalid",
                 )
+            validation_attestation = self._local_validation_attestation(run)
+            validation_payload = json.loads(
+                validation_attestation.payload_json
+            )
+            if validation_payload["tested_tree_sha"] != reviewed_tree_sha:
+                return StepOutcome(
+                    state=run.state,
+                    action="internal_review_blocked",
+                    blocked_reason="worktree changed after local validation",
+                )
+            validation_attestation_id = validation_attestation.evidence_id
         result = self.stage_executor.execute(
             stage,
             run,
@@ -331,7 +415,33 @@ class Orchestrator:
             result,
             primary=True,
         )
+        if stage == "local_validation":
+            after_tree = self.commit_port.validation_tree(  # type: ignore[attr-defined]
+                run, config
+            )
+            if after_tree != tested_tree_sha:
+                return StepOutcome(
+                    state=run.state,
+                    action="local_validation_blocked",
+                    blocked_reason="worktree changed during local validation",
+                )
         if result.status != "passed":
+            if stage == "local_validation":
+                self.repository.transition_with_evidence(
+                    run.run_id,
+                    run.state,
+                    RunState.IMPLEMENTING,
+                    "LOCAL_VALIDATION_NOT_PASSED",
+                    references,
+                )
+                return StepOutcome(
+                    state=RunState.IMPLEMENTING,
+                    action="validation_changes_required",
+                    blocked_reason="local validation did not pass",
+                    evidence_ids=tuple(
+                        reference.evidence_id for reference in references
+                    ),
+                )
             if stage == "internal_review":
                 target = (
                     RunState.IMPLEMENTING
@@ -352,7 +462,7 @@ class Orchestrator:
                         if target is RunState.IMPLEMENTING
                         else "review_decision_required"
                     ),
-                    blocked_reason=result.summary,
+                    blocked_reason="internal review did not pass",
                     evidence_ids=tuple(
                         reference.evidence_id for reference in references
                     ),
@@ -360,21 +470,28 @@ class Orchestrator:
             return StepOutcome(
                 state=run.state,
                 action=f"{stage}_blocked",
-                blocked_reason=result.summary,
+                blocked_reason=f"{stage} did not pass",
             )
-        if stage == "local_validation":
-            if run.head_sha is None or any(
-                not self._evidence_is_current(ref.evidence_id, run.head_sha)
-                for ref in references
-            ):
-                return StepOutcome(
-                    state=run.state,
-                    action="local_validation_blocked",
-                    blocked_reason="validation evidence is not bound to current head",
-                )
         transition_references = references
+        if stage == "local_validation":
+            assert tested_tree_sha is not None
+            validation_attestation = self.repository.register_evidence(
+                run.run_id,
+                f"validation-attestation:{run.run_id}:{tested_tree_sha}",
+                "local_validation_attestation",
+                {
+                    "passed": True,
+                    "tested_tree_sha": tested_tree_sha,
+                    "expected_parent_sha": run.head_sha,
+                    "source_evidence_ids": [
+                        reference.evidence_id for reference in references
+                    ],
+                },
+            )
+            transition_references = (*references, validation_attestation)
         if stage == "internal_review":
             assert reviewed_tree_sha is not None
+            assert validation_attestation is not None
             attestation = self.repository.register_evidence(
                 run.run_id,
                 f"review-attestation:{run.run_id}:{reviewed_tree_sha}",
@@ -383,12 +500,17 @@ class Orchestrator:
                     "passed": True,
                     "reviewed_tree_sha": reviewed_tree_sha,
                     "expected_parent_sha": run.head_sha,
+                    "validation_attestation_id": validation_attestation_id,
                     "source_evidence_ids": [
                         reference.evidence_id for reference in references
                     ],
                 },
             )
-            transition_references = (*references, attestation)
+            transition_references = (
+                *references,
+                validation_attestation.reference,  # type: ignore[attr-defined]
+                attestation,
+            )
         self.repository.transition_with_evidence(
             run.run_id,
             run.state,
@@ -403,6 +525,33 @@ class Orchestrator:
                 ref.evidence_id for ref in transition_references
             ),
         )
+
+    def _local_validation_attestation(self, run: RunRecord) -> object:
+        candidates = [
+            evidence
+            for evidence in self.repository.list_evidence(run.run_id)
+            if evidence.kind == "local_validation_attestation"
+        ]
+        if not candidates:
+            raise ValueError("local validation tree attestation is missing")
+        evidence = candidates[-1]
+        payload = json.loads(evidence.payload_json)
+        if (
+            type(payload) is not dict
+            or payload.get("passed") is not True
+            or payload.get("expected_parent_sha") != run.head_sha
+            or not isinstance(payload.get("tested_tree_sha"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", payload["tested_tree_sha"])
+            is None
+            or type(payload.get("source_evidence_ids")) is not list
+            or not payload["source_evidence_ids"]
+            or any(
+                not isinstance(evidence_id, str)
+                for evidence_id in payload["source_evidence_ids"]
+            )
+        ):
+            raise ValueError("local validation tree attestation is invalid")
+        return evidence
 
     def _evidence_is_current(self, evidence_id: str, head_sha: str) -> bool:
         payload = json.loads(
@@ -522,7 +671,7 @@ class Orchestrator:
             return StepOutcome(
                 state=run.state,
                 action="design_blocked",
-                blocked_reason=result.summary,
+                blocked_reason="design stage did not pass",
             )
         references = self.repository.rebind_primary_stage_result(
             run.run_id,
@@ -797,6 +946,7 @@ class Orchestrator:
             )
             is None
             or payload.get("expected_parent_sha") != run.head_sha
+            or not isinstance(payload.get("validation_attestation_id"), str)
             or type(payload.get("source_evidence_ids")) is not list
             or not payload["source_evidence_ids"]
             or any(
@@ -805,6 +955,18 @@ class Orchestrator:
             )
         ):
             raise ValueError("internal review tree attestation is invalid")
+        validation = self.repository.get_evidence(
+            payload["validation_attestation_id"]
+        )
+        validation_payload = json.loads(validation.payload_json)
+        if (
+            validation.run_id != run.run_id
+            or validation.kind != "local_validation_attestation"
+            or type(validation_payload) is not dict
+            or validation_payload.get("tested_tree_sha")
+            != payload["reviewed_tree_sha"]
+        ):
+            raise ValueError("review is not bound to tested tree")
         for evidence_id in payload["source_evidence_ids"]:
             source = self.repository.get_evidence(evidence_id)
             if source.run_id != run.run_id:
@@ -985,7 +1147,7 @@ class Orchestrator:
                 key, run.run_id, "draft_pr", identity
             )
             existing = None
-        if existing is not None and existing.status != "PENDING":
+        if existing is not None and existing.status == "FAILED":
             return StepOutcome(
                 state=run.state,
                 action="blocked",
@@ -1001,15 +1163,8 @@ class Orchestrator:
                         action="pr_reconciliation_pending",
                         blocked_reason="pending PR is not authoritatively observable",
                     )
-                found_sha = getattr(found, "head_sha", run.head_sha)
-                if found_sha != run.head_sha:
-                    return StepOutcome(
-                        state=run.state,
-                        action="pr_reconciliation_pending",
-                        blocked_reason="pending PR head SHA mismatch",
-                    )
-                number = (
-                    found if isinstance(found, int) else getattr(found, "number")
+                number = self._validate_pr_fact(
+                    found, branch, config.base_branch, run.head_sha
                 )
             else:
                 created = github.ensure_draft_pr(
@@ -1018,17 +1173,8 @@ class Orchestrator:
                     f"chore: delivery {run.run_id}",
                     f"Automated delivery run: {run.run_id}",
                 )
-                created_sha = getattr(created, "head_sha", run.head_sha)
-                if created_sha != run.head_sha:
-                    return StepOutcome(
-                        state=run.state,
-                        action="pr_reconciliation_pending",
-                        blocked_reason="created PR head SHA mismatch",
-                    )
-                number = (
-                    created
-                    if isinstance(created, int)
-                    else getattr(created, "number")
+                number = self._validate_pr_fact(
+                    created, branch, config.base_branch, run.head_sha
                 )
         except DependencyUnavailable:
             raise
@@ -1038,7 +1184,8 @@ class Orchestrator:
                 action="pr_reconciliation_pending",
                 blocked_reason=f"PR result is uncertain: {type(error).__name__}",
             )
-        self.repository.confirm_remote_operation(key)
+        if existing is None or existing.status == "PENDING":
+            self.repository.confirm_remote_operation(key)
         reference = self.repository.register_evidence(
             run.run_id,
             f"draft-pr:{run.run_id}:{run.head_sha}",
@@ -1058,6 +1205,24 @@ class Orchestrator:
             action="draft_pr_reconciled",
             evidence_ids=(reference.evidence_id,),
         )
+
+    @staticmethod
+    def _validate_pr_fact(
+        fact: object,
+        head: str,
+        base: str,
+        head_sha: str,
+    ) -> int:
+        if (
+            not isinstance(fact, PullRequestRef)
+            or type(fact.number) is not int
+            or fact.number <= 0
+            or fact.head != head
+            or fact.base != base
+            or fact.head_sha != head_sha
+        ):
+            raise ValueError("PR fact is incomplete or does not match run")
+        return fact.number
 
     def _monitor(
         self,
@@ -1085,6 +1250,22 @@ class Orchestrator:
             or snapshot.review_decision is not True
             or snapshot.is_draft is not False
         ):
+            if (
+                snapshot.checks_passed is not True
+                or snapshot.review_decision is not True
+                or snapshot.threads_resolved is not True
+            ):
+                self.repository.transition_with_evidence(
+                    run.run_id,
+                    RunState.MONITORING_CI_REVIEW,
+                    RunState.FIXING_CI_REVIEW,
+                    "CI_OR_REVIEW_CHANGES_REQUIRED",
+                )
+                return StepOutcome(
+                    state=RunState.FIXING_CI_REVIEW,
+                    action="ci_review_changes_required",
+                    blocked_reason="CI or review gates require changes",
+                )
             return StepOutcome(
                 state=run.state,
                 action="monitoring",
