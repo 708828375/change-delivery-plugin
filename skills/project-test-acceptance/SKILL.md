@@ -26,7 +26,10 @@ and apply it to the approved acceptance scope.
    as acceptance.
 6. Clean up only the exact resource IDs recorded by this run, through their
    public API. Verify deletion without widening the selector.
-7. Return only JSON conforming exactly to the complete authoritative
+7. Treat this Skill's result as advisory. The host must independently run the
+   registered fixed-argv `acceptance_check` and validate its SHA-bound JSON
+   output, resource ledger, and cleanup fact.
+8. Return only JSON conforming exactly to the complete authoritative
    `StageResult` schema and status policy injected by the host. A pass must
    reference authoritative SHA, assertion, and cleanup evidence.
 
@@ -43,5 +46,7 @@ the missing host contract.
   perform irreversible third-party actions.
 - Do not delete by a broad prefix, guessed ID, shared account, or time range.
 - Do not use narrative claims as evidence or invent `StageResult` fields.
+- Never claim that model output is authoritative API evidence. A missing
+  `acceptance_check`, `version_endpoint`, or SHA field is `blocked`.
 - If cleanup is incomplete or the SHA binding is uncertain, return `blocked`
   or `failed`, never `passed`.

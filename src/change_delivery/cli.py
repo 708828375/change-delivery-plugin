@@ -28,6 +28,7 @@ from change_delivery.approval import (
     ApprovalSnapshot,
     REQUIRED_ARTIFACT_NAMES,
     build_approval,
+    capture_approval_artifacts,
     save_approval,
     verify_approval,
 )
@@ -43,6 +44,7 @@ from change_delivery.runtime import (
     RuntimeCommitPort,
     RuntimeGitWorkspacePort,
     RuntimeStageExecutor,
+    RuntimeTestEnvironmentPort,
 )
 from change_delivery.scheduler import Scheduler
 
@@ -77,6 +79,7 @@ def _candidate_lease(
         path.is_symlink()
         or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
         or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink > 1
     ):
         raise CliUsageError("input must be a regular non-reparse file")
     if os.name != "nt":
@@ -281,6 +284,7 @@ class CliServices:
                 ),
                 github_factory=_github_port,
                 stage_executor=stage_executor,
+                test_environment=RuntimeTestEnvironmentPort(repository),
                 acceptance_executor=RuntimeAcceptancePort(
                     repository,
                     self.plugin_root,
@@ -352,6 +356,8 @@ def _stable_snapshot(
         raise CliUsageError("links and reparse points are not allowed")
     if not stat.S_ISREG(metadata.st_mode):
         raise CliUsageError("input must be a regular file")
+    if metadata.st_nlink > 1:
+        raise CliUsageError("hardlinked input files are not allowed")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags)
@@ -663,6 +669,7 @@ def _approve_locked(
     }:
         raise CliUsageError("run is not awaiting design approval")
     run_root = _child(services.plugin_root, "runs", run.run_id)
+    _require_safe_directory_chain(services.plugin_root, run_root)
     expected = run_root / "approval.json"
     if (
         args.approval_file.is_symlink()
@@ -681,14 +688,18 @@ def _approve_locked(
     if not _approval_identity_matches(snapshot, run, project):
         raise CliUsageError("approval identity does not match run")
     artifacts = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
-    if not verify_approval(snapshot, artifacts, run.config_hash):
-        raise CliUsageError("approval snapshot or artifacts changed")
+    approved_artifacts = capture_approval_artifacts(
+        snapshot,
+        artifacts,
+        run.config_hash,
+    )
     payload = json.loads(contents)
     repository.approve_with_evidence(
         run.run_id,
         approval_payload=payload,
         approval_sha256=file_sha,
         evidence_id=f"explicit-approval:{run.run_id}:{file_sha}",
+        approved_artifacts=approved_artifacts,
     )
     return {
         "ok": True,

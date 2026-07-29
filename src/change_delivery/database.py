@@ -38,6 +38,16 @@ MIGRATIONS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS approved_artifacts (
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        artifact_name TEXT NOT NULL,
+        content BLOB NOT NULL,
+        sha256 TEXT NOT NULL,
+        approval_sha256 TEXT NOT NULL,
+        PRIMARY KEY (run_id, artifact_name)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS evidence (
         evidence_id TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES runs(run_id),

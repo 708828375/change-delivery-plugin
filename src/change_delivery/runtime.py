@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import shutil
 import stat
 import tempfile
+import time
+from collections.abc import Callable
 from uuid import uuid4
 
 from change_delivery.adapters.codex import CodexAdapter, StageExecutionRequest
 from change_delivery.adapters.git import GitAdapter
+from change_delivery.adapters.http import ReadOnlyHttpClient
+from change_delivery.adapters.project import (
+    ExampleProjectAdapter,
+    cleanup_matches_run,
+)
 from change_delivery.domain import (
+    AcceptanceCheckResult,
     ProjectConfig,
     RunRecord,
     StageResult,
@@ -94,7 +103,7 @@ class RuntimeStageExecutor:
             ),
             worktree=worktree,
             head_sha=run.head_sha or self._design_head(config),
-            approval_scope=self._approval_scope(stage, run_root),
+            approval_scope=self._approval_scope(stage, run, run_root),
             automation_limit="Stop at READY_TO_MERGE; never merge or release.",
             allowed_actions=self._allowed_actions(stage),
             forbidden_actions=(
@@ -119,6 +128,8 @@ class RuntimeStageExecutor:
             (
                 "internal_review_source"
                 if stage == "internal_review"
+                else "acceptance_advisory_passed"
+                if stage == "acceptance"
                 else f"{stage}_passed"
             )
             if result.status == "passed"
@@ -414,17 +425,20 @@ class RuntimeStageExecutor:
             "blocked=missing authority/dependency/schema or scope conflict"
         )
 
-    @staticmethod
-    def _approval_scope(stage: str, run_root: Path) -> str:
+    def _approval_scope(
+        self,
+        stage: str,
+        run: RunRecord,
+        run_root: Path,
+    ) -> str:
         if stage == "design":
             return "Draft artifacts only; explicit approval is still required."
-        artifacts: dict[str, str] = {}
-        for name in (
-            "requirement.md",
-            "design.md",
-            "implementation-plan.md",
-        ):
-            artifacts[name] = (run_root / name).read_text(encoding="utf-8")
+        artifacts = {
+            name: contents.decode("utf-8")
+            for name, contents in self._repository.get_approved_artifacts(
+                run.run_id
+            ).items()
+        }
         scope = json.dumps(
             artifacts,
             ensure_ascii=True,
@@ -444,19 +458,36 @@ class RuntimeAcceptancePort:
         repository: RunRepository,
         plugin_root: Path,
         stage_executor: RuntimeStageExecutor,
+        *,
+        runner: ProcessRunner | None = None,
     ) -> None:
         self._repository = repository
         self._plugin_root = plugin_root.resolve()
         self._stage_executor = stage_executor
+        self._runner = runner or ProcessRunner(environment_secrets)
 
     def query(
         self,
         run: RunRecord,
         config: ProjectConfig,
     ) -> dict[str, object] | None:
-        del config
+        if config.acceptance_check is None:
+            return {
+                "sha": run.head_sha,
+                "passed": False,
+                "reason": "MISSING_ACCEPTANCE_CHECK",
+            }
+        advisory = self._advisory_evidence(run)
+        if advisory is None:
+            return None
+        return self._run_authority("query", run, config)
+
+    def _advisory_evidence(
+        self,
+        run: RunRecord,
+    ) -> dict[str, object] | None:
         for evidence in reversed(self._repository.list_evidence(run.run_id)):
-            if evidence.kind not in {"acceptance_passed", "acceptance_result"}:
+            if evidence.kind != "acceptance_advisory_passed":
                 continue
             try:
                 payload = json.loads(evidence.payload_json)
@@ -466,7 +497,7 @@ class RuntimeAcceptancePort:
                 type(payload) is dict
                 and payload.get("stage") == "acceptance"
                 and payload.get("sha") == run.head_sha
-                and type(payload.get("passed")) is bool
+                and payload.get("passed") is True
             ):
                 return payload
         return None
@@ -476,6 +507,12 @@ class RuntimeAcceptancePort:
         run: RunRecord,
         config: ProjectConfig,
     ) -> dict[str, object]:
+        if config.acceptance_check is None:
+            return {
+                "sha": run.head_sha,
+                "passed": False,
+                "reason": "MISSING_ACCEPTANCE_CHECK",
+            }
         run_root = self._plugin_root / "runs" / run.run_id
         result = self._stage_executor.execute(
             "acceptance",
@@ -485,16 +522,213 @@ class RuntimeAcceptancePort:
         )
         if len(result.evidence) != 1:
             raise RuntimeError("acceptance result has no authoritative host evidence")
-        evidence = self._repository.get_evidence(
-            result.evidence[0].evidence_id
+        if result.status != "passed":
+            return {
+                "sha": run.head_sha,
+                "passed": False,
+                "reason": "ACCEPTANCE_ADVISORY_BLOCKED",
+                "stage_status": result.status,
+            }
+        return self._run_authority("execute", run, config)
+
+    def _run_authority(
+        self,
+        action: str,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> dict[str, object]:
+        assert config.acceptance_check is not None
+        context = json.dumps(
+            {
+                "action": action,
+                "data_prefix": f"codex-{run.run_id}",
+                "project_id": run.project_id,
+                "run_id": run.run_id,
+                "schema_version": 1,
+                "target_sha": run.head_sha,
+                "test_branch": config.test_branch,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ) + "\n"
+        result = self._runner.run(
+            config.acceptance_check,
+            stdin_text=context,
         )
-        payload = json.loads(evidence.payload_json)
-        if type(payload) is not dict:
-            raise RuntimeError("acceptance evidence payload is invalid")
+        if result.exit_code != 0:
+            raise RuntimeError("acceptance authority command failed")
+        if len(result.stdout.encode("utf-8")) > 65_536:
+            raise RuntimeError("acceptance authority output is too large")
+        try:
+            raw = json.loads(result.stdout)
+            fact = AcceptanceCheckResult.model_validate(raw)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise RuntimeError("acceptance authority output is invalid") from error
+        expected_sha = run.head_sha or ""
+        prefix_ok = bool(fact.resource_ids) and all(
+            cleanup_matches_run(resource_id, run.run_id)
+            for resource_id in fact.resource_ids
+        )
+        passed = (
+            hmac.compare_digest(fact.target_sha, expected_sha)
+            and hmac.compare_digest(fact.deployed_sha, expected_sha)
+            and fact.assertions_passed
+            and fact.cleanup_confirmed
+            and prefix_ok
+        )
+        command_payload = config.acceptance_check.model_dump(mode="json")
         return {
-            **payload,
-            "stage_status": result.status,
-            "summary": result.summary,
+            "sha": run.head_sha,
+            "passed": passed,
+            "target_sha": fact.target_sha,
+            "deployed_sha": fact.deployed_sha,
+            "assertions_passed": fact.assertions_passed,
+            "resource_ids": list(fact.resource_ids),
+            "cleanup_confirmed": fact.cleanup_confirmed,
+            "command_id": result.command_id,
+            "command_sha256": hashlib.sha256(
+                json.dumps(
+                    command_payload,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "stdout_sha256": hashlib.sha256(
+                result.stdout.encode("utf-8")
+            ).hexdigest(),
+        }
+
+
+class RuntimeTestEnvironmentPort:
+    """Deploy one SHA to the shared test branch with an exact lease."""
+
+    def __init__(
+        self,
+        repository: RunRepository,
+        *,
+        git_factory: Callable[[ProjectConfig], object] | None = None,
+        http_factory: Callable[[ProjectConfig], object] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._repository = repository
+        self._git_factory = git_factory or self._default_git
+        self._http_factory = http_factory or (
+            lambda config: ReadOnlyHttpClient(
+                timeout_seconds=min(10, config.test_deploy_timeout_seconds)
+            )
+        )
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    @staticmethod
+    def _default_git(config: ProjectConfig) -> GitAdapter:
+        return GitAdapter(
+            config.repo_path,
+            remote=config.remote,
+            base_branch=config.base_branch,
+            test_branch=config.test_branch,
+            expected_fetch_url=config.remote_fetch_url,
+            expected_push_url=config.remote_push_url,
+        )
+
+    def _facts(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> tuple[str, str]:
+        git = self._git_factory(config)
+        git.fetch(config.remote)  # type: ignore[attr-defined]
+        branch_sha = git.remote_sha(  # type: ignore[attr-defined]
+            config.remote,
+            config.test_branch,
+        )
+        project = ExampleProjectAdapter(
+            config,
+            git=git,  # type: ignore[arg-type]
+            github=object(),
+            http=self._http_factory(config),  # type: ignore[arg-type]
+        )
+        return branch_sha, project.deployed_sha()
+
+    def query(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> dict[str, object] | None:
+        try:
+            branch_sha, deployed_sha = self._facts(run, config)
+        except Exception:
+            return None
+        if branch_sha == run.head_sha and deployed_sha == run.head_sha:
+            return {
+                "sha": run.head_sha,
+                "passed": True,
+                "test_branch_sha": branch_sha,
+                "deployed_sha": deployed_sha,
+            }
+        pushed = any(
+            evidence.kind == "test_branch_pushed"
+            and json.loads(evidence.payload_json).get("sha") == run.head_sha
+            for evidence in self._repository.list_evidence(run.run_id)
+        )
+        if pushed and branch_sha != run.head_sha:
+            return {
+                "sha": run.head_sha,
+                "passed": False,
+                "reason": "ENVIRONMENT_PREEMPTED",
+                "test_branch_sha": branch_sha,
+                "deployed_sha": deployed_sha,
+            }
+        return None
+
+    def execute(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> dict[str, object]:
+        if run.head_sha is None:
+            raise ValueError("run head SHA is missing")
+        git = self._git_factory(config)
+        git.fetch(config.remote)  # type: ignore[attr-defined]
+        observed = git.remote_sha(  # type: ignore[attr-defined]
+            config.remote,
+            config.test_branch,
+        )
+        pushed = git.push_test_with_lease(  # type: ignore[attr-defined]
+            config.remote,
+            config.test_branch,
+            run.head_sha,
+            observed,
+        )
+        self._repository.register_evidence(
+            run.run_id,
+            f"test-branch-pushed:{run.run_id}:{run.head_sha}",
+            "test_branch_pushed",
+            {
+                "sha": run.head_sha,
+                "observed_sha": observed,
+                "pushed_sha": pushed,
+                "test_branch": config.test_branch,
+            },
+        )
+        deadline = self._monotonic() + config.test_deploy_timeout_seconds
+        while self._monotonic() < deadline:
+            observed_fact = self.query(run, config)
+            if observed_fact is not None:
+                return observed_fact
+            remaining = deadline - self._monotonic()
+            if remaining <= 0:
+                break
+            self._sleep(
+                min(config.test_deploy_poll_interval_seconds, remaining)
+            )
+        return {
+            "sha": run.head_sha,
+            "passed": False,
+            "reason": "VERSION_NOT_READY",
         }
 
 

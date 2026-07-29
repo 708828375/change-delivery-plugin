@@ -209,6 +209,13 @@ def _normalize_files(
     identities: set[tuple[int, int]] = set()
     for path in paths:
         try:
+            current = Path(path.anchor)
+            for component in path.absolute().parts[1:-1]:
+                current /= component
+                if current.exists() and _is_reparse_point(current):
+                    raise ValueError(
+                        f"artifact ancestor cannot be a reparse point: {path.name}"
+                    )
             if _is_reparse_point(path):
                 raise ValueError(f"artifact cannot be a link or reparse point: {path.name}")
             resolved = path.resolve(strict=True)
@@ -220,6 +227,8 @@ def _normalize_files(
             raise OSError(f"cannot inspect artifact file: {path.name}") from error
         if _stat_identity(source_metadata) != _stat_identity(metadata):
             raise ValueError(f"artifact identity changed or resolves through a link: {path.name}")
+        if source_metadata.st_nlink > 1 or metadata.st_nlink > 1:
+            raise ValueError(f"artifact cannot be a hardlink: {path.name}")
         resolved_parent = resolved.parent
         if parent is None:
             parent = resolved_parent
@@ -352,6 +361,26 @@ def verify_approval(
         )
     except (OSError, ValueError, TypeError, UnicodeError):
         return False
+
+
+def capture_approval_artifacts(
+    approval: ApprovalSnapshot,
+    files: Iterable[str | os.PathLike[str]],
+    config_hash: str,
+) -> dict[str, bytes]:
+    """Capture the exact approved bytes after stable identity and digest checks."""
+
+    artifacts = _normalize_files(files)
+    if not hmac.compare_digest(approval.config_hash, config_hash):
+        raise ValueError("approval config hash changed")
+    captured: dict[str, bytes] = {}
+    for name, path, metadata in artifacts:
+        contents = _read_stable_bytes(path, metadata)
+        digest = hashlib.sha256(contents).hexdigest()
+        if not hmac.compare_digest(approval.artifact_hashes[name], digest):
+            raise ValueError(f"approval artifact changed: {name}")
+        captured[name] = contents
+    return captured
 
 
 def _atomic_replace(source: Path, target: Path) -> None:

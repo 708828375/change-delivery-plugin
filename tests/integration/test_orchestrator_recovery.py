@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from io import StringIO
 import hashlib
 import json
+import sys
 
 import pytest
 
@@ -18,6 +20,7 @@ from change_delivery.cli import CliServices, main
 from change_delivery.config import load_project_config
 from change_delivery.domain import (
     EvidenceRef,
+    CommandSpec,
     ProjectConfig,
     RunState,
     StageResult,
@@ -25,7 +28,11 @@ from change_delivery.domain import (
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessResult
 from change_delivery.repository import RunRepository
-from change_delivery.runtime import RuntimeAcceptancePort, RuntimeStageExecutor
+from change_delivery.runtime import (
+    RuntimeAcceptancePort,
+    RuntimeStageExecutor,
+    RuntimeTestEnvironmentPort,
+)
 
 
 SHA = "a" * 40
@@ -868,7 +875,12 @@ def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
     expected_skill: str,
     expected_role: str,
 ) -> None:
-    run_id = fixture.create(RunState.IMPLEMENTING)
+    run_id, _ = approve_fixture_run(fixture)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.IMPLEMENTING.value, run_id),
+        )
     worktree = fixture.root / "worktrees" / run_id
     worktree.mkdir(parents=True)
     captured: list[object] = []
@@ -958,15 +970,169 @@ def test_runtime_acceptance_port_preserves_blocked_stage_as_nonpassing_fact(
         BlockedAcceptanceStage(),  # type: ignore[arg-type]
     )
 
-    result = port.execute(run, config(fixture.root))
+    configured = config(fixture.root).model_copy(
+        update={
+            "acceptance_check": CommandSpec(
+                executable=sys.executable,
+                args=("-c", "raise SystemExit(1)"),
+                workdir=fixture.root,
+            )
+        }
+    )
+    result = port.execute(run, configured)
 
     assert result["passed"] is False
     assert result["stage_status"] == "blocked"
-    assert port.query(run, config(fixture.root)) == {
-        "sha": SHA,
-        "passed": False,
-        "stage": "acceptance",
-    }
+    assert port.query(run, configured) is None
+
+
+def test_default_runtime_ports_deploy_with_exact_lease_then_require_host_acceptance(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DEPLOYING_TEST)
+    old_sha = "b" * 40
+    calls: list[tuple[object, ...]] = []
+
+    class DeployGit:
+        current = old_sha
+
+        def fetch(self, remote: str) -> None:
+            calls.append(("fetch", remote))
+
+        def remote_sha(self, remote: str, branch: str) -> str:
+            calls.append(("remote_sha", remote, branch))
+            return self.current
+
+        def push_test_with_lease(
+            self,
+            remote: str,
+            branch: str,
+            source_sha: str,
+            observed_sha: str,
+        ) -> str:
+            calls.append(
+                ("push_test_with_lease", remote, branch, source_sha, observed_sha)
+            )
+            assert observed_sha == old_sha
+            self.current = source_sha
+            return source_sha
+
+    deploy_git = DeployGit()
+
+    class VersionHttp:
+        def get_json(self, url: str) -> object:
+            calls.append(("GET", url))
+            return {"sha": deploy_git.current}
+
+    command = CommandSpec(
+        executable=sys.executable,
+        args=("-c", "host-owned-acceptance"),
+        workdir=fixture.root,
+        timeout_seconds=30,
+    )
+    configured = config(fixture.root).model_copy(
+        update={
+            "acceptance_check": command,
+            "test_deploy_timeout_seconds": 5,
+            "test_deploy_poll_interval_seconds": 1.0,
+        }
+    )
+    deploy = RuntimeTestEnvironmentPort(
+        fixture.repository,
+        git_factory=lambda project: deploy_git,
+        http_factory=lambda project: VersionHttp(),
+    )
+
+    class AdvisoryStage:
+        def execute(
+            self,
+            stage: str,
+            run: object,
+            project: object,
+            run_root: Path,
+        ) -> StageResult:
+            del project, run_root
+            assert stage == "acceptance"
+            reference = fixture.repository.register_evidence(
+                run_id,
+                f"acceptance-advisory:{run_id}",
+                "acceptance_advisory_passed",
+                {"sha": run.head_sha, "passed": True, "stage": "acceptance"},  # type: ignore[attr-defined]
+            )
+            return StageResult(
+                status="passed",
+                summary="advisory checks complete",
+                evidence=(reference,),
+                findings=(),
+                next_action="run host authority",
+            )
+
+    class AcceptanceRunner:
+        stdin: list[str] = []
+
+        def run(
+            self,
+            spec: CommandSpec,
+            *,
+            stdin_text: str | None = None,
+        ) -> ProcessResult:
+            assert spec == command
+            assert stdin_text is not None
+            self.stdin.append(stdin_text)
+            return ProcessResult(
+                command_id="1" * 16,
+                exit_code=0,
+                stdout=json.dumps(
+                    {
+                        "target_sha": SHA,
+                        "deployed_sha": SHA,
+                        "assertions_passed": True,
+                        "resource_ids": [f"codex-{run_id}--message-1"],
+                        "cleanup_confirmed": True,
+                    }
+                ),
+                stderr="",
+                duration_ms=1,
+            )
+
+    authority = AcceptanceRunner()
+    acceptance = RuntimeAcceptancePort(
+        fixture.repository,
+        fixture.root,
+        AdvisoryStage(),  # type: ignore[arg-type]
+        runner=authority,  # type: ignore[arg-type]
+    )
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (configured, CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        test_environment=deploy,
+        acceptance_executor=acceptance,
+    )
+
+    assert orchestrator.step(run_id).state is RunState.ACCEPTANCE_TESTING
+    assert orchestrator.step(run_id).state is RunState.PR_READY_FOR_REVIEW
+    assert (
+        "push_test_with_lease",
+        "origin",
+        "test",
+        SHA,
+        old_sha,
+    ) in calls
+    assert len(authority.stdin) == 1
+    context = json.loads(authority.stdin[0])
+    assert context["target_sha"] == SHA
+    assert context["run_id"] == run_id
+    assert command.args == ("-c", "host-owned-acceptance")
+    evidence = fixture.repository.get_evidence(
+        f"acceptance_passed:{run_id}:{SHA}"
+    )
+    payload = json.loads(evidence.payload_json)
+    assert payload["command_sha256"]
+    assert payload["stdout_sha256"]
 
 
 def test_cli_release_is_disabled_and_has_no_side_effect(tmp_path: Path) -> None:
@@ -1983,6 +2149,92 @@ def test_cli_start_prepare_and_approve_lifecycle_is_hash_bound(
     assert json.loads(approved.getvalue())["approval_sha256"] == prepared[
         "approval_sha256"
     ]
+    approved_artifacts = fixture.repository.get_approved_artifacts(run_id)
+    original_design = (
+        fixture.root / "runs" / run_id / "design.md"
+    ).read_bytes()
+    assert approved_artifacts["requirement.md"] == requirement.read_bytes()
+    assert approved_artifacts["design.md"] == original_design
+    (fixture.root / "runs" / run_id / "design.md").write_text(
+        "replaced after approval",
+        encoding="utf-8",
+    )
+    executor = RuntimeStageExecutor(fixture.repository, fixture.root)
+    scope = json.loads(
+        executor._approval_scope(  # type: ignore[attr-defined]
+            "implementation",
+            fixture.repository.get_run(run_id),
+            fixture.root / "runs" / run_id,
+        )
+    )
+    assert scope["design.md"] == original_design.decode("utf-8")
+
+
+def test_prepare_approval_converges_and_releases_lock_after_error(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.AWAITING_DESIGN_APPROVAL)
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        base_sha_provider=lambda project: SHA,
+    )
+
+    def prepare() -> tuple[int, dict[str, object]]:
+        output, error = StringIO(), StringIO()
+        result = main(
+            ["prepare-approval", run_id, "--json"],
+            services=services,
+            stdout=output,
+            stderr=error,
+        )
+        return result, json.loads(output.getvalue() or error.getvalue())
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(pool.map(lambda _: prepare(), range(2)))
+
+    assert [result for result, _payload in results] == [0, 0]
+    assert len(
+        {payload["approval_sha256"] for _result, payload in results}
+    ) == 1
+
+    second_run = fixture.repository.create_run(
+        "run-lock-error",
+        "test-project",
+        CONFIG_HASH,
+    )
+    run_root = fixture.root / "runs" / second_run.run_id
+    run_root.mkdir(parents=True)
+    for name in ("requirement.md", "design.md", "implementation-plan.md"):
+        (run_root / name).write_text(name, encoding="utf-8")
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.AWAITING_DESIGN_APPROVAL.value, second_run.run_id),
+        )
+    services.base_sha_provider = lambda project: (_ for _ in ()).throw(
+        RuntimeError("transient provider failure")
+    )
+    failed, _ = prepare_for_run(services, second_run.run_id)
+    assert failed != 0
+    services.base_sha_provider = lambda project: SHA
+    recovered, _ = prepare_for_run(services, second_run.run_id)
+    assert recovered == 0
+
+
+def prepare_for_run(
+    services: CliServices,
+    run_id: str,
+) -> tuple[int, dict[str, object]]:
+    output, error = StringIO(), StringIO()
+    result = main(
+        ["prepare-approval", run_id, "--json"],
+        services=services,
+        stdout=output,
+        stderr=error,
+    )
+    return result, json.loads(output.getvalue() or error.getvalue())
 
 
 def test_monitor_requires_all_six_gates_for_current_head(fixture: Fixture) -> None:

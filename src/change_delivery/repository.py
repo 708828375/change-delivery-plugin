@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -8,6 +9,7 @@ from uuid import uuid4
 
 from change_delivery.database import Database
 from change_delivery.approval import ApprovalSnapshot
+from change_delivery.approval import REQUIRED_ARTIFACT_NAMES
 from change_delivery.domain import (
     EvidenceRecord,
     EvidenceRef,
@@ -725,6 +727,7 @@ class RunRepository:
         approval_payload: object,
         approval_sha256: str,
         evidence_id: str,
+        approved_artifacts: dict[str, bytes],
     ) -> EventRecord:
         if re.fullmatch(r"[0-9a-f]{64}", approval_sha256) is None:
             raise ValueError("approval SHA-256 is invalid")
@@ -746,6 +749,21 @@ class RunRepository:
         if sha256_payload(approval_payload) != approval_sha256:
             raise ValueError("approval file digest mismatch")
         base_sha = snapshot.base_sha
+        if set(approved_artifacts) != set(REQUIRED_ARTIFACT_NAMES):
+            raise ValueError("approved artifact snapshot is incomplete")
+        artifact_rows = tuple(
+            (
+                name,
+                approved_artifacts[name],
+                hashlib.sha256(approved_artifacts[name]).hexdigest(),
+            )
+            for name in REQUIRED_ARTIFACT_NAMES
+        )
+        if any(
+            digest != snapshot.artifact_hashes[name]
+            for name, _contents, digest in artifact_rows
+        ):
+            raise ValueError("approved artifact snapshot digest mismatch")
         timestamp = utc_now()
         event_id = new_event_id()
         reference = EvidenceRef(
@@ -786,6 +804,14 @@ class RunRepository:
                     """,
                     (run_id,),
                 ).fetchall()
+                stored_artifacts = connection.execute(
+                    """
+                    SELECT artifact_name, content, sha256, approval_sha256
+                    FROM approved_artifacts WHERE run_id = ?
+                    ORDER BY artifact_name
+                    """,
+                    (run_id,),
+                ).fetchall()
                 matching_events = [
                     event
                     for event in events
@@ -801,6 +827,18 @@ class RunRepository:
                     or evidence["sha256"] != approval_sha256
                     or row["head_sha"] != base_sha
                     or len(matching_events) != 1
+                    or {
+                        item["artifact_name"]: (
+                            bytes(item["content"]),
+                            item["sha256"],
+                            item["approval_sha256"],
+                        )
+                        for item in stored_artifacts
+                    }
+                    != {
+                        name: (contents, digest, approval_sha256)
+                        for name, contents, digest in artifact_rows
+                    }
                 ):
                     raise ValueError("approved run has a conflicting audit binding")
                 return EventRecord.model_validate(dict(matching_events[0]))
@@ -833,6 +871,17 @@ class RunRepository:
                 """,
                 (run_id, payload_json, timestamp),
             )
+            connection.executemany(
+                """
+                INSERT INTO approved_artifacts (
+                    run_id, artifact_name, content, sha256, approval_sha256
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    (run_id, name, contents, digest, approval_sha256)
+                    for name, contents, digest in artifact_rows
+                ),
+            )
             connection.execute(
                 """
                 UPDATE runs SET state = ?, head_sha = ?, updated_at = ?
@@ -863,6 +912,34 @@ class RunRepository:
             ).fetchone()
         assert event_row is not None
         return EventRecord.model_validate(dict(event_row))
+
+    def get_approved_artifacts(self, run_id: str) -> dict[str, bytes]:
+        approval_json, evidence = self.get_approval_binding(run_id)
+        approval_hash = sha256_payload(json.loads(approval_json))
+        if evidence.sha256 != approval_hash:
+            raise ValueError("approval artifact binding digest is inconsistent")
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT artifact_name, content, sha256, approval_sha256
+                FROM approved_artifacts WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchall()
+        captured = {
+            row["artifact_name"]: bytes(row["content"])
+            for row in rows
+        }
+        if set(captured) != set(REQUIRED_ARTIFACT_NAMES):
+            raise ValueError("approved artifact snapshot is incomplete")
+        for row in rows:
+            if (
+                row["approval_sha256"] != approval_hash
+                or hashlib.sha256(bytes(row["content"])).hexdigest()
+                != row["sha256"]
+            ):
+                raise ValueError("approved artifact snapshot is corrupt")
+        return captured
 
     def complete_commit_with_review(
         self,

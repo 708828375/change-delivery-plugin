@@ -36,6 +36,8 @@ def test_change_delivery_is_explicit_and_enforces_public_entry_gates() -> None:
         "approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json",
         "resume <run-id> --json",
         "status --run-id <run-id> --json",
+        "acceptance_check",
+        "BLOCKED",
     ):
         assert required in body
 
@@ -104,6 +106,8 @@ def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:
         "status=blocked",
         "complete authoritative",
         "plain-text",
+        "advisory",
+        "acceptance_check",
     ):
         assert required in body
     for required in (

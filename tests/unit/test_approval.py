@@ -333,6 +333,27 @@ def test_stable_read_rejects_file_change_during_hash(
         )
 
 
+def test_approval_rejects_hardlinked_artifact(tmp_path: Path) -> None:
+    requirement, design, plan = write_artifacts(tmp_path)
+    outside = tmp_path / "outside-design.md"
+    design.unlink()
+    outside.write_text("design", encoding="utf-8")
+    os.link(outside, design)
+
+    with pytest.raises(ValueError, match="hardlink"):
+        build_approval(
+            run_id="run-hardlink",
+            project_id="project-001",
+            config_hash=CONFIG_HASH,
+            base_branch="develop",
+            base_sha=BASE_SHA,
+            test_branch="test",
+            files=(requirement, design, plan),
+            user_provider=lambda: "JoySun",
+            clock=lambda: NOW,
+        )
+
+
 def test_save_load_roundtrip_is_stable_and_contains_no_absolute_paths(
     tmp_path: Path,
 ) -> None:

@@ -38,6 +38,11 @@ these gates.
    release, or invent a later state, even when earlier authorization said to
    complete the whole delivery.
 
+A registered `version_endpoint`, `version_sha_field`, and fixed
+`acceptance_check` command are mandatory for real test deployment and
+acceptance. If any is missing, report `BLOCKED`; do not claim that the current
+repository can reach `READY_TO_MERGE`.
+
 ## Non-negotiable boundaries
 
 - Do not expand the approved requirement, design, plan, repository, branch, or

@@ -373,6 +373,14 @@ class StageResult(FrozenModel):
         return self
 
 
+class AcceptanceCheckResult(FrozenModel):
+    target_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    deployed_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    assertions_passed: bool
+    resource_ids: tuple[str, ...]
+    cleanup_confirmed: bool
+
+
 def stage_result_schema_json() -> str:
     """Return the one canonical compact schema injected into every stage."""
 
@@ -606,6 +614,13 @@ class ProjectConfig(FrozenModel):
         min_length=1,
     )
     codex_timeout_seconds: int = Field(default=7200, ge=1, le=7200)
+    test_deploy_timeout_seconds: int = Field(default=300, ge=1, le=1800)
+    test_deploy_poll_interval_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=60,
+    )
+    acceptance_check: CommandSpec | None = None
     credentials: tuple[str, ...] = Field(default_factory=tuple)
     production_enabled: bool = False
 

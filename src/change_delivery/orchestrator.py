@@ -726,15 +726,33 @@ class Orchestrator:
                     blocked_reason=f"operation result is uncertain: {type(error).__name__}",
                 )
         payload = observed
-        if (
-            type(payload) is not dict
-            or payload.get("sha") != run.head_sha
-            or payload.get("passed") is not True
-        ):
+        if type(payload) is not dict or payload.get("sha") != run.head_sha:
             return StepOutcome(
                 state=run.state,
                 action=f"{operation_type}_blocked",
                 blocked_reason="operation evidence is not bound to current head",
+            )
+        if payload.get("passed") is not True:
+            reasons = {
+                "ENVIRONMENT_PREEMPTED": "shared test environment was preempted",
+                "MISSING_ACCEPTANCE_CHECK": (
+                    "registered host acceptance command is missing"
+                ),
+                "ACCEPTANCE_ADVISORY_BLOCKED": (
+                    "acceptance advisory stage did not pass"
+                ),
+                "VERSION_NOT_READY": (
+                    "test deployment version did not converge before timeout"
+                ),
+            }
+            reason = payload.get("reason")
+            return StepOutcome(
+                state=run.state,
+                action=f"{operation_type}_blocked",
+                blocked_reason=reasons.get(
+                    reason,
+                    "operation authority check did not pass",
+                ),
             )
         if operation is None:
             try:

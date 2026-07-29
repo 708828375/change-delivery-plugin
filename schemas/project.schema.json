@@ -379,6 +379,31 @@
       "title": "Codex Timeout Seconds",
       "type": "integer"
     },
+    "test_deploy_timeout_seconds": {
+      "default": 300,
+      "maximum": 1800,
+      "minimum": 1,
+      "title": "Test Deploy Timeout Seconds",
+      "type": "integer"
+    },
+    "test_deploy_poll_interval_seconds": {
+      "default": 5.0,
+      "exclusiveMinimum": 0,
+      "maximum": 60,
+      "title": "Test Deploy Poll Interval Seconds",
+      "type": "number"
+    },
+    "acceptance_check": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/CommandSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "credentials": {
       "items": {
         "type": "string"
