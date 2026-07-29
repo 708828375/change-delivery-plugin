@@ -549,3 +549,171 @@ class RunRepository:
             ).fetchone()
         assert event_row is not None
         return EventRecord.model_validate(dict(event_row))
+
+    def complete_commit_with_review(
+        self,
+        run_id: str,
+        *,
+        operation_key: str,
+        expected_parent_sha: str | None,
+        new_head_sha: str,
+        commit_tree_sha: str,
+        source_evidence_ids: tuple[str, ...],
+        attestation_id: str,
+    ) -> tuple[EvidenceRef, EvidenceRef]:
+        derived_payload = {
+            "sha": new_head_sha,
+            "passed": True,
+            "tree_sha": commit_tree_sha,
+            "source_evidence_ids": list(source_evidence_ids),
+        }
+        commit_payload = {
+            "sha": new_head_sha,
+            "passed": True,
+            "tree_sha": commit_tree_sha,
+            "parent_sha": expected_parent_sha,
+            "run_id": run_id,
+        }
+        derived_json = json.dumps(
+            derived_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        commit_json = json.dumps(
+            commit_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        derived = EvidenceRef(
+            evidence_id=f"internal-review:{run_id}:{new_head_sha}",
+            kind="internal_review_passed",
+            sha256=sha256_payload(derived_payload),
+        )
+        commit = EvidenceRef(
+            evidence_id=f"commit:{run_id}:{new_head_sha}",
+            kind="commit_created",
+            sha256=sha256_payload(commit_payload),
+        )
+        timestamp = utc_now()
+        event_id = new_event_id()
+        with self.database.transaction() as connection:
+            run_row = connection.execute(
+                "SELECT state, head_sha FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(run_id)
+            if (
+                RunState(run_row["state"]) is not RunState.COMMITTING
+                or run_row["head_sha"] != expected_parent_sha
+            ):
+                raise RuntimeError("run changed before commit completion")
+            attestation = connection.execute(
+                "SELECT * FROM evidence WHERE evidence_id = ?",
+                (attestation_id,),
+            ).fetchone()
+            if (
+                attestation is None
+                or attestation["run_id"] != run_id
+                or attestation["kind"] != "internal_review_attestation"
+            ):
+                raise ValueError("review attestation is missing or forged")
+            for source_id in source_evidence_ids:
+                source = connection.execute(
+                    "SELECT run_id FROM evidence WHERE evidence_id = ?",
+                    (source_id,),
+                ).fetchone()
+                if source is None or source["run_id"] != run_id:
+                    raise ValueError("review source evidence is missing or forged")
+            review_events = connection.execute(
+                """
+                SELECT evidence_json FROM events
+                WHERE run_id = ? AND from_state = ? AND to_state = ?
+                """,
+                (
+                    run_id,
+                    RunState.INTERNAL_REVIEW.value,
+                    RunState.COMMITTING.value,
+                ),
+            ).fetchall()
+            required_review_ids = {attestation_id, *source_evidence_ids}
+            if not any(
+                required_review_ids
+                <= set(json.loads(event["evidence_json"]))
+                for event in review_events
+            ):
+                raise ValueError(
+                    "review attestation sources are not bound to review event"
+                )
+            operation = connection.execute(
+                "SELECT status FROM remote_operations WHERE operation_key = ?",
+                (operation_key,),
+            ).fetchone()
+            if operation is not None:
+                if operation["status"] == "PENDING":
+                    connection.execute(
+                        """
+                        UPDATE remote_operations
+                        SET status = 'CONFIRMED', updated_at = ?
+                        WHERE operation_key = ?
+                        """,
+                        (timestamp, operation_key),
+                    )
+                elif operation["status"] != "CONFIRMED":
+                    raise ValueError("commit operation is terminally failed")
+            self._register_evidence_row(
+                connection,
+                run_id,
+                commit.evidence_id,
+                commit.kind,
+                commit_json,
+                commit.sha256,
+                timestamp,
+            )
+            self._register_evidence_row(
+                connection,
+                run_id,
+                derived.evidence_id,
+                derived.kind,
+                derived_json,
+                derived.sha256,
+                timestamp,
+            )
+            assert_transition(
+                RunState.COMMITTING,
+                RunState.PUSHING_FEATURE,
+                (commit.kind, derived.kind),
+                evidence_refs=(commit, derived),
+            )
+            connection.execute(
+                """
+                UPDATE runs SET state = ?, head_sha = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    RunState.PUSHING_FEATURE.value,
+                    new_head_sha,
+                    timestamp,
+                    run_id,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, run_id, event_type, from_state, to_state,
+                    evidence_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    run_id,
+                    "COMMIT_RECONCILED",
+                    RunState.COMMITTING.value,
+                    RunState.PUSHING_FEATURE.value,
+                    json.dumps([commit.evidence_id, derived.evidence_id]),
+                    timestamp,
+                ),
+            )
+        return commit, derived

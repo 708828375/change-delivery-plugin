@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 import hmac
 import hashlib
@@ -15,7 +15,7 @@ import stat
 import shutil
 import sys
 import tempfile
-from typing import Any, TextIO
+from typing import Any, Iterator, TextIO
 from uuid import uuid4
 
 from change_delivery.config import load_project_config, load_project_config_bytes
@@ -53,6 +53,86 @@ class JsonArgumentParser(argparse.ArgumentParser):
 class StableFileSnapshot:
     data: bytes
     signature: tuple[int, int, int, int]
+
+
+@contextmanager
+def _candidate_lease(
+    path: Path,
+    *,
+    limit: int,
+) -> Iterator[tuple[StableFileSnapshot, Callable[[], None]]]:
+    metadata = path.lstat()
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if (
+        path.is_symlink()
+        or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        or not stat.S_ISREG(metadata.st_mode)
+    ):
+        raise CliUsageError("input must be a regular non-reparse file")
+    if os.name != "nt":
+        snapshot = _stable_snapshot(path, limit=limit)
+        yield snapshot, lambda: _assert_snapshot_unchanged(path, snapshot, limit)
+        return
+    import msvcrt
+
+    handle = path.open("rb")
+    opened = os.fstat(handle.fileno())
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        handle.close()
+        raise CliUsageError("candidate identity changed before validation")
+    locked_length = max(1, opened.st_size)
+    try:
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, locked_length)
+        data = handle.read(limit + 1)
+        metadata = os.fstat(handle.fileno())
+        if len(data) > limit:
+            raise CliUsageError("input is too large")
+        snapshot = StableFileSnapshot(
+            data=data,
+            signature=(
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+        )
+
+        def verify() -> None:
+            handle.seek(0)
+            current = handle.read(limit + 1)
+            current_metadata = os.fstat(handle.fileno())
+            current_signature = (
+                current_metadata.st_dev,
+                current_metadata.st_ino,
+                current_metadata.st_size,
+                current_metadata.st_mtime_ns,
+            )
+            if (
+                current_signature != snapshot.signature
+                or not hmac.compare_digest(current, snapshot.data)
+            ):
+                raise CliUsageError("candidate changed while being validated")
+
+        yield snapshot, verify
+    finally:
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, locked_length)
+        finally:
+            handle.close()
+
+
+def _assert_snapshot_unchanged(
+    path: Path,
+    expected: StableFileSnapshot,
+    limit: int,
+) -> None:
+    current = _stable_snapshot(path, limit=limit)
+    if (
+        current.signature != expected.signature
+        or not hmac.compare_digest(current.data, expected.data)
+    ):
+        raise CliUsageError("candidate changed while being validated")
 
 
 class LocalRegistrationVerifier:
@@ -284,28 +364,20 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
 
 
 def _register(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
-    initial = _stable_snapshot(
+    with _candidate_lease(
         args.candidate_file,
         limit=MAX_REQUIREMENT_BYTES,
-    )
-    loaded = load_project_config_bytes(initial.data, args.candidate_file)
-    verifier = services.registration_verifier
-    if verifier is None:
-        raise CliUsageError("registration verifier is unavailable until Task11")
-    verified, reason = verifier(loaded)
-    if not verified:
-        raise CliUsageError(reason or "registration doctor failed")
-    if not hmac.compare_digest(args.confirm_hash, loaded.config_hash):
-        raise CliUsageError("confirmation hash does not match candidate")
-    final = _stable_snapshot(
-        args.candidate_file,
-        limit=MAX_REQUIREMENT_BYTES,
-    )
-    if (
-        initial.signature != final.signature
-        or not hmac.compare_digest(initial.data, final.data)
-    ):
-        raise CliUsageError("candidate changed while being validated")
+    ) as (initial, verify_unchanged):
+        loaded = load_project_config_bytes(initial.data, args.candidate_file)
+        verifier = services.registration_verifier
+        if verifier is None:
+            raise CliUsageError("registration verifier is unavailable until Task11")
+        verified, reason = verifier(loaded)
+        if not verified:
+            raise CliUsageError(reason or "registration doctor failed")
+        if not hmac.compare_digest(args.confirm_hash, loaded.config_hash):
+            raise CliUsageError("confirmation hash does not match candidate")
+        verify_unchanged()
     target = _child(
         services.plugin_root,
         "projects",

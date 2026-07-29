@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Protocol
 
 from change_delivery.approval import (
@@ -303,6 +304,22 @@ class Orchestrator:
     ) -> StepOutcome:
         if self.stage_executor is None:
             return self._blocked_dependency(run, f"{stage} stage executor")
+        reviewed_tree_sha: str | None = None
+        if stage == "internal_review":
+            if self.commit_port is None:
+                return self._blocked_dependency(run, "review tree fact adapter")
+            reviewed_tree_sha = self.commit_port.review_tree(  # type: ignore[attr-defined]
+                run, config
+            )
+            if (
+                not isinstance(reviewed_tree_sha, str)
+                or re.fullmatch(r"[0-9a-f]{40}", reviewed_tree_sha) is None
+            ):
+                return StepOutcome(
+                    state=run.state,
+                    action="internal_review_blocked",
+                    blocked_reason="review tree SHA is invalid",
+                )
         result = self.stage_executor.execute(
             stage,
             run,
@@ -355,17 +372,36 @@ class Orchestrator:
                     action="local_validation_blocked",
                     blocked_reason="validation evidence is not bound to current head",
                 )
+        transition_references = references
+        if stage == "internal_review":
+            assert reviewed_tree_sha is not None
+            attestation = self.repository.register_evidence(
+                run.run_id,
+                f"review-attestation:{run.run_id}:{reviewed_tree_sha}",
+                "internal_review_attestation",
+                {
+                    "passed": True,
+                    "reviewed_tree_sha": reviewed_tree_sha,
+                    "expected_parent_sha": run.head_sha,
+                    "source_evidence_ids": [
+                        reference.evidence_id for reference in references
+                    ],
+                },
+            )
+            transition_references = (*references, attestation)
         self.repository.transition_with_evidence(
             run.run_id,
             run.state,
             target,
             f"{stage.upper()}_PASSED",
-            references,
+            transition_references,
         )
         return StepOutcome(
             state=target,
             action=f"{stage}_passed",
-            evidence_ids=tuple(ref.evidence_id for ref in references),
+            evidence_ids=tuple(
+                ref.evidence_id for ref in transition_references
+            ),
         )
 
     def _evidence_is_current(self, evidence_id: str, head_sha: str) -> bool:
@@ -652,7 +688,19 @@ class Orchestrator:
         port = self.commit_port
         if port is None:
             return self._blocked_dependency(run, "commit adapter")
-        key = f"commit:{run.run_id}:{run.head_sha or 'unborn'}"
+        attestation, attestation_payload = self._review_attestation(run)
+        reviewed_tree_sha = attestation_payload["reviewed_tree_sha"]
+        expected_parent_sha = attestation_payload["expected_parent_sha"]
+        if expected_parent_sha != run.head_sha:
+            return StepOutcome(
+                state=run.state,
+                action="commit_review_blocked",
+                blocked_reason="review attestation parent no longer matches run head",
+            )
+        key = (
+            f"commit:{run.run_id}:{reviewed_tree_sha}:"
+            f"{expected_parent_sha or 'unborn'}"
+        )
         try:
             operation = self.repository.get_remote_operation(key)
         except KeyError:
@@ -669,7 +717,10 @@ class Orchestrator:
                 key,
                 run.run_id,
                 "commit",
-                f"{run.project_id}:{run.head_sha or 'unborn'}",
+                (
+                    f"{run.project_id}:{reviewed_tree_sha}:"
+                    f"{expected_parent_sha or 'unborn'}"
+                ),
             )
             try:
                 observed = port.execute(run, config)  # type: ignore[attr-defined]
@@ -679,46 +730,86 @@ class Orchestrator:
                     action="commit_reconciliation_pending",
                     blocked_reason=f"commit result is uncertain: {type(error).__name__}",
                 )
-        if (
-            type(observed) is not dict
-            or type(observed.get("sha")) is not str
-            or len(observed["sha"]) != 40
-            or observed.get("passed") is not True
-        ):
+        if type(observed) is not dict or observed.get("passed") is not True:
             return StepOutcome(
                 state=run.state,
                 action="commit_blocked",
                 blocked_reason="commit fact is invalid",
             )
-        if operation is not None and operation.status == "PENDING":
-            self.repository.confirm_remote_operation(key)
-        else:
-            try:
-                pending = self.repository.get_remote_operation(key)
-            except KeyError:
-                pending = None
-            if pending is not None and pending.status == "PENDING":
-                self.repository.confirm_remote_operation(key)
-        new_sha = observed["sha"]
-        reference = self.repository.register_evidence(
+        new_sha = observed.get("new_head_sha")
+        commit_tree_sha = observed.get("commit_tree_sha")
+        parent_sha = observed.get("parent_sha")
+        marker_run_id = observed.get("marker_run_id")
+        if (
+            not isinstance(new_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", new_sha) is None
+            or not isinstance(commit_tree_sha, str)
+            or re.fullmatch(r"[0-9a-f]{40}", commit_tree_sha) is None
+            or parent_sha != expected_parent_sha
+            or marker_run_id != run.run_id
+        ):
+            return StepOutcome(
+                state=run.state,
+                action="commit_blocked",
+                blocked_reason="commit parent or run marker is invalid",
+            )
+        if commit_tree_sha != reviewed_tree_sha:
+            return StepOutcome(
+                state=run.state,
+                action="commit_review_tree_mismatch",
+                blocked_reason="commit tree differs from reviewed tree",
+            )
+        source_ids = tuple(attestation_payload["source_evidence_ids"])
+        derived = self.repository.complete_commit_with_review(
             run.run_id,
-            f"commit:{run.run_id}:{new_sha}",
-            "commit_created",
-            observed,
-        )
-        self.repository.transition_with_evidence(
-            run.run_id,
-            RunState.COMMITTING,
-            RunState.PUSHING_FEATURE,
-            "COMMIT_RECONCILED",
-            (reference,),
-            run_updates={"head_sha": new_sha},
+            operation_key=key,
+            expected_parent_sha=expected_parent_sha,
+            new_head_sha=new_sha,
+            commit_tree_sha=commit_tree_sha,
+            source_evidence_ids=source_ids,
+            attestation_id=attestation.evidence_id,
         )
         return StepOutcome(
             state=RunState.PUSHING_FEATURE,
             action="commit_reconciled",
-            evidence_ids=(reference.evidence_id,),
+            evidence_ids=tuple(reference.evidence_id for reference in derived),
         )
+
+    def _review_attestation(
+        self,
+        run: RunRecord,
+    ) -> tuple[object, dict[str, object]]:
+        candidates = [
+            evidence
+            for evidence in self.repository.list_evidence(run.run_id)
+            if evidence.kind == "internal_review_attestation"
+        ]
+        if not candidates:
+            raise ValueError("internal review tree attestation is missing")
+        attestation = candidates[-1]
+        payload = json.loads(attestation.payload_json)
+        if (
+            type(payload) is not dict
+            or payload.get("passed") is not True
+            or not isinstance(payload.get("reviewed_tree_sha"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{40}", payload["reviewed_tree_sha"]
+            )
+            is None
+            or payload.get("expected_parent_sha") != run.head_sha
+            or type(payload.get("source_evidence_ids")) is not list
+            or not payload["source_evidence_ids"]
+            or any(
+                not isinstance(evidence_id, str)
+                for evidence_id in payload["source_evidence_ids"]
+            )
+        ):
+            raise ValueError("internal review tree attestation is invalid")
+        for evidence_id in payload["source_evidence_ids"]:
+            source = self.repository.get_evidence(evidence_id)
+            if source.run_id != run.run_id:
+                raise ValueError("review source evidence belongs to another run")
+        return attestation, payload
 
     def _cleanup(
         self,

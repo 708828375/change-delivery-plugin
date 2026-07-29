@@ -24,6 +24,9 @@ from change_delivery.repository import RunRepository
 
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
+NEW_SHA = "c" * 40
+TREE_SHA = "d" * 40
+OTHER_TREE_SHA = "e" * 40
 CONFIG_HASH = "c" * 64
 
 
@@ -176,7 +179,11 @@ class FakeStageExecutor:
         reference = self.repository.register_evidence(
             run_id,
             f"{stage}-proof:{run_id}",
-            f"{stage}_passed",
+            (
+                "internal_review_source"
+                if stage == "internal_review"
+                else f"{stage}_passed"
+            ),
             {"sha": head_sha, "passed": True},
         )
         return StageResult(
@@ -220,6 +227,41 @@ class FakeCleanupPort:
         self.execute_calls += 1
         self.removed = True
         return {"clean": True, "removed": True}
+
+
+class FakeCommitPort:
+    def __init__(
+        self,
+        *,
+        tree_sha: str = TREE_SHA,
+        commit_tree_sha: str = TREE_SHA,
+        observed: dict[str, object] | None = None,
+    ) -> None:
+        self.tree_sha = tree_sha
+        self.commit_tree_sha = commit_tree_sha
+        self.observed = observed
+        self.query_calls = 0
+        self.execute_calls = 0
+        self.review_tree_calls = 0
+
+    def review_tree(self, run: object, project: object) -> str:
+        self.review_tree_calls += 1
+        return self.tree_sha
+
+    def query(self, run: object, project: object) -> dict[str, object] | None:
+        self.query_calls += 1
+        return self.observed
+
+    def execute(self, run: object, project: object) -> dict[str, object]:
+        self.execute_calls += 1
+        self.observed = {
+            "new_head_sha": NEW_SHA,
+            "commit_tree_sha": self.commit_tree_sha,
+            "parent_sha": run.head_sha,  # type: ignore[attr-defined]
+            "marker_run_id": run.run_id,  # type: ignore[attr-defined]
+            "passed": True,
+        }
+        return self.observed
 
 @dataclass
 class Fixture:
@@ -843,12 +885,202 @@ def test_stage_handlers_call_once_rebind_and_advance(
         github_factory=lambda project: fixture.github,
         approval_validator=lambda run, project, root: True,
         stage_executor=executor,
+        commit_port=FakeCommitPort() if stage == "internal_review" else None,
     )
 
     outcome = orchestrator.step(run_id)
 
     assert outcome.state is target
     assert executor.calls == [stage]
+
+
+def test_internal_review_records_tree_bound_attestation(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.COMMITTING
+    assert commit.review_tree_calls == 1
+    attestations = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "internal_review_attestation"
+    ]
+    assert len(attestations) == 1
+    payload = json.loads(attestations[0].payload_json)
+    assert payload["reviewed_tree_sha"] == TREE_SHA
+    assert payload["source_evidence_ids"] == [f"internal_review-proof:{run_id}"]
+
+
+def test_commit_derives_review_evidence_for_new_head(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.PUSHING_FEATURE
+    assert fixture.repository.get_run(run_id).head_sha == NEW_SHA
+    derived = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "internal_review_passed"
+    ]
+    assert len(derived) == 1
+    payload = json.loads(derived[0].payload_json)
+    assert payload["sha"] == NEW_SHA
+    assert payload["tree_sha"] == TREE_SHA
+    assert payload["passed"] is True
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_commit_tree_mismatch_never_derives_review_pass(
+    fixture: Fixture,
+    pending: bool,
+) -> None:
+    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort(commit_tree_sha=OTHER_TREE_SHA)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+    if pending:
+        commit.observed = commit.execute(
+            fixture.repository.get_run(run_id),
+            config(fixture.root),
+        )
+        commit.execute_calls = 0
+        fixture.repository.begin_remote_operation(
+            f"commit:{run_id}:{TREE_SHA}:{SHA}",
+            run_id,
+            "commit",
+            f"test-project:{TREE_SHA}:{SHA}",
+        )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.COMMITTING
+    assert "tree" in (outcome.blocked_reason or "")
+    assert not any(
+        evidence.kind == "internal_review_passed"
+        for evidence in fixture.repository.list_evidence(run_id)
+    )
+    if pending:
+        assert commit.execute_calls == 0
+
+
+def test_forged_review_attestation_source_is_rejected(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.COMMITTING)
+    fixture.repository.register_evidence(
+        run_id,
+        f"review-attestation:{run_id}:{TREE_SHA}",
+        "internal_review_attestation",
+        {
+            "passed": True,
+            "reviewed_tree_sha": TREE_SHA,
+            "expected_parent_sha": SHA,
+            "source_evidence_ids": ["missing-source"],
+        },
+    )
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        commit_port=commit,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.COMMITTING
+    assert commit.execute_calls == 0
+    assert not any(
+        evidence.kind == "internal_review_passed"
+        for evidence in fixture.repository.list_evidence(run_id)
+    )
+
+
+def test_monitor_uses_review_evidence_derived_from_commit(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.INTERNAL_REVIEW)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+    assert orchestrator.step(run_id).state is RunState.PUSHING_FEATURE
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ?, pr_number = 42 WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+    fixture.github.snapshot_result = Snapshot(NEW_SHA)
+    for kind in (
+        "ci_passed",
+        "acceptance_passed",
+        "threads_resolved",
+        "mergeable",
+        "head_sha_verified",
+    ):
+        fixture.repository.register_evidence(
+            run_id,
+            f"{kind}:{run_id}:{NEW_SHA}",
+            kind,
+            {"sha": NEW_SHA, "passed": True},
+        )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.READY_TO_MERGE
 
 
 @pytest.mark.parametrize(
@@ -942,8 +1174,9 @@ def test_worktree_and_commit_ports_reconcile_without_replay(
     assert worktree_orchestrator.step(worktree_id).state is RunState.IMPLEMENTING
     assert worktree.execute_calls == 1
 
-    commit_id = fixture.create(RunState.COMMITTING)
-    commit = FakeReconciledPort()
+    commit_id = fixture.create(RunState.INTERNAL_REVIEW)
+    commit = FakeCommitPort()
+    executor = FakeStageExecutor(fixture.repository)
     commit_orchestrator = Orchestrator(
         repository=fixture.repository,
         plugin_root=fixture.root,
@@ -951,41 +1184,13 @@ def test_worktree_and_commit_ports_reconcile_without_replay(
         git_factory=lambda project: fixture.git,
         github_factory=lambda project: fixture.github,
         approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
         commit_port=commit,
     )
+    assert commit_orchestrator.step(commit_id).state is RunState.COMMITTING
     assert commit_orchestrator.step(commit_id).state is RunState.PUSHING_FEATURE
     assert commit.execute_calls == 1
 
-    pending_id = "run-commit-pending"
-    fixture.repository.create_run(pending_id, "test-project", CONFIG_HASH)
-    with fixture.repository.database.transaction() as connection:
-        connection.execute(
-            "UPDATE runs SET state = ?, head_sha = ? WHERE run_id = ?",
-            (RunState.COMMITTING.value, SHA, pending_id),
-        )
-    pending_root = fixture.root / "runs" / pending_id
-    pending_root.mkdir(parents=True)
-    for name in ("requirement.md", "design.md", "implementation-plan.md"):
-        (pending_root / name).write_text(name, encoding="utf-8")
-    fixture.repository.begin_remote_operation(
-        f"commit:{pending_id}:{SHA}",
-        pending_id,
-        "commit",
-        f"test-project:{SHA}",
-    )
-    pending = FakeReconciledPort({"sha": SHA, "passed": True})
-    pending_orchestrator = Orchestrator(
-        repository=fixture.repository,
-        plugin_root=fixture.root,
-        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
-        git_factory=lambda project: fixture.git,
-        github_factory=lambda project: fixture.github,
-        approval_validator=lambda run, project, root: True,
-        commit_port=pending,
-    )
-    assert pending_orchestrator.step(pending_id).state is RunState.PUSHING_FEATURE
-    assert pending.query_calls == 1
-    assert pending.execute_calls == 0
 
 
 def test_ready_merge_and_cleanup_are_observation_driven(
