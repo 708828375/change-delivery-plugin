@@ -403,6 +403,37 @@ def test_process_timeout_does_not_overwrite_terminal_state_from_step(
     assert fixture.repository.list_evidence("run-1") == []
 
 
+def test_process_timeout_with_matching_terminal_outcome_never_attempts_block(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+
+    class MatchingTerminalOrchestrator:
+        def step(self, run_id: str) -> StepOutcome:
+            fixture.repository.transition(
+                run_id,
+                RunState.DRAFT,
+                RunState.CANCELLED,
+                "MANUAL_CANCEL",
+            )
+            return timeout_outcome(RunState.CANCELLED)
+
+    scheduler = Scheduler(
+        runtime_root=tmp_path,
+        repository=fixture.repository,
+        orchestrator=MatchingTerminalOrchestrator(),
+        clock=lambda: NOW,
+    )
+
+    result = scheduler.tick()
+
+    assert result.status == "concurrent_state_change"
+    assert result.current_state is RunState.CANCELLED
+    assert fixture.repository.get_run("run-1").state is RunState.CANCELLED
+    assert fixture.repository.list_evidence("run-1") == []
+
+
 def test_process_timeout_cas_loss_reports_authoritative_terminal_state(
     tmp_path: Path,
 ) -> None:

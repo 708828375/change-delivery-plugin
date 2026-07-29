@@ -10,7 +10,7 @@ from typing import Literal, Protocol
 from filelock import FileLock, Timeout
 
 from change_delivery.domain import FrozenModel, RunState, StepOutcome
-from change_delivery.repository import RunRepository
+from change_delivery.repository import RunRepository, TERMINAL_STATES
 
 
 _FAST_WINDOW = timedelta(minutes=5)
@@ -21,6 +21,9 @@ _INTERVENTION_STATES = {
     RunState.BLOCKED,
     RunState.REVIEW_DECISION_REQUIRED,
 }
+MANUAL_INTERVENTION_STATES = frozenset(
+    {*_INTERVENTION_STATES, RunState.AWAITING_DESIGN_APPROVAL}
+)
 
 
 class OrchestratorPort(Protocol):
@@ -138,6 +141,16 @@ class Scheduler:
             outcome = self.orchestrator.step(run.run_id)
             if outcome.action == "process_timeout":
                 observed = self.repository.get_run(run.run_id)
+                if (
+                    observed.state in TERMINAL_STATES
+                    or observed.state in MANUAL_INTERVENTION_STATES
+                ):
+                    return SchedulerResult(
+                        status="concurrent_state_change",
+                        processed=1,
+                        run_id=run.run_id,
+                        current_state=observed.state,
+                    )
                 if observed.state is not outcome.state:
                     return SchedulerResult(
                         status="concurrent_state_change",
