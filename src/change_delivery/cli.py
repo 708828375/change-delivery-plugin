@@ -39,6 +39,7 @@ from change_delivery.runtime import (
     RuntimeGitWorkspacePort,
     RuntimeStageExecutor,
 )
+from change_delivery.scheduler import Scheduler
 
 
 MAX_REQUIREMENT_BYTES = 1_048_576
@@ -224,6 +225,7 @@ class CliServices:
         Callable[[LoadedProjectConfig], tuple[bool, str]] | None
     ) = None
     orchestrator: Any | None = None
+    scheduler: Any | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = self.plugin_root.resolve(strict=False)
@@ -276,6 +278,15 @@ class CliServices:
                 cleanup_port=RuntimeCleanupPort(workspace),
             )
         return self.orchestrator
+
+    def get_scheduler(self) -> Any:
+        if self.scheduler is None:
+            self.scheduler = Scheduler(
+                runtime_root=self.plugin_root,
+                repository=self.get_repository(),
+                orchestrator=self.get_orchestrator(),
+            )
+        return self.scheduler
 
 
 def _default_services() -> CliServices:
@@ -588,12 +599,8 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     if args.command == "tick":
         if args.plugin_root is not None:
             services.plugin_root = args.plugin_root
-        repository = services.get_repository()
-        runs = repository.list_active_runs()
-        outcome = None
-        if runs:
-            outcome = _orchestrator_action("step", runs[0].run_id, services)
-        return {"ok": True, "processed": 1 if outcome else 0, "outcome": outcome}
+        result = services.get_scheduler().tick()
+        return {"ok": True, **result.model_dump(mode="json")}
     if args.command == "release":
         raise CliUsageError("正式发布尚未启用/Task14")
     raise CliUsageError("unknown command")

@@ -244,6 +244,16 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
     )
 
 
+def test_stage_request_controls_codex_process_timeout(tmp_path: Path) -> None:
+    runner = FakeRunner(payload())
+
+    adapter(tmp_path, runner).run_stage(
+        request(tmp_path, timeout_seconds=321)
+    )
+
+    assert runner.commands[0].timeout_seconds == 321
+
+
 def test_writer_uses_workspace_write_and_output_file(tmp_path: Path) -> None:
     runner = FakeRunner(f"FILE:{payload()}")
 

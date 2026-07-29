@@ -91,6 +91,128 @@ class RunRepository:
             ).fetchall()
         return [RunRecord.model_validate(dict(row)) for row in rows]
 
+    def get_scheduler_poll_at(self, run_id: str) -> datetime | None:
+        with self.database.connection() as connection:
+            row = connection.execute(
+                "SELECT polled_at FROM scheduler_polls WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(row["polled_at"])
+
+    def record_scheduler_poll(
+        self,
+        run_id: str,
+        polled_at: datetime,
+    ) -> None:
+        if polled_at.tzinfo is None:
+            raise ValueError("scheduler poll timestamp must be timezone-aware")
+        timestamp = polled_at.astimezone(UTC).isoformat()
+        with self.database.transaction() as connection:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                is None
+            ):
+                raise KeyError(run_id)
+            connection.execute(
+                """
+                INSERT INTO scheduler_polls (run_id, polled_at)
+                VALUES (?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET polled_at = excluded.polled_at
+                """,
+                (run_id, timestamp),
+            )
+
+    def block_for_scheduler(
+        self,
+        run_id: str,
+        expected: RunState,
+        *,
+        evidence_kind: str,
+        event_type: str,
+        reason_code: str,
+        occurred_at: datetime,
+    ) -> EventRecord:
+        if occurred_at.tzinfo is None:
+            raise ValueError("scheduler timestamp must be timezone-aware")
+        timestamp = occurred_at.astimezone(UTC).isoformat()
+        evidence_id = f"{evidence_kind}:{uuid4().hex}"
+        payload = {
+            "reason": reason_code,
+            "threshold_hours": 72,
+            "safe_summary": "automatic processing stopped; manual review required",
+        }
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
+        digest = sha256_payload(payload)
+        reference = EvidenceRef(
+            evidence_id=evidence_id,
+            kind=evidence_kind,
+            sha256=digest,
+        )
+        event_id = new_event_id()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT state FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            current = RunState(row["state"])
+            if current is not expected:
+                raise RuntimeError("run state changed")
+            assert_transition(
+                current,
+                RunState.BLOCKED,
+                (evidence_kind,),
+                evidence_refs=(reference,),
+            )
+            self._register_evidence_row(
+                connection,
+                run_id,
+                evidence_id,
+                evidence_kind,
+                payload_json,
+                digest,
+                timestamp,
+            )
+            connection.execute(
+                "UPDATE runs SET state = ?, updated_at = ? WHERE run_id = ?",
+                (RunState.BLOCKED.value, timestamp, run_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, run_id, event_type, from_state, to_state,
+                    evidence_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    run_id,
+                    event_type,
+                    current.value,
+                    RunState.BLOCKED.value,
+                    json.dumps((evidence_id,), ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+            event_row = connection.execute(
+                "SELECT * FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        assert event_row is not None
+        return EventRecord.model_validate(dict(event_row))
+
     def transition(
         self,
         run_id: str,

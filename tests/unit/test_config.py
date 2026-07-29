@@ -71,6 +71,17 @@ def test_load_project_config_returns_expected_model(tmp_path: Path) -> None:
     assert loaded.config.production_enabled is False
 
 
+def test_project_config_accepts_bounded_codex_timeout(tmp_path: Path) -> None:
+    config_file = tmp_path / "project.yaml"
+    data = valid_config_data()
+    data["codex_timeout_seconds"] = 321
+    write_yaml(config_file, data)
+
+    loaded = load_project_config(config_file)
+
+    assert loaded.config.codex_timeout_seconds == 321
+
+
 def test_hash_is_independent_of_yaml_key_order(tmp_path: Path) -> None:
     first_file = tmp_path / "first.yaml"
     second_file = tmp_path / "second.yaml"

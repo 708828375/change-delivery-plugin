@@ -27,6 +27,7 @@ from change_delivery.domain import (
     StepOutcome,
 )
 from change_delivery.repository import RunRepository
+from change_delivery.process import ProcessTimeoutError
 from change_delivery.state_machine import READY_TO_MERGE_EVIDENCE
 
 
@@ -321,6 +322,16 @@ class Orchestrator:
             if run.state is RunState.CANCELLED:
                 return StepOutcome(state=run.state, action="already_cancelled")
             raise AssertionError(f"unmapped RunState: {run.state.value}")
+        except ProcessTimeoutError:
+            try:
+                state = self.repository.get_run(run_id).state
+            except KeyError:
+                state = RunState.BLOCKED
+            return StepOutcome(
+                state=state,
+                action="process_timeout",
+                blocked_reason="configured process timeout exceeded",
+            )
         except DependencyUnavailable as error:
             try:
                 state = self.repository.get_run(run_id).state

@@ -108,6 +108,7 @@ class RuntimeStageExecutor:
                 else "writer"
             ),
             attempt=1,
+            timeout_seconds=config.codex_timeout_seconds,
         )
         result = self._codex().run_stage(request)
         kind = (

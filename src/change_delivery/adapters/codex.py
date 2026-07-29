@@ -69,6 +69,7 @@ class StageExecutionRequest(FrozenModel):
     )
     role: Literal["read_only", "writer"]
     attempt: int = Field(ge=1)
+    timeout_seconds: int = Field(default=7200, ge=1, le=7200)
 
     @field_validator(
         "instructions",
@@ -211,6 +212,7 @@ class CodexAdapter:
         expected_skill = request.expected_skill
         run_id = request.run_id
         stage = request.stage
+        timeout_seconds = request.timeout_seconds
         if not worktree.is_dir():
             raise ValueError("stage worktree must be an existing directory")
         if (
@@ -226,6 +228,7 @@ class CodexAdapter:
             role=role,
             workdir=worktree,
             output_path=output_path,
+            timeout_seconds=timeout_seconds,
         )
         del request
         try:
@@ -253,6 +256,7 @@ class CodexAdapter:
                 run_id,
                 stage,
                 raw if "raw" in locals() else b"",
+                timeout_seconds,
             )
         except (ValueError, SchemaValidationError):
             raise BlockedError("Codex primary result failed schema validation") from None
@@ -262,6 +266,7 @@ class CodexAdapter:
         run_id: str,
         stage: str,
         invalid_output: bytes,
+        timeout_seconds: int,
     ) -> StageResult:
         repair_directory = self._new_repair_directory()
         output_path = self._new_result_path(run_id, stage)
@@ -273,6 +278,7 @@ class CodexAdapter:
             role="read_only",
             workdir=repair_directory,
             output_path=output_path,
+            timeout_seconds=timeout_seconds,
         )
         try:
             outcome = self._invoke(
@@ -302,6 +308,7 @@ class CodexAdapter:
         role: Literal["read_only", "writer"],
         workdir: Path,
         output_path: Path,
+        timeout_seconds: int,
     ) -> CommandSpec:
         sandbox = "read-only" if role == "read_only" else "workspace-write"
         return CommandSpec(
@@ -324,7 +331,7 @@ class CodexAdapter:
                 "-",
             ),
             workdir=workdir,
-            timeout_seconds=7200,
+            timeout_seconds=timeout_seconds,
             env_names=self._auth_env_names,
         )
 

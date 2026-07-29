@@ -573,6 +573,7 @@ class ProjectConfig(FrozenModel):
     required_pre_pr_checks: tuple[CommandSpec, ...] = Field(
         min_length=1,
     )
+    codex_timeout_seconds: int = Field(default=7200, ge=1, le=7200)
     credentials: tuple[str, ...] = Field(default_factory=tuple)
     production_enabled: bool = False
 

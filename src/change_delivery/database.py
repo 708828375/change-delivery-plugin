@@ -65,6 +65,12 @@ MIGRATIONS = (
         created_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS scheduler_polls (
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        polled_at TEXT NOT NULL
+    )
+    """,
 )
 
 

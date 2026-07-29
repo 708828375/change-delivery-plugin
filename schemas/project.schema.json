@@ -372,6 +372,13 @@
       "title": "Required Pre Pr Checks",
       "type": "array"
     },
+    "codex_timeout_seconds": {
+      "default": 7200,
+      "maximum": 7200,
+      "minimum": 1,
+      "title": "Codex Timeout Seconds",
+      "type": "integer"
+    },
     "credentials": {
       "items": {
         "type": "string"
