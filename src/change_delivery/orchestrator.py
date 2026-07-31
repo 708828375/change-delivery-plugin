@@ -1454,21 +1454,16 @@ class Orchestrator:
             RunState.FAILED_TERMINAL,
         }:
             raise ValueError("terminal run cannot be cancelled")
-        config, digest = self.config_loader(run.project_id)
-        if not hmac.compare_digest(digest, run.config_hash):
-            raise ValueError("project configuration hash changed")
-        pr_url = (
-            f"https://github.com/{config.github_repository}/pull/{run.pr_number}"
-            if run.pr_number is not None
-            else None
-        )
-        self.artifact_store.write_resource_inventory(
-            run_id,
-            branch=self._feature_branch(run),
-            worktree=self.plugin_root / "worktrees" / run_id,
-            pr_url=pr_url,
-            test_sha=run.head_sha,
-        )
+        try:
+            self.artifact_store.write_resource_inventory(
+                run_id,
+                branch=self._feature_branch(run),
+                worktree=self.plugin_root / "worktrees" / run_id,
+                pr_url="unavailable",
+                test_sha=run.head_sha,
+            )
+        except (OSError, ValueError):
+            pass
         self.repository.transition_with_evidence(
             run_id,
             run.state,

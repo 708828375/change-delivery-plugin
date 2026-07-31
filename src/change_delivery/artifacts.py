@@ -94,15 +94,46 @@ class ArtifactStore:
             raise ValueError(f"artifact file is unsafe: {path.name}")
 
     def create_run(self, run_id: str) -> RunArtifacts:
-        run_dir = self._run_dir(run_id, create=True)
+        if not _RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:
+            raise ValueError("run_id is not canonical")
+        self._root()
+        runs = self.runtime_root / "runs"
+        self._require_directory(runs, create=True)
+        run_dir = runs / run_id
+        run_dir.mkdir(exist_ok=False)
+        try:
+            self._run_dir(run_id)
+            for name in _DIRECTORIES:
+                directory = run_dir / name
+                resolved = self._require_directory(directory, create=True)
+                if resolved.parent != run_dir.resolve(strict=True):
+                    raise ValueError("artifact directory escapes run directory")
+            for name in _FILES:
+                self._require_regular_file(run_dir / name, create=True)
+            return self.paths(run_id)
+        except BaseException:
+            self.discard_new_run(run_id)
+            raise
+
+    def discard_new_run(self, run_id: str) -> None:
+        run_dir = self._run_dir(run_id)
+        expected = {*_FILES, *_DIRECTORIES}
+        actual = {item.name for item in run_dir.iterdir()}
+        if not actual <= expected:
+            raise ValueError("refusing to remove run directory with unknown entries")
+        for name in _FILES:
+            path = run_dir / name
+            if path.exists():
+                self._require_regular_file(path)
+                path.unlink()
         for name in _DIRECTORIES:
             directory = run_dir / name
-            resolved = self._require_directory(directory, create=True)
-            if resolved.parent != run_dir.resolve(strict=True):
-                raise ValueError("artifact directory escapes run directory")
-        for name in _FILES:
-            self._require_regular_file(run_dir / name, create=True)
-        return self.paths(run_id)
+            if directory.exists():
+                self._require_directory(directory)
+                if any(directory.iterdir()):
+                    raise ValueError("refusing to remove non-empty artifact directory")
+                directory.rmdir()
+        run_dir.rmdir()
 
     def paths(self, run_id: str) -> RunArtifacts:
         run_dir = self._run_dir(run_id)
@@ -126,7 +157,8 @@ class ArtifactStore:
         pr_url: str | None,
         test_sha: str | None,
     ) -> Path:
-        paths = self.create_run(run_id)
+        paths = self.paths(run_id)
+        self._require_directory(paths.reports_dir, create=True)
         target = paths.reports_dir / "resource-inventory.md"
         if target.exists():
             self._require_regular_file(target)

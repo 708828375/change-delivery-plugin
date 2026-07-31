@@ -73,7 +73,8 @@ class Scheduler:
         # ``absolute`` preserves the lexical final component so validation can
         # still detect a symlink or Windows reparse point at runtime_root.
         self.runtime_root = runtime_root.absolute()
-        self.retention_service = retention_service
+        self.retention_service = retention_service or RetentionService(self.runtime_root, repository)
+        self.notification_service = notification_service or NotificationService(repository.database)
         self.retention_lock_path = self.runtime_root / "retention.lock"
         self.retention_lock = FileLock(self.retention_lock_path, timeout=0)
         self.retention_day_path = self.runtime_root / "retention-day"
@@ -96,10 +97,18 @@ class Scheduler:
                     self._validate_held_lock_identity(expected_identity)
                 except (OSError, ValueError):
                     return SchedulerResult(status="unsafe_lock", processed=0)
-                return self._tick_locked()
+                result = self._tick_locked()
         except Timeout:
             return SchedulerResult(status="already_running", processed=0)
-
+        self._notify_result(result)
+        self._notify_waiting_runs()
+        try:
+            now = self.clock()
+            if now.tzinfo is not None:
+                self._run_daily_retention(now.astimezone(UTC))
+        except Exception:
+            pass
+        return result
     def _tick_locked(self) -> SchedulerResult:
         now = self.clock()
         if now.tzinfo is None:
@@ -232,6 +241,62 @@ class Scheduler:
             )
         return SchedulerResult(status="idle", processed=0)
 
+    def _notify_result(self, result: SchedulerResult) -> None:
+        outcome = result.outcome
+        if result.run_id is None or outcome is None:
+            return
+        if outcome.state not in {
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.BLOCKED,
+            RunState.ENVIRONMENT_PREEMPTED,
+            RunState.REVIEW_DECISION_REQUIRED,
+            RunState.READY_TO_MERGE,
+            RunState.FAILED_TERMINAL,
+        }:
+            return
+        try:
+            self.notification_service.emit(
+                result.run_id,
+                outcome.state,
+                self._notification_reason(result.run_id, outcome.state, outcome.blocked_reason or outcome.action),
+                action=outcome.action,
+            )
+        except Exception:
+            pass
+
+    def _notification_reason(
+        self,
+        run_id: str,
+        state: RunState,
+        fallback: str,
+    ) -> str:
+        events = self.repository.list_events(run_id)
+        entering = next(
+            (event for event in reversed(events) if event.to_state is state),
+            None,
+        )
+        return entering.event_type if entering is not None else fallback
+    def _notify_waiting_runs(self) -> None:
+        try:
+            runs = self.repository.list_active_runs()
+        except Exception:
+            return
+        for run in runs:
+            if run.state not in MANUAL_INTERVENTION_STATES:
+                continue
+            try:
+                events = self.repository.list_events(run.run_id)
+                reason = self._notification_reason(
+                    run.run_id, run.state, run.state.value
+                )
+                self.notification_service.emit(
+                    run.run_id,
+                    run.state,
+                    reason,
+                    action="manual intervention required",
+                )
+            except Exception:
+                continue
     def _run_daily_retention(self, now: datetime) -> None:
         service = self.retention_service
         if service is None:
@@ -261,7 +326,7 @@ class Scheduler:
                 self._require_safe_auxiliary_file(temporary)
                 os.replace(temporary, self.retention_day_path)
                 self._require_safe_auxiliary_file(self.retention_day_path)
-        except (OSError, Timeout, ValueError):
+        except Exception:
             return
         finally:
             try:

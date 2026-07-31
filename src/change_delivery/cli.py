@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from filelock import FileLock, Timeout
 
+from change_delivery.artifacts import ArtifactStore
 from change_delivery.config import load_project_config, load_project_config_bytes
 from change_delivery.adapters.git import GitAdapter, GitError
 from change_delivery.adapters.github import GitHubAdapter
@@ -487,25 +488,19 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     contents = _stable_read(args.requirement_file, limit=MAX_REQUIREMENT_BYTES)
     contents.decode("utf-8")
     run_id = f"run-{uuid4().hex}"
-    run_root = _child(services.plugin_root, "runs", run_id)
-    run_root.mkdir(parents=True, exist_ok=False)
+    store = ArtifactStore(services.plugin_root)
+    repository = services.get_repository(create=True)
+    paths = store.create_run(run_id)
     try:
-        _atomic_write(run_root / "requirement.md", contents)
-        _atomic_write(
-            run_root / "design.md",
-            b"# Design\n\nPending explicit design approval.\n",
-        )
-        _atomic_write(
-            run_root / "implementation-plan.md",
-            b"# Implementation Plan\n\nPending explicit design approval.\n",
-        )
-        run = services.get_repository(create=True).create_run(
-            run_id,
-            project.project_id,
-            digest,
-        )
+        _atomic_write(paths.requirement, contents)
+        _atomic_write(paths.design, b"# Design\n\nPending explicit design approval.\n")
+        _atomic_write(paths.plan, b"# Implementation Plan\n\nPending explicit design approval.\n")
+        run = repository.create_run(run_id, project.project_id, digest)
     except BaseException:
-        # Files remain as audit evidence if DB creation became uncertain.
+        try:
+            repository.discard_unstarted_run(run_id)
+        finally:
+            store.discard_new_run(run_id)
         raise
     return {
         "ok": True,
@@ -608,7 +603,7 @@ def _prepare_approval_locked(
         raise CliUsageError("project configuration hash changed")
     artifacts = tuple(run_root / name for name in REQUIRED_ARTIFACT_NAMES)
     destination = run_root / "approval.json"
-    if destination.exists():
+    if destination.exists() and destination.stat().st_size > 0:
         contents = _stable_read(destination, limit=MAX_REQUIREMENT_BYTES)
         try:
             snapshot = ApprovalSnapshot.model_validate(json.loads(contents))

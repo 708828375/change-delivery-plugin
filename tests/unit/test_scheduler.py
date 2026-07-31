@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+from io import StringIO
 import os
 from pathlib import Path
 import threading
@@ -13,6 +14,7 @@ import pytest
 
 from change_delivery.database import Database
 from change_delivery.domain import RunState, StepOutcome
+from change_delivery.notifications import NotificationService
 from change_delivery.repository import RunRepository
 from change_delivery.scheduler import Scheduler
 
@@ -504,3 +506,73 @@ def test_process_timeout_cas_loss_reports_authoritative_terminal_state(
     assert result.current_state is RunState.CANCELLED
     assert fixture.repository.get_run("run-1").state is RunState.CANCELLED
     assert fixture.repository.list_evidence("run-1") == []
+
+def test_retention_exception_does_not_block_normal_tick(tmp_path: Path) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+
+    class FailingRetention:
+        def clean(self, *, now: datetime) -> None:
+            assert not fixture.scheduler.lock.is_locked
+            raise RuntimeError("maintenance failed")
+
+    fixture.scheduler.retention_service = FailingRetention()
+    result = fixture.scheduler.tick()
+    assert result.status == "processed"
+    assert fixture.orchestrator.calls == ["run-1"]
+
+def test_scheduler_notifies_only_changed_waiting_reason_with_full_payload(tmp_path: Path) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+    with fixture.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ?, pr_number = 42 WHERE run_id = ?",
+            (RunState.BLOCKED.value, "run-1"),
+        )
+        connection.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("event-a", "run-1", "MISSING_TOKEN", RunState.DRAFT.value, RunState.BLOCKED.value, "[]", NOW.isoformat()),
+        )
+    output = StringIO()
+    fixture.scheduler.notification_service = NotificationService(fixture.database, output=output)
+
+    fixture.scheduler.tick()
+    fixture.scheduler.tick()
+    with fixture.database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("event-b", "run-1", "MISSING_VERSION", RunState.BLOCKED.value, RunState.BLOCKED.value, "[]", NOW.isoformat()),
+        )
+    fixture.scheduler.tick()
+
+    payloads = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(payloads) == 2
+    assert payloads[-1] == {
+        "action": "manual intervention required",
+        "pr": "#42",
+        "project": "project",
+        "reason": "MISSING_VERSION",
+        "run": "run-1",
+        "status": "BLOCKED",
+    }
+
+def test_slow_retention_runs_after_main_tick_lock_is_released(tmp_path: Path) -> None:
+    fixture = make_scheduler(tmp_path)
+    fixture.repository.create_run("run-1", "project", "hash")
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowRetention:
+        def clean(self, *, now: datetime) -> None:
+            assert not fixture.scheduler.lock.is_locked
+            entered.set()
+            release.wait(timeout=5)
+
+    fixture.scheduler.retention_service = SlowRetention()
+    worker = threading.Thread(target=fixture.scheduler.tick)
+    worker.start()
+    assert entered.wait(timeout=2)
+    assert fixture.orchestrator.calls == ["run-1"]
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()

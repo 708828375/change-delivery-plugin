@@ -7,6 +7,7 @@ from pathlib import Path
 from io import StringIO
 import hashlib
 import json
+import os
 import sys
 
 import pytest
@@ -25,9 +26,11 @@ from change_delivery.domain import (
     RunState,
     StageResult,
 )
+from change_delivery.notifications import NotificationService
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessResult
 from change_delivery.repository import RunRepository
+from change_delivery.retention import RetentionService
 from change_delivery.runtime import (
     RuntimeAcceptancePort,
     RuntimeStageExecutor,
@@ -2060,7 +2063,10 @@ def test_cli_start_dry_run_creates_only_draft_artifacts(
     assert run.state is RunState.DRAFT
     assert {
         path.name for path in (fixture.root / "runs" / run.run_id).iterdir()
-    } == {"requirement.md", "design.md", "implementation-plan.md"}
+    } == {
+        "requirement.md", "design.md", "implementation-plan.md",
+        "approval.json", "evidence", "reports", "sanitized-summary.md",
+    }
 
 
 def test_cli_start_prepare_and_approve_lifecycle_is_hash_bound(
@@ -2707,3 +2713,75 @@ def test_cli_approve_rejects_path_escape(fixture: Fixture) -> None:
 
     assert result != 0
     assert fixture.repository.get_run(run_id).state is RunState.AWAITING_DESIGN_APPROVAL
+
+def test_cancel_survives_missing_or_changed_project_config(fixture: Fixture) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    orchestrator = fixture.orchestrator()
+    orchestrator.config_loader = lambda _project_id: (_ for _ in ()).throw(FileNotFoundError("gone"))
+    outcome = orchestrator.cancel(run_id)
+    assert outcome.state is RunState.CANCELLED
+    inventory = fixture.root / "runs" / run_id / "reports" / "resource-inventory.md"
+    assert "unavailable" in inventory.read_text(encoding="utf-8")
+
+
+def test_cli_start_failure_leaves_no_db_run_or_partial_tree(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = fixture.root / "failed-input.md"
+    requirement.write_text("requirement", encoding="utf-8")
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    monkeypatch.setattr(
+        fixture.repository,
+        "create_run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("db failed")),
+    )
+    result = main(
+        ["start", "--project", "test-project", "--requirement-file", str(requirement), "--json"],
+        services=services,
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+    assert result == 2
+    runs = fixture.root / "runs"
+    assert not runs.exists() or list(runs.iterdir()) == []
+    assert fixture.repository.list_active_runs() == []
+
+def test_real_cli_services_scheduler_wires_governance_services(fixture: Fixture) -> None:
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    scheduler = services.get_scheduler()
+    assert isinstance(scheduler.retention_service, RetentionService)
+    assert isinstance(scheduler.notification_service, NotificationService)
+
+def test_cancel_inventory_failure_does_not_block_cancellation(fixture: Fixture) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    orchestrator = fixture.orchestrator()
+    orchestrator.artifact_store.write_resource_inventory = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk unavailable"))
+    )
+    assert orchestrator.cancel(run_id).state is RunState.CANCELLED
+
+
+def test_real_cli_scheduler_reaches_daily_retention(fixture: Fixture) -> None:
+    run_id = fixture.create(RunState.COMPLETED)
+    raw = fixture.root / "runs" / run_id / "evidence" / "ci-raw-old.log"
+    raw.parent.mkdir(exist_ok=True)
+    raw.write_text("old", encoding="utf-8")
+    old = datetime(2026, 6, 1, tzinfo=UTC).timestamp()
+    os.utime(raw, (old, old))
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+    scheduler = services.get_scheduler()
+    scheduler.clock = lambda: datetime(2026, 7, 31, tzinfo=UTC)
+    assert scheduler.tick().status == "idle"
+    assert not raw.exists()

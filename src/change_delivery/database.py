@@ -72,6 +72,9 @@ MIGRATIONS = (
         notification_key TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES runs(run_id),
         payload_hash TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'PENDING',
+        delivery_token TEXT,
+        updated_at TEXT NOT NULL,
         created_at TEXT NOT NULL
     )
     """,
@@ -148,4 +151,27 @@ class Database:
                 connection.execute(
                     "ALTER TABLE scheduler_polls "
                     "ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+                )
+            notification_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(notifications)"
+                ).fetchall()
+            }
+            if "delivery_status" not in notification_columns:
+                connection.execute(
+                    "ALTER TABLE notifications ADD COLUMN delivery_status "
+                    "TEXT NOT NULL DEFAULT 'DELIVERED'"
+                )
+            if "delivery_token" not in notification_columns:
+                connection.execute(
+                    "ALTER TABLE notifications ADD COLUMN delivery_token TEXT"
+                )
+            if "updated_at" not in notification_columns:
+                connection.execute(
+                    "ALTER TABLE notifications ADD COLUMN updated_at TEXT"
+                )
+                connection.execute(
+                    "UPDATE notifications SET updated_at = created_at "
+                    "WHERE updated_at IS NULL"
                 )

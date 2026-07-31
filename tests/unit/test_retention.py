@@ -2,6 +2,8 @@ from datetime import UTC, datetime, timedelta
 import os
 from pathlib import Path
 
+import pytest
+
 from change_delivery.database import Database
 from change_delivery.domain import RunState
 from change_delivery.repository import RunRepository
@@ -81,3 +83,22 @@ def test_retention_is_idempotent(tmp_path: Path) -> None:
     old(run / "logs" / "cmd.stdout.log", 31)
     assert service.clean(now=NOW).deleted_raw_logs == 1
     assert service.clean(now=NOW).deleted_raw_logs == 0
+
+def test_retention_rejects_symlink_or_reparse_runtime_root(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    service, _ = fixture(tmp_path)
+    original = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == tmp_path or original(path),
+    )
+    with pytest.raises(ValueError, match="ancestry"):
+        service.clean(now=NOW)
+
+def test_retention_rejects_windows_reparse_runtime_root(tmp_path: Path, monkeypatch) -> None:
+    service, _ = fixture(tmp_path)
+    monkeypatch.setattr(service, "_is_reparse", lambda metadata: True)
+    with pytest.raises(ValueError, match="ancestry"):
+        service.clean(now=NOW)

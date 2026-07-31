@@ -73,6 +73,24 @@ class RunRepository:
         assert row is not None
         return RunRecord.model_validate(dict(row))
 
+    def discard_unstarted_run(self, run_id: str) -> None:
+        """Compensate only a pristine DRAFT row created by a failed start."""
+        with self.database.transaction() as connection:
+            dependent = sum(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+                for table in (
+                    "events", "approvals", "approved_artifacts", "evidence",
+                    "remote_operations", "notifications", "scheduler_polls",
+                )
+            )
+            if dependent:
+                raise ValueError("refusing to discard a run with audit records")
+            connection.execute(
+                "DELETE FROM runs WHERE run_id = ? AND state = ?",
+                (run_id, RunState.DRAFT.value),
+            )
     def get_run(self, run_id: str) -> RunRecord:
         with self.database.connection() as connection:
             row = connection.execute(

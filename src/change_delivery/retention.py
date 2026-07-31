@@ -53,7 +53,7 @@ class RetentionService:
         if current.tzinfo is None:
             raise ValueError("retention clock must be timezone-aware")
         current = current.astimezone(UTC)
-        root = self.runtime_root.resolve(strict=True)
+        root = self._validated_runtime_root()
         deleted_raw = 0
         deleted_reports = 0
         unknown: list[str] = []
@@ -98,6 +98,21 @@ class RetentionService:
             skipped_unsafe=tuple(sorted(set(unsafe))),
         )
 
+    def _validated_runtime_root(self) -> Path:
+        current = self.runtime_root
+        chain = (current, *current.parents)
+        for path in chain:
+            metadata = path.lstat()
+            if (
+                path.is_symlink()
+                or self._is_reparse(metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise ValueError("runtime root ancestry is unsafe")
+        resolved = current.resolve(strict=True)
+        if resolved != current:
+            raise ValueError("runtime root identity changed during validation")
+        return resolved
     def _safe_directory(self, directory: Path, root: Path) -> bool:
         try:
             metadata = directory.lstat()
@@ -196,12 +211,11 @@ class RetentionService:
                 or self._is_reparse(before)
                 or not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
-                or path.resolve(strict=True).parent not in {
-                    run_dir.resolve(strict=True),
-                    (run_dir / "logs").resolve(strict=True),
-                    (run_dir / "evidence").resolve(strict=True),
-                    (run_dir / "reports").resolve(strict=True),
-                }
+                or path.resolve(strict=True).parent != path.parent.resolve(strict=True)
+                or (
+                    path.parent != run_dir
+                    and path.parent.name not in {"logs", "evidence", "reports"}
+                )
             ):
                 return False
             descriptor = os.open(
