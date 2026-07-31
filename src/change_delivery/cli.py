@@ -47,6 +47,7 @@ from change_delivery.runtime import (
     RuntimeTestEnvironmentPort,
 )
 from change_delivery.scheduler import Scheduler
+from change_delivery.release import ReleaseService
 
 
 MAX_REQUIREMENT_BYTES = 1_048_576
@@ -235,6 +236,7 @@ class CliServices:
     orchestrator: Any | None = None
     scheduler: Any | None = None
     base_sha_provider: Callable[[Any], str] | None = None
+    release_service: Any | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = self.plugin_root.resolve(strict=False)
@@ -304,6 +306,15 @@ class CliServices:
                 orchestrator=self.get_orchestrator(),
             )
         return self.scheduler
+
+    def get_release_service(self) -> Any:
+        if self.release_service is None:
+            self.release_service = ReleaseService(
+                repository=self.get_repository(),
+                config_loader=self.load_project,
+                github_factory=_github_port,
+            )
+        return self.release_service
 
 
 def _default_services() -> CliServices:
@@ -810,7 +821,8 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         result = services.get_scheduler().tick()
         return {"ok": True, **result.model_dump(mode="json")}
     if args.command == "release":
-        raise CliUsageError("正式发布尚未启用/Task14")
+        report = services.get_release_service().preflight(args.run_id)
+        return {"ok": True, **report.model_dump(mode="json")}
     raise CliUsageError("unknown command")
 
 

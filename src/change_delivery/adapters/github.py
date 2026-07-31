@@ -21,6 +21,7 @@ _REPOSITORY = re.compile(
 _THREAD_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{2,255}={0,2}$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _GH_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
+_MERGED_PR_FIELDS = "number,state,headRefOid,mergeCommit,statusCheckRollup"
 _PR_FIELDS = "number,url,baseRefName,headRefName,isDraft,headRefOid"
 _SNAPSHOT_FIELDS = (
     "headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft"
@@ -173,6 +174,25 @@ class CheckSnapshot(FrozenModel):
             and self.checks_passed
             and self.threads_resolved
         )
+
+
+class MergedPullRequestSnapshot(FrozenModel):
+    """Authoritative, read-only facts needed by production release preflight."""
+
+    number: int = Field(gt=0, strict=True)
+    state: Literal["OPEN", "CLOSED", "MERGED"]
+    head_sha: str = Field(pattern=r"^[0-9a-f]{40}$", strict=True)
+    merge_commit_sha: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{40}$",
+        strict=True,
+    )
+    checks_status: Literal["passed", "pending", "failed"]
+
+    @field_validator("head_sha", "merge_commit_sha")
+    @classmethod
+    def normalize_sha(cls, value: str | None) -> str | None:
+        return value.lower() if value is not None else None
 
 
 def _validate_branch(branch: str) -> None:
@@ -372,6 +392,19 @@ class GitHubAdapter:
                 "pull request gate evidence changed",
             )
         return self.parse_snapshot(second_payload, second_threads)
+
+    def merged_snapshot(self, pr_number: int) -> MergedPullRequestSnapshot:
+        """Return stable merge/check facts without mutating the pull request."""
+
+        _validate_number(pr_number)
+        first = self._merged_snapshot_sample(pr_number)
+        second = self._merged_snapshot_sample(pr_number)
+        if first != second:
+            raise SnapshotChanged(
+                "merged_snapshot",
+                "pull request release facts changed",
+            )
+        return second
 
     def parse_snapshot(
         self,
@@ -688,6 +721,83 @@ class GitHubAdapter:
         if result.exit_code != 0:
             raise GitHubError("snapshot")
         return _json_object(result, "snapshot")
+
+    def _merged_snapshot_sample(
+        self,
+        pr_number: int,
+    ) -> MergedPullRequestSnapshot:
+        try:
+            result = self._execute(
+                (
+                    "pr",
+                    "view",
+                    str(pr_number),
+                    "--repo",
+                    self._repository,
+                    "--json",
+                    _MERGED_PR_FIELDS,
+                )
+            )
+        except ProcessTimeoutError:
+            raise GitHubError(
+                "merged_snapshot",
+                "pull request release facts are unknown",
+            ) from None
+        if result.exit_code != 0:
+            raise GitHubError("merged_snapshot")
+        payload = _json_object(result, "merged_snapshot")
+        _exact_keys(
+            payload,
+            {
+                "number",
+                "state",
+                "headRefOid",
+                "mergeCommit",
+                "statusCheckRollup",
+            },
+            "merged_snapshot",
+        )
+        number = payload["number"]
+        if number != pr_number:
+            raise GitHubError(
+                "merged_snapshot",
+                "pull request identity did not match",
+            )
+        state = payload["state"]
+        if state not in {"OPEN", "CLOSED", "MERGED"}:
+            raise GitHubError("merged_snapshot", "pull request state was invalid")
+        merge_commit = payload["mergeCommit"]
+        if merge_commit is None:
+            merge_commit_sha = None
+        elif isinstance(merge_commit, dict) and set(merge_commit) == {"oid"}:
+            merge_commit_sha = merge_commit["oid"]
+            if (
+                not isinstance(merge_commit_sha, str)
+                or not _SHA.fullmatch(merge_commit_sha)
+            ):
+                raise GitHubError(
+                    "merged_snapshot",
+                    "merge commit SHA was invalid",
+                )
+            merge_commit_sha = merge_commit_sha.lower()
+        else:
+            raise GitHubError(
+                "merged_snapshot",
+                "merge commit response was invalid",
+            )
+        try:
+            return MergedPullRequestSnapshot(
+                number=number,
+                state=state,
+                head_sha=self._payload_sha(payload, "merged_snapshot"),
+                merge_commit_sha=merge_commit_sha,
+                checks_status=self._checks_status(payload["statusCheckRollup"]),
+            )
+        except (ValidationError, ValueError, TypeError):
+            raise GitHubError(
+                "merged_snapshot",
+                "pull request release facts were invalid",
+            ) from None
 
     @staticmethod
     def _payload_sha(payload: Mapping[str, Any], operation: str) -> str:

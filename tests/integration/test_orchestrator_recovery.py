@@ -1200,7 +1200,7 @@ def test_cli_release_is_disabled_and_has_no_side_effect(tmp_path: Path) -> None:
     )
 
     assert result != 0
-    assert "Task14" in json.loads(stderr.getvalue())["error"]
+    assert "runtime database" in json.loads(stderr.getvalue())["error"]
     assert tuple(tmp_path.iterdir()) == before
 
 

@@ -943,3 +943,87 @@ def test_json_and_process_errors_do_not_leak_tokens(tmp_path: Path) -> None:
     assert secret not in str(caught.value)
     assert secret not in repr(caught.value)
     assert secret not in repr(caught.value.__dict__)
+
+
+def merged_payload(
+    *,
+    sha: str = SHA,
+    merge_sha: str | None = OTHER_SHA,
+    state: str = "MERGED",
+    check_status: str = "COMPLETED",
+    conclusion: str | None = "SUCCESS",
+) -> dict[str, object]:
+    return {
+        "number": 152,
+        "state": state,
+        "headRefOid": sha,
+        "mergeCommit": None if merge_sha is None else {"oid": merge_sha},
+        "statusCheckRollup": [
+            {
+                "__typename": "CheckRun",
+                "name": "required/test",
+                "status": check_status,
+                "conclusion": conclusion,
+            }
+        ],
+    }
+
+
+def test_merged_snapshot_is_a_stable_pure_query(tmp_path: Path) -> None:
+    payload = merged_payload()
+    runner = FakeRunner(result(payload), result(payload))
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    snapshot = adapter.merged_snapshot(152)
+
+    assert snapshot.number == 152
+    assert snapshot.state == "MERGED"
+    assert snapshot.head_sha == SHA
+    assert snapshot.merge_commit_sha == OTHER_SHA
+    assert snapshot.checks_status == "passed"
+    assert [command.args for command in runner.commands] == [
+        (
+            "pr",
+            "view",
+            "152",
+            "--repo",
+            REPOSITORY,
+            "--json",
+            "number,state,headRefOid,mergeCommit,statusCheckRollup",
+        ),
+        (
+            "pr",
+            "view",
+            "152",
+            "--repo",
+            REPOSITORY,
+            "--json",
+            "number,state,headRefOid,mergeCommit,statusCheckRollup",
+        ),
+    ]
+
+
+def test_merged_snapshot_rejects_a_changed_second_sample(tmp_path: Path) -> None:
+    runner = FakeRunner(
+        result(merged_payload()),
+        result(
+            merged_payload(
+                check_status="IN_PROGRESS",
+                conclusion=None,
+            )
+        ),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    with pytest.raises(SnapshotChanged, match="release facts changed"):
+        adapter.merged_snapshot(152)
+
+
+def test_merged_snapshot_fails_closed_on_missing_field(tmp_path: Path) -> None:
+    payload = merged_payload()
+    del payload["mergeCommit"]
+    runner = FakeRunner(result(payload))
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    with pytest.raises(GitHubError, match="fields did not match"):
+        adapter.merged_snapshot(152)
