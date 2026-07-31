@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 import json
+import hashlib
 from pathlib import Path
 from datetime import UTC, datetime, timedelta
 
@@ -32,8 +33,8 @@ def test_notification_is_atomic_and_emitted_only_when_payload_changes(tmp_path: 
         assert connection.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 2
     rendered = [json.loads(line) for line in output.getvalue().splitlines()]
     assert rendered[-1] == {
-        "action": "inspect", "pr": "none", "project": "project",
-        "reason": "changed", "run": "CD-1", "status": "DRAFT",
+        "action": "inspect", "pr": None, "project": "project",
+        "message": "changed", "run": "CD-1", "state": "DRAFT",
     }
 
 
@@ -85,7 +86,11 @@ def test_notification_rejects_log_injection_and_redacts_secrets(tmp_path: Path) 
 def test_stale_pending_claim_is_recovered_after_process_crash(tmp_path: Path) -> None:
     service, database, output = make_service(tmp_path)
     canonical = json.dumps(
-        {"message": "waiting", "run_id": "CD-1", "state": "DRAFT"},
+        {
+            "action": "inspect run status", "message": "waiting",
+            "pr": None, "project": "project", "run": "CD-1",
+            "state": "DRAFT",
+        },
         ensure_ascii=False, separators=(",", ":"), sort_keys=True,
     )
     import hashlib
@@ -98,3 +103,63 @@ def test_stale_pending_claim_is_recovered_after_process_crash(tmp_path: Path) ->
         )
     assert service.emit("CD-1", RunState.DRAFT, "waiting").emitted
     assert len(output.getvalue().splitlines()) == 1
+
+def test_every_canonical_output_field_participates_in_hash(tmp_path: Path) -> None:
+    service, database, _ = make_service(tmp_path)
+    first = service.emit("CD-1", RunState.DRAFT, "same", action="one")
+    action_changed = service.emit("CD-1", RunState.DRAFT, "same", action="two")
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET project_id = ?, pr_number = ? WHERE run_id = ?",
+            ("project-two", 42, "CD-1"),
+        )
+    identity_changed = service.emit("CD-1", RunState.DRAFT, "same", action="two")
+    assert len({first.notification_key, action_changed.notification_key, identity_changed.notification_key}) == 3
+    assert hashlib.sha256(first.text.encode("utf-8")).hexdigest() == first.notification_key
+
+
+def test_equal_redacted_output_deduplicates_even_when_secret_differs(tmp_path: Path) -> None:
+    service, _, output = make_service(tmp_path)
+    service.secrets = {"first": "alpha-secret", "second": "beta-secret"}
+    first = service.emit("CD-1", RunState.DRAFT, "token alpha-secret")
+    second = service.emit("CD-1", RunState.DRAFT, "token beta-secret")
+    assert first.notification_key == second.notification_key
+    assert first.emitted and not second.emitted
+    assert len(output.getvalue().splitlines()) == 1
+
+
+def test_closed_stream_releases_claim_for_immediate_retry(tmp_path: Path) -> None:
+    service, database, _ = make_service(tmp_path)
+    closed = StringIO()
+    closed.close()
+    service.output = closed
+    with pytest.raises(ValueError):
+        service.emit("CD-1", RunState.DRAFT, "closed")
+    with database.connection() as connection:
+        row = connection.execute(
+            "SELECT delivery_status, delivery_token FROM notifications"
+        ).fetchone()
+        assert tuple(row) == ("PENDING", None)
+    service.output = StringIO()
+    assert service.emit("CD-1", RunState.DRAFT, "closed").emitted
+
+
+def test_release_failure_does_not_mask_original_output_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    class FatalOutput:
+        def write(self, value: str) -> int:
+            raise KeyboardInterrupt("original")
+        def flush(self) -> None:
+            return None
+
+    service.output = FatalOutput()
+    monkeypatch.setattr(
+        service,
+        "_release",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("release failed")),
+    )
+    with pytest.raises(KeyboardInterrupt, match="original"):
+        service.emit("CD-1", RunState.DRAFT, "fatal")

@@ -41,6 +41,7 @@ def test_cancel_inventory_lists_resources_without_deleting(tmp_path: Path) -> No
         branch="feature/CD-1",
         worktree=resource,
         pr_url="https://github.com/example/repo/pull/1",
+        pr_number=1,
         test_sha="a" * 40,
     )
 
@@ -48,6 +49,7 @@ def test_cancel_inventory_lists_resources_without_deleting(tmp_path: Path) -> No
     text = summary.read_text(encoding="utf-8")
     assert "feature/CD-1" in text
     assert str(resource) in text
+    assert "#1" in text
     assert summary == paths.reports_dir / "resource-inventory.md"
 
 

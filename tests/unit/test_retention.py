@@ -23,7 +23,9 @@ def fixture(tmp_path: Path, *, pinned: bool = False):
     run = tmp_path / "runs" / "CD-1"
     for directory in (run / "logs", run / "evidence", run / "reports"):
         directory.mkdir(parents=True, exist_ok=True)
-    service = RetentionService(tmp_path, repository, pinned_run_ids={"CD-1"} if pinned else set())
+    if pinned:
+        repository.set_pinned("CD-1", pinned=True)
+    service = RetentionService(tmp_path, repository)
     return service, run
 
 
@@ -99,6 +101,8 @@ def test_retention_rejects_symlink_or_reparse_runtime_root(
 
 def test_retention_rejects_windows_reparse_runtime_root(tmp_path: Path, monkeypatch) -> None:
     service, _ = fixture(tmp_path)
-    monkeypatch.setattr(service, "_is_reparse", lambda metadata: True)
+    monkeypatch.setattr(
+        "change_delivery.artifacts._path_is_reparse", lambda path: True
+    )
     with pytest.raises(ValueError, match="ancestry"):
         service.clean(now=NOW)

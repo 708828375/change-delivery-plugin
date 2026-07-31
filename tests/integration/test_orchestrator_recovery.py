@@ -2716,12 +2716,18 @@ def test_cli_approve_rejects_path_escape(fixture: Fixture) -> None:
 
 def test_cancel_survives_missing_or_changed_project_config(fixture: Fixture) -> None:
     run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
     orchestrator = fixture.orchestrator()
     orchestrator.config_loader = lambda _project_id: (_ for _ in ()).throw(FileNotFoundError("gone"))
     outcome = orchestrator.cancel(run_id)
     assert outcome.state is RunState.CANCELLED
     inventory = fixture.root / "runs" / run_id / "reports" / "resource-inventory.md"
-    assert "unavailable" in inventory.read_text(encoding="utf-8")
+    text = inventory.read_text(encoding="utf-8")
+    assert "unavailable" in text
+    assert "#42" in text
 
 
 def test_cli_start_failure_leaves_no_db_run_or_partial_tree(
@@ -2785,3 +2791,42 @@ def test_real_cli_scheduler_reaches_daily_retention(fixture: Fixture) -> None:
     scheduler.clock = lambda: datetime(2026, 7, 31, tzinfo=UTC)
     assert scheduler.tick().status == "idle"
     assert not raw.exists()
+
+def test_cli_pin_persists_across_restart_and_controls_retention(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.COMPLETED)
+    summary = fixture.root / "runs" / run_id / "sanitized-summary.md"
+    summary.write_text("safe", encoding="utf-8")
+    expired = datetime(2025, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(summary, (expired, expired))
+    services = CliServices(plugin_root=fixture.root, repository=fixture.repository)
+
+    assert main(
+        ["pin", run_id, "--json"], services=services,
+        stdout=StringIO(), stderr=StringIO(),
+    ) == 0
+    restarted_database = Database(fixture.root / "state.sqlite3")
+    restarted_database.migrate()
+    restarted_repository = RunRepository(restarted_database)
+    assert restarted_repository.get_run(run_id).pinned is True
+    RetentionService(fixture.root, restarted_repository).clean(
+        now=datetime(2026, 7, 31, tzinfo=UTC)
+    )
+    assert summary.exists()
+
+    restarted_services = CliServices(
+        plugin_root=fixture.root, repository=restarted_repository
+    )
+    assert main(
+        ["pin", run_id, "--off", "--json"], services=restarted_services,
+        stdout=StringIO(), stderr=StringIO(),
+    ) == 0
+    final_database = Database(fixture.root / "state.sqlite3")
+    final_database.migrate()
+    final_repository = RunRepository(final_database)
+    assert final_repository.get_run(run_id).pinned is False
+    RetentionService(fixture.root, final_repository).clean(
+        now=datetime(2026, 7, 31, tzinfo=UTC)
+    )
+    assert not summary.exists()

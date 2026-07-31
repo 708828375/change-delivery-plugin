@@ -98,11 +98,11 @@ def test_scheduler_does_not_invoke_orchestrator_without_active_runs(
 
 
 def test_scheduler_runs_retention_only_once_per_utc_day(tmp_path: Path) -> None:
-    calls: list[datetime] = []
+    calls: list[tuple[datetime, bool]] = []
 
     class FakeRetention:
         def clean(self, *, now: datetime) -> None:
-            calls.append(now)
+            calls.append((now, fixture.scheduler.lock.is_locked))
 
     fixture = make_scheduler(tmp_path)
     fixture.scheduler.retention_service = FakeRetention()
@@ -110,7 +110,7 @@ def test_scheduler_runs_retention_only_once_per_utc_day(tmp_path: Path) -> None:
     fixture.scheduler.tick()
     fixture.scheduler.tick()
 
-    assert calls == [NOW]
+    assert calls == [(NOW, False)]
     assert (tmp_path / "retention-day").read_text(encoding="ascii") == "2026-07-29"
 
 
@@ -511,15 +511,18 @@ def test_retention_exception_does_not_block_normal_tick(tmp_path: Path) -> None:
     fixture = make_scheduler(tmp_path)
     fixture.repository.create_run("run-1", "project", "hash")
 
+    lock_states: list[bool] = []
+
     class FailingRetention:
         def clean(self, *, now: datetime) -> None:
-            assert not fixture.scheduler.lock.is_locked
+            lock_states.append(fixture.scheduler.lock.is_locked)
             raise RuntimeError("maintenance failed")
 
     fixture.scheduler.retention_service = FailingRetention()
     result = fixture.scheduler.tick()
     assert result.status == "processed"
     assert fixture.orchestrator.calls == ["run-1"]
+    assert lock_states == [False]
 
 def test_scheduler_notifies_only_changed_waiting_reason_with_full_payload(tmp_path: Path) -> None:
     fixture = make_scheduler(tmp_path)
@@ -548,12 +551,12 @@ def test_scheduler_notifies_only_changed_waiting_reason_with_full_payload(tmp_pa
     payloads = [json.loads(line) for line in output.getvalue().splitlines()]
     assert len(payloads) == 2
     assert payloads[-1] == {
-        "action": "manual intervention required",
-        "pr": "#42",
+        "action": "resolve blocker",
+        "pr": 42,
         "project": "project",
-        "reason": "MISSING_VERSION",
+        "message": "MISSING_VERSION",
         "run": "run-1",
-        "status": "BLOCKED",
+        "state": "BLOCKED",
     }
 
 def test_slow_retention_runs_after_main_tick_lock_is_released(tmp_path: Path) -> None:
@@ -561,10 +564,11 @@ def test_slow_retention_runs_after_main_tick_lock_is_released(tmp_path: Path) ->
     fixture.repository.create_run("run-1", "project", "hash")
     entered = threading.Event()
     release = threading.Event()
+    lock_states: list[bool] = []
 
     class SlowRetention:
         def clean(self, *, now: datetime) -> None:
-            assert not fixture.scheduler.lock.is_locked
+            lock_states.append(fixture.scheduler.lock.is_locked)
             entered.set()
             release.wait(timeout=5)
 
@@ -576,3 +580,43 @@ def test_slow_retention_runs_after_main_tick_lock_is_released(tmp_path: Path) ->
     release.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
+    assert lock_states == [False]
+
+def test_restart_scan_notifies_exactly_all_six_recovery_states_without_progression(
+    tmp_path: Path,
+) -> None:
+    fixture = make_scheduler(tmp_path)
+    states = (
+        RunState.AWAITING_DESIGN_APPROVAL,
+        RunState.BLOCKED,
+        RunState.ENVIRONMENT_PREEMPTED,
+        RunState.REVIEW_DECISION_REQUIRED,
+        RunState.READY_TO_MERGE,
+        RunState.FAILED_TERMINAL,
+    )
+    for index, state in enumerate(states):
+        run_id = f"recovery-{index}"
+        fixture.repository.create_run(run_id, "project", "hash")
+        with fixture.database.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state = ? WHERE run_id = ?",
+                (state.value, run_id),
+            )
+    output = StringIO()
+    fixture.scheduler.notification_service = NotificationService(
+        fixture.database, output=output
+    )
+
+    fixture.scheduler.tick()
+    fixture.scheduler.tick()
+
+    payloads = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert len(payloads) == 6
+    assert {payload["state"] for payload in payloads} == {
+        state.value for state in states
+    }
+    assert all(
+        set(payload) == {"run", "state", "message", "action", "project", "pr"}
+        for payload in payloads
+    )
+    assert fixture.orchestrator.calls == []

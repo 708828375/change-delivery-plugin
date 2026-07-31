@@ -1460,6 +1460,7 @@ class Orchestrator:
                 branch=self._feature_branch(run),
                 worktree=self.plugin_root / "worktrees" / run_id,
                 pr_url="unavailable",
+                pr_number=run.pr_number,
                 test_sha=run.head_sha,
             )
         except (OSError, ValueError):

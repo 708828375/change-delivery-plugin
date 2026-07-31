@@ -9,6 +9,7 @@ from typing import Literal, Protocol
 
 from filelock import FileLock, Timeout
 
+from change_delivery.artifacts import validate_runtime_root
 from change_delivery.domain import FrozenModel, RunState, StepOutcome
 from change_delivery.notifications import NotificationService
 from change_delivery.repository import RunRepository, TERMINAL_STATES
@@ -22,6 +23,7 @@ _STOP_AFTER = timedelta(hours=72)
 _INTERVENTION_STATES = {
     RunState.BLOCKED,
     RunState.REVIEW_DECISION_REQUIRED,
+    RunState.ENVIRONMENT_PREEMPTED,
 }
 MANUAL_INTERVENTION_STATES = frozenset(
     {*_INTERVENTION_STATES, RunState.AWAITING_DESIGN_APPROVAL}
@@ -72,7 +74,9 @@ class Scheduler:
     ) -> None:
         # ``absolute`` preserves the lexical final component so validation can
         # still detect a symlink or Windows reparse point at runtime_root.
-        self.runtime_root = runtime_root.absolute()
+        self.runtime_root = validate_runtime_root(
+            runtime_root, require_exists=True
+        )
         self.retention_service = retention_service or RetentionService(self.runtime_root, repository)
         self.notification_service = notification_service or NotificationService(repository.database)
         self.retention_lock_path = self.runtime_root / "retention.lock"
@@ -101,7 +105,7 @@ class Scheduler:
         except Timeout:
             return SchedulerResult(status="already_running", processed=0)
         self._notify_result(result)
-        self._notify_waiting_runs()
+        self._notify_required_runs()
         try:
             now = self.clock()
             if now.tzinfo is not None:
@@ -114,7 +118,6 @@ class Scheduler:
         if now.tzinfo is None:
             raise ValueError("scheduler clock must return a timezone-aware value")
         now = now.astimezone(UTC)
-        self._run_daily_retention(now)
         runs = self.repository.list_active_runs()
         if not runs:
             return SchedulerResult(status="idle", processed=0)
@@ -259,7 +262,7 @@ class Scheduler:
                 result.run_id,
                 outcome.state,
                 self._notification_reason(result.run_id, outcome.state, outcome.blocked_reason or outcome.action),
-                action=outcome.action,
+                action=self._notification_action(outcome.state),
             )
         except Exception:
             pass
@@ -276,16 +279,24 @@ class Scheduler:
             None,
         )
         return entering.event_type if entering is not None else fallback
-    def _notify_waiting_runs(self) -> None:
+    @staticmethod
+    def _notification_action(state: RunState) -> str:
+        return {
+            RunState.AWAITING_DESIGN_APPROVAL: "approve design",
+            RunState.BLOCKED: "resolve blocker",
+            RunState.ENVIRONMENT_PREEMPTED: "restore test environment",
+            RunState.REVIEW_DECISION_REQUIRED: "decide review finding",
+            RunState.READY_TO_MERGE: "merge pull request",
+            RunState.FAILED_TERMINAL: "inspect terminal failure",
+        }[state]
+
+    def _notify_required_runs(self) -> None:
         try:
-            runs = self.repository.list_active_runs()
+            runs = self.repository.list_notification_runs()
         except Exception:
             return
         for run in runs:
-            if run.state not in MANUAL_INTERVENTION_STATES:
-                continue
             try:
-                events = self.repository.list_events(run.run_id)
                 reason = self._notification_reason(
                     run.run_id, run.state, run.state.value
                 )
@@ -293,7 +304,7 @@ class Scheduler:
                     run.run_id,
                     run.state,
                     reason,
-                    action="manual intervention required",
+                    action=self._notification_action(run.state),
                 )
             except Exception:
                 continue
@@ -355,6 +366,8 @@ class Scheduler:
 
     def _validate_lock_boundary(self, *, require_lock: bool = False) -> None:
         root = self.runtime_root
+        if validate_runtime_root(root, require_exists=True) != root:
+            raise ValueError("runtime root identity changed")
         metadata = root.lstat()
         if (
             root.is_symlink()

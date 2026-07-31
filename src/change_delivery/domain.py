@@ -399,6 +399,7 @@ class RunRecord(FrozenModel):
     state: RunState
     head_sha: str | None = None
     pr_number: int | None = None
+    pinned: bool = False
     created_at: datetime
     updated_at: datetime
 

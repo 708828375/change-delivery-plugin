@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 
+from change_delivery.artifacts import validate_runtime_root
 from change_delivery.repository import RunRepository, TERMINAL_STATES
 
 
@@ -34,12 +35,11 @@ class RetentionService:
         self,
         runtime_root: Path,
         repository: RunRepository,
-        *,
-        pinned_run_ids: set[str] | frozenset[str] = frozenset(),
     ) -> None:
-        self.runtime_root = runtime_root.absolute()
+        self.runtime_root = validate_runtime_root(
+            runtime_root, require_exists=True
+        )
         self.repository = repository
-        self.pinned_run_ids = frozenset(pinned_run_ids)
 
     @staticmethod
     def _is_reparse(metadata: os.stat_result) -> bool:
@@ -60,7 +60,7 @@ class RetentionService:
         unsafe: list[str] = []
         with self.repository.database.connection() as connection:
             rows = connection.execute(
-                "SELECT run_id, state FROM runs ORDER BY run_id"
+                "SELECT run_id, state, pinned FROM runs ORDER BY run_id"
             ).fetchall()
         terminal_values = {state.value for state in TERMINAL_STATES}
         for row in rows:
@@ -77,7 +77,7 @@ class RetentionService:
                 if (
                     category == "report"
                     and path.name == "sanitized-summary.md"
-                    and row["run_id"] in self.pinned_run_ids
+                    and bool(row["pinned"])
                 ):
                     continue
                 age = self._age(path, current, run_dir, unsafe)
@@ -99,16 +99,9 @@ class RetentionService:
         )
 
     def _validated_runtime_root(self) -> Path:
-        current = self.runtime_root
-        chain = (current, *current.parents)
-        for path in chain:
-            metadata = path.lstat()
-            if (
-                path.is_symlink()
-                or self._is_reparse(metadata)
-                or not stat.S_ISDIR(metadata.st_mode)
-            ):
-                raise ValueError("runtime root ancestry is unsafe")
+        current = validate_runtime_root(
+            self.runtime_root, require_exists=True
+        )
         resolved = current.resolve(strict=True)
         if resolved != current:
             raise ValueError("runtime root identity changed during validation")

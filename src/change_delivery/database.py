@@ -15,6 +15,7 @@ MIGRATIONS = (
         state TEXT NOT NULL,
         head_sha TEXT,
         pr_number INTEGER,
+        pinned INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
@@ -133,6 +134,14 @@ class Database:
         with self.transaction() as connection:
             for statement in MIGRATIONS:
                 connection.execute(statement)
+            run_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+            }
+            if "pinned" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
             scheduler_columns = {
                 row["name"]
                 for row in connection.execute(

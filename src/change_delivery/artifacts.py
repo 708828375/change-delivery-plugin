@@ -19,6 +19,38 @@ _FILES = (
 _DIRECTORIES = ("evidence", "reports")
 
 
+def _path_is_reparse(path: Path) -> bool:
+    metadata = path.lstat()
+    return bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def validate_runtime_root(
+    runtime_root: Path,
+    *,
+    require_exists: bool,
+) -> Path:
+    """Validate lexical root identity and every existing ancestor."""
+
+    lexical = runtime_root.absolute()
+    for candidate in (lexical, *lexical.parents):
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            candidate.is_symlink()
+            or _path_is_reparse(candidate)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise ValueError("runtime root ancestry contains a link, reparse point, or non-directory")
+    if require_exists and not lexical.exists():
+        raise FileNotFoundError(lexical)
+    return lexical
+
+
 @dataclass(frozen=True)
 class RunArtifacts:
     run_dir: Path
@@ -35,7 +67,7 @@ class ArtifactStore:
     """Owns the small, fixed filesystem surface of a delivery run."""
 
     def __init__(self, runtime_root: Path) -> None:
-        self.runtime_root = runtime_root.absolute()
+        self.runtime_root = validate_runtime_root(runtime_root, require_exists=False)
 
     @staticmethod
     def _is_reparse(path: Path) -> bool:
@@ -58,7 +90,9 @@ class ArtifactStore:
         return path.resolve(strict=True)
 
     def _root(self) -> Path:
+        validate_runtime_root(self.runtime_root, require_exists=False)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
+        validate_runtime_root(self.runtime_root, require_exists=True)
         return self._require_directory(self.runtime_root)
 
     def _run_dir(self, run_id: str, *, create: bool = False) -> Path:
@@ -156,6 +190,7 @@ class ArtifactStore:
         worktree: Path | None,
         pr_url: str | None,
         test_sha: str | None,
+        pr_number: int | None = None,
     ) -> Path:
         paths = self.paths(run_id)
         self._require_directory(paths.reports_dir, create=True)
@@ -167,6 +202,7 @@ class ArtifactStore:
             ("Branch", branch or "none"),
             ("Worktree", str(worktree) if worktree is not None else "none"),
             ("PR", pr_url or "none"),
+            ("PR number", f"#{pr_number}" if pr_number is not None else "none"),
             ("Test SHA", test_sha or "none"),
         )
         content = "# Preserved resources\n\n" + "\n".join(

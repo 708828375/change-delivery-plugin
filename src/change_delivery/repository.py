@@ -91,6 +91,39 @@ class RunRepository:
                 "DELETE FROM runs WHERE run_id = ? AND state = ?",
                 (run_id, RunState.DRAFT.value),
             )
+    def set_pinned(self, run_id: str, *, pinned: bool) -> RunRecord:
+        if type(pinned) is not bool:
+            raise TypeError("pinned must be a bool")
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET pinned = ?, updated_at = updated_at WHERE run_id = ?",
+                (int(pinned), run_id),
+            )
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise KeyError(run_id)
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        assert row is not None
+        return RunRecord.model_validate(dict(row))
+
+    def list_notification_runs(self) -> list[RunRecord]:
+        states = (
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.BLOCKED,
+            RunState.ENVIRONMENT_PREEMPTED,
+            RunState.REVIEW_DECISION_REQUIRED,
+            RunState.READY_TO_MERGE,
+            RunState.FAILED_TERMINAL,
+        )
+        placeholders = ", ".join("?" for _ in states)
+        with self.database.connection() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM runs WHERE state IN ({placeholders}) "
+                "ORDER BY created_at, run_id",
+                tuple(state.value for state in states),
+            ).fetchall()
+        return [RunRecord.model_validate(dict(row)) for row in rows]
     def get_run(self, run_id: str) -> RunRecord:
         with self.database.connection() as connection:
             row = connection.execute(

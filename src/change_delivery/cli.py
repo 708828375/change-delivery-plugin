@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from filelock import FileLock, Timeout
 
-from change_delivery.artifacts import ArtifactStore
+from change_delivery.artifacts import ArtifactStore, validate_runtime_root
 from change_delivery.config import load_project_config, load_project_config_bytes
 from change_delivery.adapters.git import GitAdapter, GitError
 from change_delivery.adapters.github import GitHubAdapter
@@ -240,7 +240,9 @@ class CliServices:
     release_service: Any | None = None
 
     def __post_init__(self) -> None:
-        self.plugin_root = self.plugin_root.resolve(strict=False)
+        self.plugin_root = validate_runtime_root(
+            self.plugin_root, require_exists=False
+        )
         if self.registration_verifier is None:
             self.registration_verifier = LocalRegistrationVerifier()
         if self.base_sha_provider is None:
@@ -474,6 +476,9 @@ def _parser() -> JsonArgumentParser:
     resume.add_argument("run_id")
     cancel = command("cancel")
     cancel.add_argument("run_id")
+    pin = command("pin")
+    pin.add_argument("run_id")
+    pin.add_argument("--off", action="store_true")
     doctor = command("doctor")
     doctor.add_argument("--project")
     tick = command("tick")
@@ -808,11 +813,23 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         return _orchestrator_action("resume", args.run_id, services)
     if args.command == "cancel":
         return _orchestrator_action("cancel", args.run_id, services)
+    if args.command == "pin":
+        run = services.get_repository().set_pinned(
+            args.run_id, pinned=not args.off
+        )
+        return {"ok": True, "run_id": run.run_id, "pinned": run.pinned}
     if args.command == "doctor":
         return _doctor(args, services)
     if args.command == "tick":
         if args.plugin_root is not None:
-            services.plugin_root = args.plugin_root
+            candidate = validate_runtime_root(
+                args.plugin_root, require_exists=True
+            )
+            if services.scheduler is not None and candidate != services.plugin_root:
+                raise CliUsageError(
+                    "tick runtime root cannot replace a configured scheduler root"
+                )
+            services.plugin_root = candidate
         result = services.get_scheduler().tick()
         return {"ok": True, **result.model_dump(mode="json")}
     if args.command == "release":
