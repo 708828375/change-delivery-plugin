@@ -7,7 +7,7 @@ $fixedSourceRoot = (
 if ($fixedSourceRoot -cne 'C:\Users\ExampleUser\change-delivery-plugin') {
     throw 'Tick entrypoint is not running from the fixed source root.'
 }
-$TrustedHostSecuritySha256 = 'a257664f40af45f2a17393c18a52f21145c7cddcf618de3137960ce3f6d3e131'
+$TrustedHostSecuritySha256 = 'f66a3ab5bea7a826a7f0db5502acdc2b087e60e1babf48ecb8f6726194e92f58'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item

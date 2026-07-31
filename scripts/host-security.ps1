@@ -606,3 +606,72 @@ function ConvertTo-CanonicalRuntimeHostJson([object] $Config) {
     }
     return (ConvertTo-Json $ordered -Compress) + [Environment]::NewLine
 }
+
+function Write-RuntimeHost(
+    [string] $RuntimeRoot,
+    [object] $Configuration,
+    [string] $SourceRoot
+) {
+    # Validate an in-memory JSON round trip before creating any directory or file.
+    $candidate = ConvertFrom-Json (
+        ConvertTo-Json $Configuration -Depth 100 -Compress
+    )
+    Assert-StrictRuntimeHost $candidate $SourceRoot | Out-Null
+    $json = ConvertTo-CanonicalRuntimeHostJson $candidate
+
+    $parent = Split-Path -Parent $RuntimeRoot
+    Assert-NoReparseChain $parent
+    if (-not (Test-Path -LiteralPath $RuntimeRoot)) {
+        New-Item -ItemType Directory -Path $RuntimeRoot -ErrorAction Stop | Out-Null
+    }
+    Assert-NoReparseChain $RuntimeRoot
+    $runtimeItem = Get-Item -LiteralPath $RuntimeRoot -Force
+    if ($runtimeItem -isnot [IO.DirectoryInfo]) {
+        throw 'Runtime root must be an ordinary directory.'
+    }
+
+    $destination = Join-Path $RuntimeRoot 'runtime-host.json'
+    if (Test-Path -LiteralPath $destination) {
+        $existing = Read-StrictJsonObject $destination 16KB
+        Assert-StrictRuntimeHost $existing $SourceRoot | Out-Null
+        $current = [IO.File]::ReadAllText(
+            (Resolve-RegularFile $destination 'runtime-host.json'),
+            [Text.UTF8Encoding]::new($false, $true)
+        )
+        if ($current -cne $json) {
+            throw 'Existing runtime-host.json differs; refusing to overwrite it.'
+        }
+        return
+    }
+
+    $temporary = Join-Path $RuntimeRoot (
+        '.runtime-host.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+    )
+    try {
+        $stream = [IO.File]::Open(
+            $temporary,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($json)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+        $roundTrip = Read-StrictJsonObject $temporary 16KB
+        Assert-StrictRuntimeHost $roundTrip $SourceRoot | Out-Null
+        if ((ConvertTo-CanonicalRuntimeHostJson $roundTrip) -cne $json) {
+            throw 'Runtime host JSON round trip is not canonical.'
+        }
+        [IO.File]::Move($temporary, $destination)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) {
+            [IO.File]::Delete($temporary)
+        }
+    }
+}

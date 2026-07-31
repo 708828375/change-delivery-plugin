@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = 'a257664f40af45f2a17393c18a52f21145c7cddcf618de3137960ce3f6d3e131'
+$TrustedHostSecuritySha256 = 'f66a3ab5bea7a826a7f0db5502acdc2b087e60e1babf48ecb8f6726194e92f58'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -68,63 +68,6 @@ if ($Doctor) {
         fixed_source = $true
     } | ConvertTo-Json -Compress
     return
-}
-
-function Write-RuntimeHost(
-    [string] $RuntimeRoot,
-    [System.Collections.IDictionary] $Configuration
-) {
-    $parent = Split-Path -Parent $RuntimeRoot
-    Assert-NoReparseChain $parent
-    if (-not (Test-Path -LiteralPath $RuntimeRoot)) {
-        New-Item -ItemType Directory -Path $RuntimeRoot -ErrorAction Stop | Out-Null
-    }
-    Assert-NoReparseChain $RuntimeRoot
-    $runtimeItem = Get-Item -LiteralPath $RuntimeRoot -Force
-    if ($runtimeItem -isnot [IO.DirectoryInfo]) {
-        throw 'Runtime root must be an ordinary directory.'
-    }
-    $destination = Join-Path $RuntimeRoot 'runtime-host.json'
-    $json = (ConvertTo-Json $Configuration -Compress) + [Environment]::NewLine
-    if (Test-Path -LiteralPath $destination) {
-        $existing = Read-StrictJsonObject $destination 16KB
-        Assert-StrictRuntimeHost $existing $fixedRoot | Out-Null
-        $current = [IO.File]::ReadAllText(
-            (Resolve-RegularFile $destination 'runtime-host.json'),
-            [Text.UTF8Encoding]::new($false, $true)
-        )
-        if ($current -cne $json) {
-            throw 'Existing runtime-host.json differs; refusing to overwrite it.'
-        }
-        return
-    }
-    $temporary = Join-Path $RuntimeRoot (
-        '.runtime-host.' + [Guid]::NewGuid().ToString('N') + '.tmp'
-    )
-    $stream = [IO.File]::Open(
-        $temporary,
-        [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write,
-        [IO.FileShare]::None
-    )
-    try {
-        $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($json)
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush($true)
-    }
-    finally {
-        $stream.Dispose()
-    }
-    try {
-        [IO.File]::Move($temporary, $destination)
-    }
-    finally {
-        if (Test-Path -LiteralPath $temporary) {
-            [IO.File]::Delete($temporary)
-        }
-    }
-    $roundTrip = Read-StrictJsonObject $destination 16KB
-    Assert-StrictRuntimeHost $roundTrip $fixedRoot | Out-Null
 }
 
 $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
@@ -194,10 +137,11 @@ $configuration = [ordered]@{
     codex_platform_dependency = $codex.platform_dependency
     codex_platform_package_name = $codex.platform_package_name
     codex_platform_version = $codex.platform_version
+    module_manifest = $moduleManifest
     auth_mode = $AuthMode
     auth_source = $auth
 }
-Write-RuntimeHost $runtimeRoot $configuration
+Write-RuntimeHost $runtimeRoot $configuration $fixedRoot
 
 if ($results.Count -eq 1) {
     Write-Output 'Scheduled task already has the complete fixed definition.'
