@@ -150,3 +150,45 @@ def test_successful_concurrent_pin_preserves_expired_summary(
     assert pin_result == [0]
     assert service.repository.get_run("CD-1").pinned is True
     assert summary.exists()
+
+
+def test_pin_fails_when_retention_deleted_summary_before_lock_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, run = fixture(tmp_path)
+    summary = run / "sanitized-summary.md"
+    old(summary, 200)
+    entered_delete = threading.Event()
+    release_delete = threading.Event()
+    original_unlink = service._safe_unlink
+
+    def delayed_unlink(path: Path, run_dir: Path) -> bool:
+        if path == summary:
+            entered_delete.set()
+            assert release_delete.wait(timeout=5)
+        return original_unlink(path, run_dir)
+
+    monkeypatch.setattr(service, "_safe_unlink", delayed_unlink)
+    services = CliServices(plugin_root=tmp_path, repository=service.repository)
+    retention_thread = threading.Thread(target=lambda: service.clean(now=NOW))
+    retention_thread.start()
+    assert entered_delete.wait(timeout=2)
+
+    pin_result: list[int] = []
+    pin_thread = threading.Thread(
+        target=lambda: pin_result.append(
+            main(
+                ["pin", "CD-1", "--json"], services=services,
+                stdout=StringIO(), stderr=StringIO(),
+            )
+        )
+    )
+    pin_thread.start()
+    assert pin_thread.is_alive()
+    release_delete.set()
+    retention_thread.join(timeout=5)
+    pin_thread.join(timeout=5)
+
+    assert pin_result and pin_result[0] != 0
+    assert service.repository.get_run("CD-1").pinned is False
+    assert not summary.exists()

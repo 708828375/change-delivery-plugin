@@ -822,6 +822,10 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         return _orchestrator_action("cancel", args.run_id, services)
     if args.command == "pin":
         with maintenance_lock(services.plugin_root, timeout=30):
+            if not args.off:
+                ArtifactStore(services.plugin_root).require_pinnable_summary(
+                    args.run_id
+                )
             run = services.get_repository().set_pinned(
                 args.run_id, pinned=not args.off
             )

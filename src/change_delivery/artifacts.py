@@ -182,6 +182,21 @@ class ArtifactStore:
             sanitized_summary=run_dir / "sanitized-summary.md",
         )
 
+    def require_pinnable_summary(self, run_id: str) -> Path:
+        """Return an existing summary only when its full path is safe to pin."""
+        root = self._root()
+        run_dir = self._run_dir(run_id)
+        summary = run_dir / "sanitized-summary.md"
+        self._require_regular_file(summary)
+        resolved = summary.resolve(strict=True)
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError("sanitized summary escapes runtime root") from error
+        if resolved.parent != run_dir.resolve(strict=True):
+            raise ValueError("sanitized summary has an unexpected parent")
+        return summary
+
     def write_resource_inventory(
         self,
         run_id: str,
