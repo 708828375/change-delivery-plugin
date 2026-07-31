@@ -2830,3 +2830,40 @@ def test_cli_pin_persists_across_restart_and_controls_retention(
         now=datetime(2026, 7, 31, tzinfo=UTC)
     )
     assert not summary.exists()
+
+
+def test_cli_start_compensation_preserves_concurrently_advanced_run(
+    fixture: Fixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = fixture.root / "racing-input.md"
+    requirement.write_text("requirement", encoding="utf-8")
+    created_run_ids: list[str] = []
+    original_create = fixture.repository.create_run
+
+    def create_then_advance(run_id: str, project_id: str, config_hash: str):
+        original_create(run_id, project_id, config_hash)
+        created_run_ids.append(run_id)
+        fixture.repository.transition(
+            run_id,
+            RunState.DRAFT,
+            RunState.AWAITING_DESIGN_APPROVAL,
+            "CONCURRENT_ADVANCE",
+        )
+        raise OSError("artifact completion failed")
+
+    monkeypatch.setattr(fixture.repository, "create_run", create_then_advance)
+    services = CliServices(
+        plugin_root=fixture.root,
+        repository=fixture.repository,
+        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+    )
+
+    result = main(
+        ["start", "--project", "test-project", "--requirement-file", str(requirement), "--json"],
+        services=services, stdout=StringIO(), stderr=StringIO(),
+    )
+
+    assert result == 2
+    run_id = created_run_ids[0]
+    assert fixture.repository.get_run(run_id).state is RunState.AWAITING_DESIGN_APPROVAL
+    assert (fixture.root / "runs" / run_id).is_dir()

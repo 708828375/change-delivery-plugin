@@ -77,10 +77,10 @@ class Scheduler:
         self.runtime_root = validate_runtime_root(
             runtime_root, require_exists=True
         )
-        self.retention_service = retention_service or RetentionService(self.runtime_root, repository)
+        self.retention_service = retention_service or RetentionService(
+            self.runtime_root, repository, lock_timeout=0
+        )
         self.notification_service = notification_service or NotificationService(repository.database)
-        self.retention_lock_path = self.runtime_root / "retention.lock"
-        self.retention_lock = FileLock(self.retention_lock_path, timeout=0)
         self.retention_day_path = self.runtime_root / "retention-day"
         self.repository = repository
         self.orchestrator = orchestrator
@@ -316,27 +316,25 @@ class Scheduler:
             f".{self.retention_day_path.name}.{os.getpid()}.tmp"
         )
         try:
-            with self.retention_lock.acquire(timeout=0):
-                self._require_safe_auxiliary_file(self.retention_lock_path)
-                day = now.date().isoformat()
-                if self.retention_day_path.exists():
-                    self._require_safe_auxiliary_file(self.retention_day_path)
-                    if self.retention_day_path.read_text(encoding="ascii") == day:
-                        return
-                service.clean(now=now)
-                descriptor = os.open(
-                    temporary,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-                try:
-                    os.write(descriptor, day.encode("ascii"))
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                self._require_safe_auxiliary_file(temporary)
-                os.replace(temporary, self.retention_day_path)
+            day = now.date().isoformat()
+            if self.retention_day_path.exists():
                 self._require_safe_auxiliary_file(self.retention_day_path)
+                if self.retention_day_path.read_text(encoding="ascii") == day:
+                    return
+            service.clean(now=now)
+            descriptor = os.open(
+                temporary,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                os.write(descriptor, day.encode("ascii"))
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            self._require_safe_auxiliary_file(temporary)
+            os.replace(temporary, self.retention_day_path)
+            self._require_safe_auxiliary_file(self.retention_day_path)
         except Exception:
             return
         finally:
@@ -352,7 +350,6 @@ class Scheduler:
                         temporary.unlink()
             except OSError:
                 pass
-
     def _require_safe_auxiliary_file(self, path: Path) -> None:
         metadata = path.lstat()
         if (

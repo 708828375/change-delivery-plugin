@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import os
 from pathlib import Path
 import stat
+from typing import Iterator
+
+from filelock import FileLock
 
 from change_delivery.artifacts import validate_runtime_root
 from change_delivery.repository import RunRepository, TERMINAL_STATES
@@ -18,6 +22,29 @@ RAW_LOG_GLOBS = (
 REPORT_GLOBS = ("reports/*.md", "sanitized-summary.md")
 _RAW_RETENTION = timedelta(days=30)
 _REPORT_RETENTION = timedelta(days=180)
+
+
+@contextmanager
+def maintenance_lock(
+    runtime_root: Path, *, timeout: float = 30,
+) -> Iterator[None]:
+    root = validate_runtime_root(runtime_root, require_exists=True)
+    lock_path = root / "retention.lock"
+    with FileLock(lock_path, timeout=timeout):
+        validate_runtime_root(root, require_exists=True)
+        metadata = lock_path.lstat()
+        if (
+            lock_path.is_symlink()
+            or bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            )
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or lock_path.resolve(strict=True).parent != root.resolve(strict=True)
+        ):
+            raise ValueError("maintenance lock is unsafe")
+        yield
 
 
 @dataclass(frozen=True)
@@ -35,11 +62,14 @@ class RetentionService:
         self,
         runtime_root: Path,
         repository: RunRepository,
+        *,
+        lock_timeout: float = 30,
     ) -> None:
         self.runtime_root = validate_runtime_root(
             runtime_root, require_exists=True
         )
         self.repository = repository
+        self.lock_timeout = lock_timeout
 
     @staticmethod
     def _is_reparse(metadata: os.stat_result) -> bool:
@@ -49,6 +79,12 @@ class RetentionService:
         )
 
     def clean(self, *, now: datetime | None = None) -> RetentionResult:
+        with maintenance_lock(
+            self.runtime_root, timeout=self.lock_timeout
+        ):
+            return self._clean_locked(now=now)
+
+    def _clean_locked(self, *, now: datetime | None = None) -> RetentionResult:
         current = now or datetime.now(UTC)
         if current.tzinfo is None:
             raise ValueError("retention clock must be timezone-aware")
@@ -74,12 +110,10 @@ class RetentionService:
             unknown.extend(self._unknown_files(run_dir, known, unsafe))
             for path in sorted(known):
                 category = known[path]
-                if (
-                    category == "report"
-                    and path.name == "sanitized-summary.md"
-                    and bool(row["pinned"])
-                ):
-                    continue
+                if category == "report" and path.name == "sanitized-summary.md":
+                    authoritative = self.repository.get_run(row["run_id"])
+                    if authoritative.pinned:
+                        continue
                 age = self._age(path, current, run_dir, unsafe)
                 threshold = _RAW_RETENTION if category == "raw" else _REPORT_RETENTION
                 if age is None or age <= threshold:

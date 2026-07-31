@@ -36,6 +36,7 @@ from change_delivery.approval import (
 from change_delivery.database import Database
 from change_delivery.domain import LoadedProjectConfig, RunState
 from change_delivery.repository import RunRepository
+from change_delivery.retention import maintenance_lock
 from change_delivery.redaction import redact_text
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessRunner
@@ -501,11 +502,18 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         _atomic_write(paths.design, b"# Design\n\nPending explicit design approval.\n")
         _atomic_write(paths.plan, b"# Implementation Plan\n\nPending explicit design approval.\n")
         run = repository.create_run(run_id, project.project_id, digest)
-    except BaseException:
+    except BaseException as primary_error:
         try:
             repository.discard_unstarted_run(run_id)
-        finally:
+            if repository.run_exists(run_id):
+                raise ValueError(
+                    "run changed while start compensation was in progress"
+                )
             store.discard_new_run(run_id)
+        except BaseException as compensation_error:
+            primary_error.add_note(
+                f"start compensation preserved artifacts: {compensation_error}"
+            )
         raise
     return {
         "ok": True,
@@ -513,7 +521,6 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         "state": run.state.value,
         "dry_run": bool(args.dry_run),
     }
-
 
 def _register(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     with _candidate_lease(
@@ -814,9 +821,10 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     if args.command == "cancel":
         return _orchestrator_action("cancel", args.run_id, services)
     if args.command == "pin":
-        run = services.get_repository().set_pinned(
-            args.run_id, pinned=not args.off
-        )
+        with maintenance_lock(services.plugin_root, timeout=30):
+            run = services.get_repository().set_pinned(
+                args.run_id, pinned=not args.off
+            )
         return {"ok": True, "run_id": run.run_id, "pinned": run.pinned}
     if args.command == "doctor":
         return _doctor(args, services)

@@ -1,10 +1,13 @@
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 import os
 from pathlib import Path
+import threading
 
 import pytest
 
 from change_delivery.database import Database
+from change_delivery.cli import CliServices, main
 from change_delivery.domain import RunState
 from change_delivery.repository import RunRepository
 from change_delivery.retention import RetentionService
@@ -106,3 +109,44 @@ def test_retention_rejects_windows_reparse_runtime_root(tmp_path: Path, monkeypa
     )
     with pytest.raises(ValueError, match="ancestry"):
         service.clean(now=NOW)
+
+
+def test_successful_concurrent_pin_preserves_expired_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, run = fixture(tmp_path)
+    summary = run / "sanitized-summary.md"
+    old(summary, 200)
+    entered_set_pinned = threading.Event()
+    release_set_pinned = threading.Event()
+    original_set_pinned = service.repository.set_pinned
+
+    def delayed_set_pinned(run_id: str, *, pinned: bool):
+        entered_set_pinned.set()
+        assert release_set_pinned.wait(timeout=5)
+        return original_set_pinned(run_id, pinned=pinned)
+
+    monkeypatch.setattr(service.repository, "set_pinned", delayed_set_pinned)
+    services = CliServices(plugin_root=tmp_path, repository=service.repository)
+    pin_result: list[int] = []
+    pin_thread = threading.Thread(
+        target=lambda: pin_result.append(
+            main(
+                ["pin", "CD-1", "--json"], services=services,
+                stdout=StringIO(), stderr=StringIO(),
+            )
+        )
+    )
+    pin_thread.start()
+    assert entered_set_pinned.wait(timeout=2)
+
+    retention_thread = threading.Thread(target=lambda: service.clean(now=NOW))
+    retention_thread.start()
+    retention_thread.join(timeout=2)
+    release_set_pinned.set()
+    pin_thread.join(timeout=5)
+    retention_thread.join(timeout=5)
+
+    assert pin_result == [0]
+    assert service.repository.get_run("CD-1").pinned is True
+    assert summary.exists()

@@ -73,9 +73,16 @@ class RunRepository:
         assert row is not None
         return RunRecord.model_validate(dict(row))
 
-    def discard_unstarted_run(self, run_id: str) -> None:
-        """Compensate only a pristine DRAFT row created by a failed start."""
+    def discard_unstarted_run(self, run_id: str) -> bool:
+        """Delete a pristine DRAFT row atomically; report if it existed."""
         with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT state, head_sha, pr_number, pinned, created_at, updated_at "
+                "FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return False
             dependent = sum(
                 connection.execute(
                     f"SELECT COUNT(*) FROM {table} WHERE run_id = ?", (run_id,)
@@ -85,12 +92,34 @@ class RunRepository:
                     "remote_operations", "notifications", "scheduler_polls",
                 )
             )
-            if dependent:
-                raise ValueError("refusing to discard a run with audit records")
+            pristine = (
+                row["state"] == RunState.DRAFT.value
+                and row["head_sha"] is None
+                and row["pr_number"] is None
+                and not bool(row["pinned"])
+                and row["updated_at"] == row["created_at"]
+                and dependent == 0
+            )
+            if not pristine:
+                raise ValueError(
+                    "refusing to discard a run that is no longer pristine"
+                )
             connection.execute(
-                "DELETE FROM runs WHERE run_id = ? AND state = ?",
+                "DELETE FROM runs WHERE run_id = ? AND state = ? "
+                "AND head_sha IS NULL AND pr_number IS NULL AND pinned = 0 "
+                "AND updated_at = created_at",
                 (run_id, RunState.DRAFT.value),
             )
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ValueError("run changed during start compensation")
+            return True
+
+    def run_exists(self, run_id: str) -> bool:
+        with self.database.connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone() is not None
+
     def set_pinned(self, run_id: str, *, pinned: bool) -> RunRecord:
         if type(pinned) is not bool:
             raise TypeError("pinned must be a bool")
