@@ -10,7 +10,9 @@ from typing import Literal, Protocol
 from filelock import FileLock, Timeout
 
 from change_delivery.domain import FrozenModel, RunState, StepOutcome
+from change_delivery.notifications import NotificationService
 from change_delivery.repository import RunRepository, TERMINAL_STATES
+from change_delivery.retention import RetentionService
 
 
 _FAST_WINDOW = timedelta(minutes=5)
@@ -28,6 +30,14 @@ MANUAL_INTERVENTION_STATES = frozenset(
 
 class OrchestratorPort(Protocol):
     def step(self, run_id: str) -> StepOutcome: ...
+
+class RetentionPort(Protocol):
+    def clean(self, *, now: datetime) -> object: ...
+
+class NotificationPort(Protocol):
+    def emit(self, run_id: str, state: RunState, message: str, *, action: str) -> object: ...
+
+
 
 
 class SchedulerResult(FrozenModel):
@@ -53,6 +63,8 @@ class Scheduler:
     def __init__(
         self,
         *,
+        retention_service: RetentionPort | None = None,
+        notification_service: NotificationPort | None = None,
         runtime_root: Path,
         repository: RunRepository,
         orchestrator: OrchestratorPort,
@@ -61,6 +73,10 @@ class Scheduler:
         # ``absolute`` preserves the lexical final component so validation can
         # still detect a symlink or Windows reparse point at runtime_root.
         self.runtime_root = runtime_root.absolute()
+        self.retention_service = retention_service
+        self.retention_lock_path = self.runtime_root / "retention.lock"
+        self.retention_lock = FileLock(self.retention_lock_path, timeout=0)
+        self.retention_day_path = self.runtime_root / "retention-day"
         self.repository = repository
         self.orchestrator = orchestrator
         self.clock = clock or (lambda: datetime.now(UTC))
@@ -85,14 +101,14 @@ class Scheduler:
             return SchedulerResult(status="already_running", processed=0)
 
     def _tick_locked(self) -> SchedulerResult:
-        runs = self.repository.list_active_runs()
-        if not runs:
-            return SchedulerResult(status="idle", processed=0)
-
         now = self.clock()
         if now.tzinfo is None:
             raise ValueError("scheduler clock must return a timezone-aware value")
         now = now.astimezone(UTC)
+        self._run_daily_retention(now)
+        runs = self.repository.list_active_runs()
+        if not runs:
+            return SchedulerResult(status="idle", processed=0)
         throttled = False
         waiting = False
         for run in runs:
@@ -215,6 +231,62 @@ class Scheduler:
                 processed=0,
             )
         return SchedulerResult(status="idle", processed=0)
+
+    def _run_daily_retention(self, now: datetime) -> None:
+        service = self.retention_service
+        if service is None:
+            return
+        temporary = self.retention_day_path.with_name(
+            f".{self.retention_day_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            with self.retention_lock.acquire(timeout=0):
+                self._require_safe_auxiliary_file(self.retention_lock_path)
+                day = now.date().isoformat()
+                if self.retention_day_path.exists():
+                    self._require_safe_auxiliary_file(self.retention_day_path)
+                    if self.retention_day_path.read_text(encoding="ascii") == day:
+                        return
+                service.clean(now=now)
+                descriptor = os.open(
+                    temporary,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                try:
+                    os.write(descriptor, day.encode("ascii"))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                self._require_safe_auxiliary_file(temporary)
+                os.replace(temporary, self.retention_day_path)
+                self._require_safe_auxiliary_file(self.retention_day_path)
+        except (OSError, Timeout, ValueError):
+            return
+        finally:
+            try:
+                if temporary.exists():
+                    metadata = temporary.lstat()
+                    if (
+                        not temporary.is_symlink()
+                        and not self._is_reparse(metadata)
+                        and stat.S_ISREG(metadata.st_mode)
+                        and metadata.st_nlink == 1
+                    ):
+                        temporary.unlink()
+            except OSError:
+                pass
+
+    def _require_safe_auxiliary_file(self, path: Path) -> None:
+        metadata = path.lstat()
+        if (
+            path.is_symlink()
+            or self._is_reparse(metadata)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or path.resolve(strict=True).parent != self.runtime_root.resolve(strict=True)
+        ):
+            raise ValueError("scheduler auxiliary file is unsafe")
 
     def _validate_lock_boundary(self, *, require_lock: bool = False) -> None:
         root = self.runtime_root

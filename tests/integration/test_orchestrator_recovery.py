@@ -649,6 +649,10 @@ def test_cancel_is_idempotent_and_preserves_resources(fixture: Fixture) -> None:
     assert first.state is second.state is RunState.CANCELLED
     assert fixture.git.remove_worktree_calls == 0
     assert fixture.github.close_pr_calls == 0
+    inventory = fixture.root / "runs" / run_id / "reports" / "resource-inventory.md"
+    assert inventory.is_file()
+    assert f"feature/{run_id}" in inventory.read_text(encoding="utf-8")
+    assert SHA in inventory.read_text(encoding="utf-8")
 
 
 def test_blocked_resume_uses_persisted_from_state(fixture: Fixture) -> None:

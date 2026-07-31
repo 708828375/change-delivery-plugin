@@ -95,6 +95,23 @@ def test_scheduler_does_not_invoke_orchestrator_without_active_runs(
     assert fixture.orchestrator.calls == []
 
 
+def test_scheduler_runs_retention_only_once_per_utc_day(tmp_path: Path) -> None:
+    calls: list[datetime] = []
+
+    class FakeRetention:
+        def clean(self, *, now: datetime) -> None:
+            calls.append(now)
+
+    fixture = make_scheduler(tmp_path)
+    fixture.scheduler.retention_service = FakeRetention()
+
+    fixture.scheduler.tick()
+    fixture.scheduler.tick()
+
+    assert calls == [NOW]
+    assert (tmp_path / "retention-day").read_text(encoding="ascii") == "2026-07-29"
+
+
 def test_scheduler_does_not_tick_ready_to_merge(tmp_path: Path) -> None:
     fixture = make_scheduler(tmp_path)
     fixture.repository.create_run("ready", "project", "hash")

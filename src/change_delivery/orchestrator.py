@@ -11,6 +11,7 @@ import re
 import secrets
 import stat
 from typing import Protocol
+from change_delivery.artifacts import ArtifactStore
 
 from change_delivery.approval import (
     ApprovalSnapshot,
@@ -94,6 +95,7 @@ class Orchestrator:
         worktree_port: object | None = None,
         commit_port: object | None = None,
         cleanup_port: object | None = None,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.repository = repository
         self.plugin_root = plugin_root.resolve()
@@ -108,6 +110,7 @@ class Orchestrator:
         self.worktree_port = worktree_port
         self.commit_port = commit_port
         self.cleanup_port = cleanup_port
+        self.artifact_store = artifact_store or ArtifactStore(self.plugin_root)
 
     def _run_root(self, run_id: str) -> Path:
         candidate = self.plugin_root / "runs" / run_id
@@ -1451,6 +1454,21 @@ class Orchestrator:
             RunState.FAILED_TERMINAL,
         }:
             raise ValueError("terminal run cannot be cancelled")
+        config, digest = self.config_loader(run.project_id)
+        if not hmac.compare_digest(digest, run.config_hash):
+            raise ValueError("project configuration hash changed")
+        pr_url = (
+            f"https://github.com/{config.github_repository}/pull/{run.pr_number}"
+            if run.pr_number is not None
+            else None
+        )
+        self.artifact_store.write_resource_inventory(
+            run_id,
+            branch=self._feature_branch(run),
+            worktree=self.plugin_root / "worktrees" / run_id,
+            pr_url=pr_url,
+            test_sha=run.head_sha,
+        )
         self.repository.transition_with_evidence(
             run_id,
             run.state,
