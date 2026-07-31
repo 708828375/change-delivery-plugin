@@ -8,6 +8,7 @@ ROOT = Path(__file__).parents[2]
 PERSONAL = ROOT / "scripts" / "install-personal-plugin.ps1"
 SCHEDULED = ROOT / "scripts" / "install-scheduled-task.ps1"
 TICK = ROOT / "scripts" / "run-tick.ps1"
+SECURITY = ROOT / "scripts" / "host-security.ps1"
 
 
 def _text(path: Path) -> str:
@@ -15,7 +16,7 @@ def _text(path: Path) -> str:
 
 
 def test_install_scripts_parse_as_powershell() -> None:
-    paths = ", ".join(f"'{path}'" for path in (PERSONAL, SCHEDULED, TICK))
+    paths = ", ".join(f"'{path}'" for path in (PERSONAL, SCHEDULED, TICK, SECURITY))
     command = (
         f"$files=@({paths}); foreach($file in $files){{"
         "[void][scriptblock]::Create("
@@ -47,7 +48,7 @@ def test_personal_installer_is_fail_closed_and_uses_codex_marketplace_api() -> N
 
 
 def test_scheduler_installer_pins_native_codex_auth_and_runtime_host() -> None:
-    script = _text(SCHEDULED)
+    script = _text(SCHEDULED) + _text(SECURITY)
 
     assert "@openai\\codex" in script
     assert "vendor" in script
