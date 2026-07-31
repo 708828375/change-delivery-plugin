@@ -35,6 +35,8 @@ $hostConfigPath = Join-Path $runtimeRoot 'runtime-host.json'
 $configStream = Open-StableFile $hostConfigPath
 $pythonStream = $null
 $moduleStream = $null
+$codexStream = $null
+$authStream = $null
 try {
     $reader = [IO.StreamReader]::new(
         $configStream,
@@ -51,12 +53,16 @@ try {
     }
     if (
         $null -eq $hostConfig.python_path -or
-        $null -eq $hostConfig.module_root
+        $null -eq $hostConfig.module_root -or
+        $null -eq $hostConfig.codex_path -or
+        $null -eq $hostConfig.auth_mode
     ) {
         throw "Runtime host configuration is incomplete."
     }
     $pythonPath = [string] $hostConfig.python_path
     $moduleRoot = [string] $hostConfig.module_root
+    $codexPath = [string] $hostConfig.codex_path
+    $authMode = [string] $hostConfig.auth_mode
     if (
         -not [IO.Path]::IsPathRooted($pythonPath) -or
         -not [IO.Path]::IsPathRooted($moduleRoot)
@@ -74,6 +80,42 @@ try {
     $moduleEntry = Join-Path $moduleItem.FullName 'change_delivery\__init__.py'
     $pythonStream = Open-StableFile $pythonPath
     $moduleStream = Open-StableFile $moduleEntry
+    $codexStream = Open-StableFile $codexPath
+    if (
+        -not [string]::Equals(
+            [IO.Path]::GetFileName($codexPath),
+            'codex.exe',
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw "Runtime Codex executable is not native codex.exe."
+    }
+    if ($authMode -eq 'auth_file') {
+        if ($null -eq $hostConfig.auth_source) {
+            throw "Runtime auth_file mode requires auth_source."
+        }
+        $authSource = [string] $hostConfig.auth_source
+        if ([IO.Path]::GetFileName($authSource) -ne 'auth.json') {
+            throw "Runtime auth source must be auth.json."
+        }
+        $authStream = Open-StableFile $authSource
+        $env:OPENAI_API_KEY = $null
+        $env:CHANGE_DELIVERY_AUTH_SOURCE = $authSource
+    }
+    elseif ($authMode -eq 'api_key') {
+        if ($null -ne $hostConfig.auth_source) {
+            throw "Runtime api_key mode forbids auth_source."
+        }
+        if ([string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
+            throw "Runtime api_key mode requires process OPENAI_API_KEY."
+        }
+        $env:CHANGE_DELIVERY_AUTH_SOURCE = $null
+    }
+    else {
+        throw "Runtime auth mode is invalid."
+    }
+    $env:CHANGE_DELIVERY_AUTH_MODE = $authMode
+    $env:CHANGE_DELIVERY_CODEX_EXECUTABLE = $codexPath
 
     $env:PYTHONPATH = $null
     $env:PYTHONHOME = $null
@@ -83,6 +125,12 @@ try {
     exit $LASTEXITCODE
 }
 finally {
+    if ($null -ne $authStream) {
+        $authStream.Dispose()
+    }
+    if ($null -ne $codexStream) {
+        $codexStream.Dispose()
+    }
     if ($null -ne $moduleStream) {
         $moduleStream.Dispose()
     }

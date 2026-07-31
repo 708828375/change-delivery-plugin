@@ -248,7 +248,9 @@ class RuntimeStageExecutor:
             sort_keys=True,
         ).encode("utf-8")
         self._write_runtime_file(schema, schema_bytes)
-        executable_text = shutil.which("codex.exe") or shutil.which("codex")
+        executable_text = os.environ.get("CHANGE_DELIVERY_CODEX_EXECUTABLE")
+        if executable_text is None:
+            executable_text = shutil.which("codex.exe") or shutil.which("codex")
         if executable_text is None:
             raise RuntimeError("Codex CLI executable is unavailable")
         skills = self._skill_registry(source_root)
@@ -257,7 +259,21 @@ class RuntimeStageExecutor:
             / ".codex"
             / "auth.json"
         )
-        if os.environ.get("OPENAI_API_KEY"):
+        configured_auth_mode = os.environ.get("CHANGE_DELIVERY_AUTH_MODE")
+        configured_auth_source = os.environ.get("CHANGE_DELIVERY_AUTH_SOURCE")
+        if configured_auth_mode == "api_key":
+            if configured_auth_source or not os.environ.get("OPENAI_API_KEY"):
+                raise RuntimeError("configured api_key authentication is unavailable")
+            auth_mode = "api_key"
+            auth_source = None
+        elif configured_auth_mode == "auth_file":
+            if not configured_auth_source:
+                raise RuntimeError("configured auth_file authentication is unavailable")
+            auth_mode = "auth_file"
+            auth_source = Path(configured_auth_source)
+        elif configured_auth_mode is not None:
+            raise RuntimeError("configured Codex authentication mode is invalid")
+        elif os.environ.get("OPENAI_API_KEY"):
             auth_mode = "api_key"
             auth_source = None
         elif auth_file.is_file():
