@@ -81,7 +81,7 @@ def test_fake_vendor_manifest_version_is_rejected_before_execution(tmp_path: Pat
 . '{SECURITY}'
 $rejected = $false
 try {{ Resolve-CodexIdentityAtRoot '{root}' | Out-Null }}
-catch {{ if ($_.Exception.Message -notmatch 'version') {{ throw }}; $rejected = $true }}
+catch {{ if ($_.Exception.Message -notmatch 'version|trust anchor') {{ throw }}; $rejected = $true }}
 if (-not $rejected) {{ exit 20 }}
 """
     result = run_ps(command)

@@ -7,7 +7,35 @@ $fixedSourceRoot = (
 if ($fixedSourceRoot -cne 'C:\Users\ExampleUser\change-delivery-plugin') {
     throw 'Tick entrypoint is not running from the fixed source root.'
 }
-. (Join-Path $PSScriptRoot 'host-security.ps1')
+$TrustedHostSecuritySha256 = 'a257664f40af45f2a17393c18a52f21145c7cddcf618de3137960ce3f6d3e131'
+function Open-StableTrustedHelper([string] $Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $cursor = $item
+    while ($null -ne $cursor) {
+        if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Trusted helper path contains a reparse point.'
+        }
+        $cursor = if ($cursor -is [IO.DirectoryInfo]) { $cursor.Parent } else { $cursor.Directory }
+    }
+    if ($item -isnot [IO.FileInfo]) { throw 'Trusted helper must be an ordinary file.' }
+    $links = @(& 'C:\Windows\System32\fsutil.exe' hardlink list $item.FullName)
+    if ($LASTEXITCODE -ne 0 -or $links.Count -ne 1) {
+        throw 'Trusted helper must have exactly one hard link.'
+    }
+    $stream = [IO.File]::Open($item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try { $hash = [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+        finally { $algorithm.Dispose() }
+        if ($hash -cne $TrustedHostSecuritySha256) { throw 'Trusted helper hash differs from the embedded anchor.' }
+        $stream.Position = 0
+        return $stream
+    }
+    catch { $stream.Dispose(); throw }
+}
+$helperPath = Join-Path $PSScriptRoot 'host-security.ps1'
+$helperStream = Open-StableTrustedHelper $helperPath
+. $helperPath
 $fixedModuleRoot = (
     Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\src')
 ).ProviderPath
@@ -22,6 +50,22 @@ function Open-StableFile([string] $Path) {
     )
 }
 
+function Open-ModuleTreeHandles([string] $ModuleRoot, [object[]] $Expected) {
+    Assert-ModuleTreeManifest $ModuleRoot $Expected
+    $root = (Resolve-Path -LiteralPath $ModuleRoot).ProviderPath
+    $handles = [Collections.Generic.List[IO.FileStream]]::new()
+    try {
+        foreach ($entry in $Expected) {
+            $candidate = Join-Path $root ([string] $entry.relative_path)
+            $path = Resolve-RegularFile $candidate ([IO.Path]::GetFileName($candidate))
+            if (-not $path.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Module manifest path escaped the fixed module root.' }
+            $handles.Add([IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read))
+        }
+        Assert-ModuleTreeManifest $ModuleRoot $Expected
+        return $handles.ToArray()
+    }
+    catch { foreach ($handle in $handles) { $handle.Dispose() }; throw }
+}
 $runtimeRoot = Join-Path (
     [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
 ) '.codex\change-delivery'
@@ -31,6 +75,7 @@ $pythonStream = $null
 $moduleStream = $null
 $codexStream = $null
 $authStream = $null
+$moduleStreams = @()
 try {
     if ($configStream.Length -le 0 -or $configStream.Length -gt 16KB) {
         throw 'Runtime host configuration has an invalid size.'
@@ -59,6 +104,8 @@ try {
     if ($identity.module_root -cne $fixedModuleRoot) {
         throw 'Runtime module root does not match $PSScriptRoot\..\src.'
     }
+    $moduleStreams = @(Open-ModuleTreeHandles (Join-Path $fixedModuleRoot 'change_delivery') @($hostConfig.module_manifest))
+
 
     $pythonPath = [string] $hostConfig.python_path
     $moduleRoot = [string] $hostConfig.module_root
@@ -100,6 +147,7 @@ try {
     exit $LASTEXITCODE
 }
 finally {
+    foreach ($stream in $moduleStreams) { $stream.Dispose() }
     if ($null -ne $authStream) {
         $authStream.Dispose()
     }
@@ -113,4 +161,5 @@ finally {
         $pythonStream.Dispose()
     }
     $configStream.Dispose()
+    $helperStream.Dispose()
 }

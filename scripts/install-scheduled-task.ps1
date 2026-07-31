@@ -10,7 +10,35 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-. (Join-Path $PSScriptRoot 'host-security.ps1')
+$TrustedHostSecuritySha256 = 'a257664f40af45f2a17393c18a52f21145c7cddcf618de3137960ce3f6d3e131'
+function Open-StableTrustedHelper([string] $Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $cursor = $item
+    while ($null -ne $cursor) {
+        if (($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Trusted helper path contains a reparse point.'
+        }
+        $cursor = if ($cursor -is [IO.DirectoryInfo]) { $cursor.Parent } else { $cursor.Directory }
+    }
+    if ($item -isnot [IO.FileInfo]) { throw 'Trusted helper must be an ordinary file.' }
+    $links = @(& 'C:\Windows\System32\fsutil.exe' hardlink list $item.FullName)
+    if ($LASTEXITCODE -ne 0 -or $links.Count -ne 1) {
+        throw 'Trusted helper must have exactly one hard link.'
+    }
+    $stream = [IO.File]::Open($item.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try { $hash = [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+        finally { $algorithm.Dispose() }
+        if ($hash -cne $TrustedHostSecuritySha256) { throw 'Trusted helper hash differs from the embedded anchor.' }
+        $stream.Position = 0
+        return $stream
+    }
+    catch { $stream.Dispose(); throw }
+}
+$helperPath = Join-Path $PSScriptRoot 'host-security.ps1'
+$helperStream = Open-StableTrustedHelper $helperPath
+. $helperPath
 
 $taskName = 'Codex Change Delivery Tick'
 $fixedRoot = Assert-FixedSourceRoot $SourceRoot
@@ -24,6 +52,8 @@ Assert-NoReparseChain $moduleRoot
 [void](Resolve-RegularFile (
     Join-Path $moduleRoot 'change_delivery\__init__.py'
 ) '__init__.py')
+$moduleManifest = @(Read-TrustedModuleManifest)
+Assert-ModuleTreeManifest (Join-Path $moduleRoot 'change_delivery') $moduleManifest
 
 $python = Resolve-TrustedPythonIdentity
 $codex = Resolve-OfficialCodexIdentity

@@ -1,6 +1,61 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
+$script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
+$script:HostSecurityRoot = $PSScriptRoot
+$script:TrustedModuleManifestSha256 = '5a17d07b0874b8788bee6b508f258cce3c07c0618dcb9afcdcdaf0f65fece36c'
+
+if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace ChangeDelivery {
+    public static class NativeFileIdentity {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BY_HANDLE_FILE_INFORMATION {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(
+            string name, uint access, uint share, IntPtr security,
+            uint creation, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION information);
+
+        public static uint GetLinkCount(string path) {
+            using (SafeFileHandle handle = CreateFileW(
+                path, 0x80000000, 1, IntPtr.Zero, 3, 0x80, IntPtr.Zero)) {
+                if (handle.IsInvalid) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                BY_HANDLE_FILE_INFORMATION information;
+                if (!GetFileInformationByHandle(handle, out information)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                return information.NumberOfLinks;
+            }
+        }
+    }
+}
+'@
+}
+
 $script:RuntimeHostFields = @(
     'schema_version',
     'python_path',
@@ -13,6 +68,7 @@ $script:RuntimeHostFields = @(
     'codex_platform_dependency',
     'codex_platform_package_name',
     'codex_platform_version',
+    'module_manifest',
     'auth_mode',
     'auth_source'
 )
@@ -57,6 +113,9 @@ function Resolve-RegularFile([string] $Path, [string] $ExpectedName) {
     ) {
         throw "Expected file basename $ExpectedName."
     }
+    if ([ChangeDelivery.NativeFileIdentity]::GetLinkCount($item.FullName) -ne 1) {
+        throw 'Expected a single-link ordinary file.'
+    }
     return $item.FullName
 }
 
@@ -82,7 +141,7 @@ function Assert-ExactJsonProperties([object] $Value, [string[]] $Names) {
     $expected = @($Names | Sort-Object)
     if (
         $actual.Count -ne $expected.Count -or
-        (Compare-Object $actual $expected).Count -ne 0
+        @(Compare-Object $actual $expected).Count -ne 0
     ) {
         throw 'JSON object fields do not match the strict schema.'
     }
@@ -115,8 +174,19 @@ function Get-PlatformContract() {
 
 function Resolve-CodexIdentityAtRoot([string] $GlobalRoot) {
     $root = (Resolve-Path -LiteralPath $GlobalRoot -ErrorAction Stop).ProviderPath
+    $fixedRoot = Split-Path -Parent (Split-Path -Parent $script:FixedCodexPackageRoot)
+    if (-not [string]::Equals(
+        $root.TrimEnd('\'),
+        $fixedRoot.TrimEnd('\'),
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'Codex package root is not the fixed personal trust anchor.'
+    }
     Assert-NoReparseChain $root
     $packageRoot = Join-Path $root '@openai\codex'
+    if ((Resolve-Path $packageRoot).ProviderPath -cne $script:FixedCodexPackageRoot) {
+        throw 'Codex parent package differs from the fixed personal trust anchor.'
+    }
     Assert-NoReparseChain $packageRoot
     $parentManifest = Read-StrictJsonObject (
         Join-Path $packageRoot 'package.json'
@@ -205,42 +275,106 @@ function Resolve-CodexIdentityAtRoot([string] $GlobalRoot) {
 }
 
 function Resolve-OfficialCodexIdentity() {
-    $npm = Get-Command npm.cmd -CommandType Application -ErrorAction Stop
-    $npmPath = Resolve-RegularFile $npm.Source 'npm.cmd'
-    $rootOutput = & $npmPath root -g
-    if ($LASTEXITCODE -ne 0 -or @($rootOutput).Count -ne 1) {
-        throw 'Unable to discover one global npm package root.'
-    }
-    return Resolve-CodexIdentityAtRoot ([string] $rootOutput)
+    $globalRoot = Split-Path -Parent (Split-Path -Parent $script:FixedCodexPackageRoot)
+    return Resolve-CodexIdentityAtRoot $globalRoot
 }
 
 function Resolve-TrustedPythonIdentity() {
-    $trusted = @(
-        Get-Command python.exe -CommandType Application -All -ErrorAction Stop |
-        ForEach-Object {
-            try {
-                $candidate = Resolve-RegularFile $_.Source ''
-                if (
-                    [IO.Path]::GetFileName($candidate) -match
-                    '^(?i:python(?:3(?:\.\d+)?)?\.exe)$'
-                ) {
-                    $candidate
-                }
-            }
-            catch {
-                # App execution aliases and reparse candidates are not trusted.
-            }
-        } |
-        Sort-Object -Unique
+    $path = Resolve-RegularFile $script:FixedPythonPath 'python.exe'
+    $contractText = & $path -I -c (
+        'import json,sys;print(json.dumps(dict(executable=sys.executable,' +
+        'major=sys.version_info.major,minor=sys.version_info.minor),' +
+        'sort_keys=True))'
     )
-    if ($trusted.Count -ne 1) {
-        throw 'Exactly one trusted Python application must resolve for the installer.'
+    if ($LASTEXITCODE -ne 0 -or @($contractText).Count -ne 1) {
+        throw 'Fixed Python failed its direct identity contract.'
     }
-    $path = [string] $trusted[0]
+    $contract = ConvertFrom-Json ([string] $contractText)
+    if (
+        $contract.executable -cne $path -or
+        $contract.major -ne 3 -or
+        $contract.minor -ne 12
+    ) {
+        throw 'Fixed Python identity or version differs from the trust anchor.'
+    }
     return [PSCustomObject]@{
         path = $path
         sha256 = Get-FileSha256 $path
     }
+}
+
+function Get-ModuleTreeManifest([string] $ModuleRoot) {
+    $root = (Resolve-Path -LiteralPath $ModuleRoot -ErrorAction Stop).ProviderPath
+    Assert-NoReparseChain $root
+    $files = @(
+        Get-ChildItem -LiteralPath $root -Recurse -File -Filter '*.py' |
+        Sort-Object FullName
+    )
+    if ($files.Count -eq 0) {
+        throw 'Trusted Python module tree is empty.'
+    }
+    return @(
+        $files | ForEach-Object {
+            $path = Resolve-RegularFile $_.FullName $_.Name
+            $relative = $path.Substring($root.Length).TrimStart('\').Replace('\', '/')
+            [PSCustomObject][ordered]@{
+                relative_path = $relative
+                sha256 = Get-FileSha256 $path
+                size = [int64] $_.Length
+            }
+        }
+    )
+}
+
+function ConvertTo-CanonicalModuleManifest([object[]] $Manifest) {
+    $normalized = @(
+        $Manifest | ForEach-Object {
+            Assert-ExactJsonProperties $_ @('relative_path', 'sha256', 'size')
+            if (
+                $_.relative_path -isnot [string] -or
+                $_.relative_path -notmatch '^[A-Za-z0-9_./-]+\.py$' -or
+                $_.relative_path.Contains('..') -or
+                $_.sha256 -isnot [string] -or
+                $_.sha256 -notmatch '^[0-9a-f]{64}$' -or
+                -not ($_.size -is [int] -or $_.size -is [long]) -or
+                [int64] $_.size -lt 0
+            ) {
+                throw 'Module manifest entry is invalid.'
+            }
+            [ordered]@{
+                relative_path = [string] $_.relative_path
+                sha256 = [string] $_.sha256
+                size = [int64] $_.size
+            }
+        }
+    )
+    return ConvertTo-Json $normalized -Compress
+}
+
+function Assert-ModuleTreeManifest([string] $ModuleRoot, [object[]] $Expected) {
+    $actual = Get-ModuleTreeManifest $ModuleRoot
+    if (
+        (ConvertTo-CanonicalModuleManifest $actual) -cne
+        (ConvertTo-CanonicalModuleManifest $Expected)
+    ) {
+        throw 'Python module tree differs from the trusted manifest.'
+    }
+}
+
+function Read-TrustedModuleManifest() {
+    if ($script:TrustedModuleManifestSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'Trusted module manifest has not been finalized.'
+    }
+    $path = Join-Path $script:HostSecurityRoot 'trusted-module-manifest.json'
+    $file = Resolve-RegularFile $path 'trusted-module-manifest.json'
+    if ((Get-FileSha256 $file) -cne $script:TrustedModuleManifestSha256) {
+        throw 'Trusted module manifest hash differs from the embedded trust anchor.'
+    }
+    $value = [IO.File]::ReadAllText($file, [Text.UTF8Encoding]::new($false, $true)) |
+        ConvertFrom-Json
+    $manifest = @($value)
+    [void](ConvertTo-CanonicalModuleManifest $manifest)
+    return $manifest
 }
 
 function Resolve-Authentication([string] $Mode, [string] $Source) {
@@ -387,7 +521,7 @@ function Assert-StrictRuntimeHost([object] $Config, [string] $SourceRoot) {
         throw 'Runtime host schema version is invalid.'
     }
     foreach ($name in $script:RuntimeHostFields) {
-        if ($name -in @('schema_version', 'auth_source')) {
+        if ($name -in @('schema_version', 'auth_source', 'module_manifest')) {
             continue
         }
         if (
@@ -416,6 +550,12 @@ function Assert-StrictRuntimeHost([object] $Config, [string] $SourceRoot) {
     )) {
         throw 'Runtime module root differs from $PSScriptRoot\..\src.'
     }
+    $trustedManifest = @(Read-TrustedModuleManifest)
+    if ((ConvertTo-CanonicalModuleManifest @($Config.module_manifest)) -cne
+        (ConvertTo-CanonicalModuleManifest $trustedManifest)) {
+        throw 'Runtime host module manifest differs from the independent trust anchor.'
+    }
+    Assert-ModuleTreeManifest (Join-Path $actualModule 'change_delivery') $trustedManifest
     $python = Resolve-TrustedPythonIdentity
     if (
         $Config.python_path -cne $python.path -or

@@ -1,11 +1,6 @@
 [CmdletBinding()]
 param(
-    [string] $SourceRoot = (Split-Path -Parent $PSScriptRoot),
-    [string] $PluginsRoot = (
-        Join-Path (
-            [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
-        ) 'plugins'
-    )
+    [string] $SourceRoot = (Split-Path -Parent $PSScriptRoot)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,6 +56,7 @@ if ($marketplaceName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
     throw 'The personal Marketplace name is invalid.'
 }
 
+$PluginsRoot = Join-Path $userProfile 'plugins'
 if (-not (Test-Path -LiteralPath $PluginsRoot)) {
     New-Item -ItemType Directory -Path $PluginsRoot -ErrorAction Stop | Out-Null
 }
