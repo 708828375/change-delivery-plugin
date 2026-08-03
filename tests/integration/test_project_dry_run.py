@@ -118,10 +118,6 @@ def fixture_config():
     return load_project_config(fixture).config
 
 
-def allow_fixture_endpoint(_config: ProjectConfig) -> None:
-    """Explicit test-only bypass for the intentionally unroutable fixture URL."""
-
-
 def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
     fake_http = FakeHttp({"git_sha": TEST_SHA})
     fake_git = FakeGit(fixture_config)
@@ -132,7 +128,6 @@ def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
         github=fake_github,
         http=fake_http,
         file_exists=lambda path: path.name in {"pyproject.toml", "pytest.ini"},
-        endpoint_policy=allow_fixture_endpoint,
     )
 
     report = adapter.discover(dry_run=True)
@@ -167,7 +162,6 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         github=fake_github,
         http=fake_http,
         file_exists=lambda _path: False,
-        endpoint_policy=allow_fixture_endpoint,
     )
     factory_calls = []
 
@@ -179,7 +173,6 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (fixture_config, "c" * 64),
         discovery_factory=discovery_factory,
-        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -211,7 +204,7 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         "base_sha": DEVELOP_SHA,
         "test_branch": "test",
         "test_sha": TEST_SHA,
-        "version_endpoint": "https://example.test.invalid/version",
+        "version_endpoint": "https://api.test.example.invalid/health",
         "version_sha_field": "git_sha",
         "version_probe": {
             "status": "passed",
@@ -228,7 +221,7 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
     assert fake_git.write_calls == []
     assert fake_github.write_calls == []
     assert fake_http.calls == [
-        ("GET", "https://example.test.invalid/version")
+        ("GET", "https://api.test.example.invalid/health")
     ]
     runtime = tmp_path / "runtime"
     assert not (runtime / "state.sqlite3").exists()
@@ -261,13 +254,11 @@ def test_cli_start_dry_run_blocks_bad_version_evidence_without_writes(
         github=fake_github,
         http=fake_http,
         file_exists=lambda _path: False,
-        endpoint_policy=allow_fixture_endpoint,
     )
     services = CliServices(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (fixture_config, "c" * 64),
         discovery_factory=lambda _config: adapter,
-        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -316,7 +307,6 @@ def test_cli_start_dry_run_refuses_production_enabled_config_before_io(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (production_config, "c" * 64),
         discovery_factory=lambda config: factory_calls.append(config),
-        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -455,6 +445,25 @@ def test_direct_project_adapter_blocks_production_endpoint_before_any_io(
     assert fake_http.calls == []
 
 
+def test_project_adapter_policy_cannot_be_injected(
+    fixture_config,
+) -> None:
+    fake_git = FakeGit(fixture_config)
+    fake_http = FakeHttp({"git_sha": TEST_SHA})
+
+    with pytest.raises(TypeError):
+        ExampleProjectAdapter(
+            fixture_config,
+            git=fake_git,
+            github=FakeGitHub(),
+            http=fake_http,
+            endpoint_policy=lambda _config: None,
+        )
+
+    assert fake_git.read_calls == []
+    assert fake_http.calls == []
+
+
 def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
     fixture_config,
     tmp_path: Path,
@@ -473,13 +482,11 @@ def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
         github=FakeGitHub(),
         http=fake_http,
         file_exists=lambda _path: False,
-        endpoint_policy=allow_fixture_endpoint,
     )
     services = CliServices(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (fixture_config, "c" * 64),
         discovery_factory=lambda _config: adapter,
-        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -515,7 +522,6 @@ def test_cli_start_dry_run_never_echoes_dependency_exception_text(
         discovery_factory=lambda _config: (_ for _ in ()).throw(
             RuntimeError(secret)
         ),
-        dry_run_endpoint_policy=lambda _config: None,
     )
     stderr = StringIO()
 
@@ -657,7 +663,6 @@ def test_project_dry_run_requires_literal_true(fixture_config) -> None:
         git=FakeGit(fixture_config),
         github=FakeGitHub(),
         http=FakeHttp({"git_sha": TEST_SHA}),
-        endpoint_policy=allow_fixture_endpoint,
     )
 
     with pytest.raises(ValueError, match="dry_run"):
@@ -679,7 +684,6 @@ def test_discovery_rejects_git_probe_bound_to_other_remote_url(
         git=fake_git,
         github=FakeGitHub(),
         http=FakeHttp({"git_sha": TEST_SHA}),
-        endpoint_policy=allow_fixture_endpoint,
     )
 
     with pytest.raises(ValueError, match="remote push URL"):
@@ -696,7 +700,6 @@ def test_discovery_rejects_git_attestation_for_other_repository(
         git=fake_git,
         github=FakeGitHub(),
         http=FakeHttp({"git_sha": TEST_SHA}),
-        endpoint_policy=allow_fixture_endpoint,
     )
 
     with pytest.raises(ValueError, match="repository path"):
@@ -712,14 +715,13 @@ def test_version_probe_requires_present_exact_40_hex_sha(
         git=FakeGit(fixture_config),
         github=FakeGitHub(),
         http=fake_http,
-        endpoint_policy=allow_fixture_endpoint,
     )
 
     assert adapter.version_matches(TEST_SHA)
     assert not adapter.version_matches("c" * 40)
     assert fake_http.calls == [
-        ("GET", "https://example.test.invalid/version"),
-        ("GET", "https://example.test.invalid/version"),
+        ("GET", "https://api.test.example.invalid/health"),
+        ("GET", "https://api.test.example.invalid/health"),
     ]
 
     for body in ({}, {"git_sha": "short"}, {"git_sha": "g" * 40}):
@@ -737,7 +739,6 @@ def test_nested_version_sha_field_is_supported(fixture_config) -> None:
         git=FakeGit(config),
         github=FakeGitHub(),
         http=FakeHttp({"build": {"git_sha": TEST_SHA}}),
-        endpoint_policy=allow_fixture_endpoint,
     )
 
     assert adapter.deployed_sha() == TEST_SHA

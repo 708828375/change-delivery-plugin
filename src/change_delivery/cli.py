@@ -247,7 +247,6 @@ class CliServices:
     discovery_factory: Callable[[Any], Any] | None = None
     discovery_http_factory: Callable[[], Any] | None = None
     discovery_git_runner: Any | None = None
-    dry_run_endpoint_policy: Callable[[Any], None] | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = validate_runtime_root(
@@ -259,8 +258,6 @@ class CliServices:
             self.base_sha_provider = _registered_base_sha
         if self.discovery_http_factory is None:
             self.discovery_http_factory = ReadOnlyHttpClient
-        if self.dry_run_endpoint_policy is None:
-            self.dry_run_endpoint_policy = enforce_project_test_endpoint
         if self.discovery_factory is None:
             http_factory = self.discovery_http_factory
             runner = self.discovery_git_runner
@@ -596,17 +593,8 @@ def _start_dry_run(project: Any, services: CliServices) -> dict[str, Any]:
             "deployed_sha": None,
         },
     }
-    endpoint_policy = services.dry_run_endpoint_policy
-    if endpoint_policy is None:
-        report["version_probe"] = {
-            "status": "blocked",
-            "reason": "test endpoint policy is unavailable",
-            "reason_code": "endpoint_policy_unavailable",
-            "deployed_sha": None,
-        }
-        return report
     try:
-        endpoint_policy(project)
+        enforce_project_test_endpoint(project)
     except Exception:
         report["version_probe"] = {
             "status": "blocked",
