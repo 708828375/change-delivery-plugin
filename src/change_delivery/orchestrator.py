@@ -46,6 +46,12 @@ class GitHubPort(Protocol):
     def list_actionable_reviews(
         self, pr_number: int
     ) -> tuple[ReviewThread, ...]: ...
+    def reply_to_thread(
+        self, pr_number: int, thread_id: str, body: str
+    ) -> None: ...
+    def thread_contains_comment(
+        self, pr_number: int, thread_id: str, body: str
+    ) -> bool: ...
 
 
 class StageExecutor(Protocol):
@@ -1190,7 +1196,9 @@ class Orchestrator:
         if remote_sha == run.head_sha:
             if operation is not None and operation.status == "PENDING":
                 self.repository.confirm_remote_operation(key)
-            return self._finish_push(run, branch, "feature_already_pushed")
+            return self._finish_push(
+                run, config, branch, "feature_already_pushed"
+            )
         if operation is not None and operation.status == "PENDING":
             return StepOutcome(
                 state=run.state,
@@ -1227,14 +1235,18 @@ class Orchestrator:
                 blocked_reason="push result SHA mismatch",
             )
         self.repository.confirm_remote_operation(key)
-        return self._finish_push(run, branch, "feature_pushed")
+        return self._finish_push(run, config, branch, "feature_pushed")
 
     def _finish_push(
         self,
         run: RunRecord,
+        config: ProjectConfig,
         branch: str,
         action: str,
     ) -> StepOutcome:
+        cycle = self._complete_review_fix_cycle(run, config)
+        if isinstance(cycle, StepOutcome):
+            return cycle
         payload = {"branch": branch, "sha": run.head_sha}
         reference = self.repository.register_evidence(
             run.run_id,
@@ -1247,13 +1259,150 @@ class Orchestrator:
             RunState.PUSHING_FEATURE,
             RunState.PR_DRAFT,
             "FEATURE_PUSHED",
-            (reference,),
+            (reference, *cycle),
         )
         return StepOutcome(
             state=RunState.PR_DRAFT,
             action=action,
-            evidence_ids=(reference.evidence_id,),
+            evidence_ids=(
+                reference.evidence_id,
+                *(item.evidence_id for item in cycle),
+            ),
         )
+
+    def _complete_review_fix_cycle(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> tuple[object, ...] | StepOutcome:
+        request = next(
+            (
+                self.repository.get_evidence(evidence_id)
+                for event in reversed(self.repository.list_events(run.run_id))
+                if event.to_state is RunState.FIXING_CI_REVIEW
+                for evidence_id in event.evidence_ids
+                if self.repository.get_evidence(evidence_id).kind
+                == "ci_review_fix_request"
+            ),
+            None,
+        )
+        if request is None:
+            return ()
+        payload = json.loads(request.payload_json)
+        if (
+            type(payload) is not dict
+            or type(payload.get("issues")) is not list
+            or payload.get("head_sha") == run.head_sha
+            or run.head_sha is None
+            or run.pr_number is None
+        ):
+            return StepOutcome(
+                state=RunState.PUSHING_FEATURE,
+                action="review_fix_cycle_blocked",
+                blocked_reason="review fix request or fix head is invalid",
+            )
+        github = self.github_factory(config)
+        references = []
+        for issue in payload["issues"]:
+            identity = json.loads(issue["issue_identity"])
+            if identity[0] != "review_thread":
+                continue
+            thread_id = identity[1]
+            marker_identity = hashlib.sha256(
+                (
+                    f"{run.run_id}:{issue['issue_fingerprint']}:"
+                    f"{request.evidence_id}:{payload['head_sha']}:"
+                    f"{run.head_sha}:{thread_id}"
+                ).encode("utf-8")
+            ).hexdigest()
+            body = (
+                "Applied an automated fix for this review thread.\n\n"
+                f"<!-- change-delivery-reply:{marker_identity} -->"
+            )
+            key = (
+                f"review_reply:{run.run_id}:"
+                f"{issue['issue_fingerprint']}:{run.head_sha}"
+            )
+            try:
+                operation = self.repository.get_remote_operation(key)
+            except KeyError:
+                operation = None
+            observed = github.thread_contains_comment(  # type: ignore[attr-defined]
+                run.pr_number, thread_id, body
+            )
+            if not observed:
+                if operation is not None:
+                    return StepOutcome(
+                        state=RunState.PUSHING_FEATURE,
+                        action="review_reply_reconciliation_pending",
+                        blocked_reason="review reply is not yet observable",
+                    )
+                self.repository.begin_remote_operation(
+                    key,
+                    run.run_id,
+                    "review_reply",
+                    (
+                        f"{config.github_repository}:{run.pr_number}:"
+                        f"{thread_id}:{marker_identity}"
+                    ),
+                )
+                github.reply_to_thread(  # type: ignore[attr-defined]
+                    run.pr_number, thread_id, body
+                )
+                observed = github.thread_contains_comment(  # type: ignore[attr-defined]
+                    run.pr_number, thread_id, body
+                )
+                if not observed:
+                    return StepOutcome(
+                        state=RunState.PUSHING_FEATURE,
+                        action="review_reply_reconciliation_pending",
+                        blocked_reason="review reply is not yet observable",
+                    )
+            if operation is not None and operation.status == "PENDING":
+                self.repository.confirm_remote_operation(key)
+            elif operation is None:
+                self.repository.confirm_remote_operation(key)
+            reply = self.repository.register_evidence(
+                run.run_id,
+                f"review-thread-replied:{marker_identity}",
+                "review_thread_replied",
+                {
+                    "run_id": run.run_id,
+                    "issue_fingerprint": issue["issue_fingerprint"],
+                    "request_evidence_id": request.evidence_id,
+                    "request_head_sha": payload["head_sha"],
+                    "fix_sha": run.head_sha,
+                    "thread_id": thread_id,
+                    "pr_number": run.pr_number,
+                    "reply_marker_sha256": marker_identity,
+                    "passed": True,
+                },
+            )
+            references.append(reply)
+        for issue in payload["issues"]:
+            pushed_identity = hashlib.sha256(
+                (
+                    f"{run.run_id}:{issue['issue_fingerprint']}:"
+                    f"{request.evidence_id}:{run.head_sha}"
+                ).encode("utf-8")
+            ).hexdigest()
+            pushed = self.repository.register_evidence(
+                run.run_id,
+                f"review-fix-pushed:{pushed_identity}",
+                "review_fix_pushed",
+                {
+                    "issue_fingerprint": issue["issue_fingerprint"],
+                    "observation_fingerprint": issue[
+                        "observation_fingerprint"
+                    ],
+                    "request_evidence_id": request.evidence_id,
+                    "request_head_sha": payload["head_sha"],
+                    "fix_sha": run.head_sha,
+                    "passed": True,
+                },
+            )
+            references.append(pushed)
+        return tuple(references)
 
     def _draft_pr(
         self,
@@ -1411,6 +1560,23 @@ class Orchestrator:
                         action="actionable_feedback_missing",
                         blocked_reason="remote failure lacks actionable details",
                         evidence_ids=(missing.evidence_id,),
+                    )
+                issues = tuple(
+                    issue
+                    for issue in issues
+                    if not self._review_issue_awaits_update(
+                        run.run_id,
+                        issue["issue_fingerprint"],
+                        issue["observation_fingerprint"],
+                    )
+                )
+                if not issues:
+                    return StepOutcome(
+                        state=RunState.MONITORING_CI_REVIEW,
+                        action="awaiting_review_update",
+                        blocked_reason=(
+                            "previous feedback has not been updated for fix head"
+                        ),
                     )
                 feedback_fingerprint = hashlib.sha256(
                     json.dumps(
@@ -1616,24 +1782,40 @@ class Orchestrator:
     def _feedback_issues(
         untrusted_data: dict[str, object],
     ) -> tuple[dict[str, str], ...]:
-        identities: set[tuple[str, ...]] = set()
-        for check in untrusted_data["failed_checks"]:  # type: ignore[union-attr]
-            identities.add(
-                (
-                    "ci_check",
-                    check["kind"],
-                    check.get("workflow") or "",
-                    check["name"],
-                )
-            )
+        identities: dict[tuple[str, ...], tuple[str, ...]] = {}
         for review in untrusted_data["requested_reviews"]:  # type: ignore[union-attr]
-            identities.add(("requested_review", review["review_id"]))
+            normalized_body = " ".join(review["body"].split()).casefold()
+            identity = (
+                "requested_review",
+                review["author"].casefold(),
+                normalized_body,
+            )
+            identities[identity] = (
+                *identity,
+                review["review_id"],
+            )
         for thread in untrusted_data["threads"]:  # type: ignore[union-attr]
-            identities.add(("review_thread", thread["thread_id"]))
+            identity = ("review_thread", thread["thread_id"])
+            reviewer_comments = tuple(
+                comment
+                for comment in thread["comments"]
+                if "<!-- change-delivery-reply:" not in comment
+            )
+            identities[identity] = (
+                *identity,
+                thread.get("path") or "",
+                str(thread.get("line") or ""),
+                *reviewer_comments,
+            )
         issues = []
-        for identity in sorted(identities):
+        for identity, observation in sorted(identities.items()):
             encoded = json.dumps(
                 identity,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            observation_encoded = json.dumps(
+                observation,
                 ensure_ascii=True,
                 separators=(",", ":"),
             )
@@ -1643,9 +1825,36 @@ class Orchestrator:
                     "issue_fingerprint": hashlib.sha256(
                         encoded.encode("ascii")
                     ).hexdigest(),
+                    "observation_identity": observation_encoded,
+                    "observation_fingerprint": hashlib.sha256(
+                        observation_encoded.encode("ascii")
+                    ).hexdigest(),
                 }
             )
         return tuple(issues)
+
+    def _review_issue_awaits_update(
+        self,
+        run_id: str,
+        issue_fingerprint: str,
+        observation_fingerprint: str,
+    ) -> bool:
+        for evidence in reversed(self.repository.list_evidence(run_id)):
+            if evidence.kind != "review_fix_pushed":
+                continue
+            payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(
+                evidence.sha256, sha256_payload(payload)
+            ):
+                raise ValueError("review fix push evidence digest mismatch")
+            if (
+                type(payload) is dict
+                and payload.get("issue_fingerprint") == issue_fingerprint
+            ):
+                return payload.get("observation_fingerprint") == (
+                    observation_fingerprint
+                )
+        return False
 
     def _review_fix_attempts(
         self,

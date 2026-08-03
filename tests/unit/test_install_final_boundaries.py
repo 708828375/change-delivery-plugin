@@ -58,6 +58,7 @@ $script = [IO.File]::ReadAllText(
 $injected = @'
 function Assert-ModuleTreeManifest {{}}
 function Assert-NoPythonBytecode {{}}
+function Assert-ClosedPythonModuleRoot {{}}
 function Resolve-TrustedPythonIdentity {{
   [PSCustomObject]@{{ path='C:\softs\python-3.12.10\python.exe'; sha256=('a'*64) }}
 }}

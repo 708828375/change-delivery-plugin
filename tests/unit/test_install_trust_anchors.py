@@ -140,6 +140,65 @@ if (-not $standaloneRejected) {{ exit 67 }}
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_closed_module_root_accepts_exact_manifest_tree(tmp_path: Path) -> None:
+    source_root = tmp_path / "src"
+    package = source_root / "change_delivery"
+    adapters = package / "adapters"
+    adapters.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (adapters / "__init__.py").write_text("\n", encoding="utf-8")
+    command = rf"""
+. '{SECURITY}'
+$contract = Get-Command Assert-ClosedPythonModuleRoot -ErrorAction SilentlyContinue
+if ($null -eq $contract -or $contract.CommandType -ne 'Function') {{ exit 68 }}
+$expected = Get-ModuleTreeManifest '{package}'
+Assert-ClosedPythonModuleRoot '{source_root}' $expected
+"""
+
+    result = run_ps(command)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "directory"),
+    (
+        ("sqlite3.py", False),
+        ("change_delivery/evil.pyd", False),
+        ("change_delivery/extra", True),
+    ),
+)
+def test_closed_module_root_rejects_unmanifested_import_entries(
+    tmp_path: Path,
+    relative_path: str,
+    directory: bool,
+) -> None:
+    source_root = tmp_path / "src"
+    package = source_root / "change_delivery"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+    attack = source_root / relative_path
+    if directory:
+        attack.mkdir(parents=True)
+    else:
+        attack.parent.mkdir(parents=True, exist_ok=True)
+        attack.write_bytes(b"attacker-controlled")
+    command = rf"""
+. '{SECURITY}'
+$contract = Get-Command Assert-ClosedPythonModuleRoot -ErrorAction SilentlyContinue
+if ($null -eq $contract -or $contract.CommandType -ne 'Function') {{ exit 69 }}
+$expected = Get-ModuleTreeManifest '{package}'
+$rejected = $false
+try {{ Assert-ClosedPythonModuleRoot '{source_root}' $expected }}
+catch {{ $rejected = $true }}
+if (-not $rejected) {{ exit 70 }}
+"""
+
+    result = run_ps(command)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_tick_pins_helper_and_holds_all_module_handles() -> None:
     tick = TICK.read_text(encoding="utf-8")
     scheduled = SCHEDULED.read_text(encoding="utf-8")
@@ -154,3 +213,5 @@ def test_tick_pins_helper_and_holds_all_module_handles() -> None:
     assert "sys.implementation.cache_tag=None" in tick
     assert "Assert-NoPythonBytecode" in scheduled
     assert scheduled.count("Assert-NoPythonBytecode") >= 2
+    assert "Assert-ClosedPythonModuleRoot" in tick
+    assert "Assert-ClosedPythonModuleRoot" in scheduled

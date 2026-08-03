@@ -536,11 +536,15 @@ class RuntimeStageExecutor:
                 or set(issue) != {
                     "issue_identity",
                     "issue_fingerprint",
+                    "observation_identity",
+                    "observation_fingerprint",
                     "existing_attempts",
                     "attempt",
                 }
                 or type(issue["issue_identity"]) is not str
                 or type(issue["issue_fingerprint"]) is not str
+                or type(issue["observation_identity"]) is not str
+                or type(issue["observation_fingerprint"]) is not str
                 or type(issue["existing_attempts"]) is not int
                 or type(issue["attempt"]) is not int
                 or issue["attempt"] != issue["existing_attempts"] + 1
@@ -553,6 +557,13 @@ class RuntimeStageExecutor:
                 issue["issue_fingerprint"], issue_fingerprint
             ):
                 raise ValueError("review fix issue fingerprint is invalid")
+            observation_fingerprint = hashlib.sha256(
+                issue["observation_identity"].encode("ascii")
+            ).hexdigest()
+            if not hmac.compare_digest(
+                issue["observation_fingerprint"], observation_fingerprint
+            ):
+                raise ValueError("review fix observation fingerprint is invalid")
             assert_fix_attempt_allowed(
                 issue["issue_fingerprint"], issue["existing_attempts"]
             )

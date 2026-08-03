@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
 $script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = '7539abc7439e06f70baddb260b3e1539cb5f749e51c48340193aa1d88171fc03'
+$script:TrustedModuleManifestSha256 = 'e6d2545239d7067dffa17d9fddaba463512ef7243c97ca6321ee105d458fb5d8'
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -364,6 +364,82 @@ function ConvertTo-CanonicalModuleManifest([object[]] $Manifest) {
         }
     )
     return ConvertTo-Json $normalized -Compress
+}
+
+function Assert-ClosedPythonModuleRoot(
+    [string] $ModuleRoot,
+    [object[]] $Expected
+) {
+    $root = (Resolve-Path -LiteralPath $ModuleRoot -ErrorAction Stop).ProviderPath
+    Assert-NoReparseChain $root
+    [void](ConvertTo-CanonicalModuleManifest $Expected)
+
+    $rootEntries = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop)
+    if (
+        $rootEntries.Count -ne 1 -or
+        $rootEntries[0] -isnot [IO.DirectoryInfo] -or
+        $rootEntries[0].Name -cne 'change_delivery' -or
+        ($rootEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    ) {
+        throw 'Trusted src root must contain only the ordinary change_delivery directory.'
+    }
+
+    $packageRoot = (Resolve-Path -LiteralPath (
+        Join-Path $root 'change_delivery'
+    ) -ErrorAction Stop).ProviderPath
+    Assert-NoReparseChain $packageRoot
+    Assert-NoPythonBytecode $packageRoot
+
+    $expectedFiles = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    $expectedDirectories = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal
+    )
+    foreach ($entry in $Expected) {
+        $relative = [string] $entry.relative_path
+        if (-not $expectedFiles.Add($relative)) {
+            throw 'Trusted module manifest contains duplicate paths.'
+        }
+        $segments = @($relative.Split('/'))
+        for ($index = 1; $index -lt $segments.Count; $index++) {
+            [void] $expectedDirectories.Add(
+                (($segments[0..($index - 1)]) -join '/')
+            )
+        }
+    }
+
+    $actualEntries = @(
+        Get-ChildItem -LiteralPath $packageRoot -Recurse -Force -ErrorAction Stop
+    )
+    if (
+        $actualEntries.Count -ne
+        ($expectedFiles.Count + $expectedDirectories.Count)
+    ) {
+        throw 'Trusted Python package tree contains unmanifested entries.'
+    }
+    foreach ($item in $actualEntries) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Trusted Python package tree contains a reparse point.'
+        }
+        $relative = $item.FullName.Substring($packageRoot.Length).TrimStart('\')
+        $relative = $relative.Replace('\', '/')
+        if ($item -is [IO.DirectoryInfo]) {
+            if (-not $expectedDirectories.Contains($relative)) {
+                throw 'Trusted Python package tree contains an unexpected directory.'
+            }
+            Assert-NoReparseChain $item.FullName
+            continue
+        }
+        if (
+            $item -isnot [IO.FileInfo] -or
+            -not $expectedFiles.Contains($relative)
+        ) {
+            throw 'Trusted Python package tree contains an unexpected file.'
+        }
+        [void](Resolve-RegularFile $item.FullName $item.Name)
+    }
+    Assert-ModuleTreeManifest $packageRoot $Expected
 }
 
 function Assert-ModuleTreeManifest([string] $ModuleRoot, [object[]] $Expected) {

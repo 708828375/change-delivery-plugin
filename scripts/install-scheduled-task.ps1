@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = '918ba38a2f81a5a1fe501ccaacdd9fce599395fa4a28fbe5411a4fd0931bc7c2'
+$TrustedHostSecuritySha256 = '441ec7f64fb80e2c3ef030bb4a16faeef89bbf2e1c644a899e9a044866b4d4cc'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -56,6 +56,7 @@ Assert-NoPythonBytecode (Join-Path $moduleRoot 'change_delivery')
 $moduleManifest = @(Read-TrustedModuleManifest)
 Assert-ModuleTreeManifest (Join-Path $moduleRoot 'change_delivery') $moduleManifest
 Assert-NoPythonBytecode (Join-Path $moduleRoot 'change_delivery')
+Assert-ClosedPythonModuleRoot $moduleRoot $moduleManifest
 
 $python = Resolve-TrustedPythonIdentity
 $codex = Resolve-OfficialCodexIdentity

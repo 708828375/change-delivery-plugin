@@ -643,6 +643,28 @@ class GitHubAdapter:
         if not isinstance(comment_id, str) or not comment_id:
             raise GitHubError("reply_to_thread", "reply ID was invalid")
 
+    def thread_contains_comment(
+        self,
+        pr_number: int,
+        thread_id: str,
+        body: str,
+    ) -> bool:
+        _validate_number(pr_number)
+        _validate_thread_id(thread_id)
+        _validate_body(body, allow_empty=False)
+        first = self._query_threads(pr_number)
+        second = self._query_threads(pr_number)
+        if self._thread_fingerprint(first) != self._thread_fingerprint(second):
+            raise SnapshotChanged(
+                "review_threads", "review thread evidence changed"
+            )
+        matching = [
+            thread for thread in second if thread.thread_id == thread_id
+        ]
+        if len(matching) != 1:
+            raise ValueError("review thread does not belong to pull request")
+        return body in matching[0].comments
+
     def _locate_pr(self, head: str, base: str) -> PullRequestRef | None:
         try:
             view_result = self._execute(

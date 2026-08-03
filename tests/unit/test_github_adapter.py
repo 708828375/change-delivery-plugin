@@ -843,6 +843,22 @@ def test_list_actionable_reviews_filters_and_sorts_by_stable_id(
     assert reviews[0].comments == ("please fix",)
 
 
+def test_thread_comment_observation_is_double_sampled(tmp_path: Path) -> None:
+    body = "Applied fix.\n\n<!-- change-delivery-reply:abc123 -->"
+    observed = thread_payload(thread_id="PRRT_observed")
+    comments = observed["comments"]
+    assert isinstance(comments, dict)
+    comments["nodes"] = [{"body": "please fix"}, {"body": body}]
+    runner = FakeRunner(
+        result(graphql_payload(observed)),
+        result(graphql_payload(observed)),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    assert adapter.thread_contains_comment(152, "PRRT_observed", body)
+    assert len(runner.commands) == 2
+
+
 def test_graphql_parser_rejects_missing_fields_and_unknown_shape(
     tmp_path: Path,
 ) -> None:

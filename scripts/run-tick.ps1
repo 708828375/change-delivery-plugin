@@ -7,7 +7,7 @@ $fixedSourceRoot = (
 if ($fixedSourceRoot -cne 'C:\Users\ExampleUser\change-delivery-plugin') {
     throw 'Tick entrypoint is not running from the fixed source root.'
 }
-$TrustedHostSecuritySha256 = '918ba38a2f81a5a1fe501ccaacdd9fce599395fa4a28fbe5411a4fd0931bc7c2'
+$TrustedHostSecuritySha256 = '441ec7f64fb80e2c3ef030bb4a16faeef89bbf2e1c644a899e9a044866b4d4cc'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -106,8 +106,10 @@ try {
     }
     $trustedModuleTree = Join-Path $fixedModuleRoot 'change_delivery'
     Assert-NoPythonBytecode $trustedModuleTree
+    Assert-ClosedPythonModuleRoot $fixedModuleRoot @($hostConfig.module_manifest)
     $moduleStreams = @(Open-ModuleTreeHandles $trustedModuleTree @($hostConfig.module_manifest))
     Assert-NoPythonBytecode $trustedModuleTree
+    Assert-ClosedPythonModuleRoot $fixedModuleRoot @($hostConfig.module_manifest)
 
 
     $pythonPath = [string] $hostConfig.python_path
@@ -156,6 +158,7 @@ try {
         "runpy.run_module('change_delivery',run_name='__main__')"
     )
     Assert-NoPythonBytecode $trustedModuleTree
+    Assert-ClosedPythonModuleRoot $fixedModuleRoot @($hostConfig.module_manifest)
     & $pythonPath -I -B -c $bootstrap $moduleRoot tick `
         --plugin-root $runtimeRoot --json
     exit $LASTEXITCODE
