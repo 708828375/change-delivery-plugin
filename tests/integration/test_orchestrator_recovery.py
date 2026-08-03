@@ -16,7 +16,7 @@ import pytest
 import change_delivery.cli as cli_module
 from change_delivery.approval import build_approval, save_approval
 from change_delivery.adapters.codex import CodexAdapter
-from change_delivery.adapters.github import PullRequestRef
+from change_delivery.adapters.github import PullRequestRef, ReviewThread
 from change_delivery.database import Database
 from change_delivery.cli import CliServices, main
 from change_delivery.config import load_project_config
@@ -132,6 +132,7 @@ class FakeGitHub:
     is_draft: bool = True
     merged: bool = False
     merge_query_calls: int = 0
+    actionable_reviews: tuple[ReviewThread, ...] = ()
 
     def ensure_draft_pr(
         self, branch: str, base: str, title: str, body: str
@@ -156,6 +157,12 @@ class FakeGitHub:
     def snapshot(self, pr_number: int) -> object:
         assert self.snapshot_result is not None
         return self.snapshot_result
+
+    def list_actionable_reviews(
+        self, pr_number: int
+    ) -> tuple[ReviewThread, ...]:
+        assert pr_number == self.pr_number
+        return self.actionable_reviews
 
     def get_pr(self, pr_number: int) -> object:
         self.get_calls += 1
@@ -757,13 +764,34 @@ def test_default_cli_wires_git_and_github_adapters(
 def test_default_runtime_skills_are_bundled_with_plugin() -> None:
     source_root = Path(cli_module.__file__).resolve().parents[2]
     for name in (
+        "delivery-planning",
+        "delivery-implement",
+        "delivery-review",
+        "project-test-acceptance",
+    ):
+        assert (source_root / "skills" / name / "SKILL.md").is_file()
+
+    globally_existing_names = {
         "writing-plans",
         "subagent-driven-development",
         "verification-before-completion",
         "requesting-code-review",
         "receiving-code-review",
-    ):
-        assert (source_root / "skills" / name / "SKILL.md").is_file()
+    }
+    bundled_names = {
+        path.name
+        for path in (source_root / "skills").iterdir()
+        if path.is_dir() and (path / "SKILL.md").is_file()
+    }
+    assert bundled_names == {
+        "change-delivery",
+        "delivery-planning",
+        "delivery-implement",
+        "delivery-review",
+        "project-test-acceptance",
+        "production-release",
+    }
+    assert bundled_names.isdisjoint(globally_existing_names)
 
 
 def test_runtime_local_validation_registers_host_bound_source(
@@ -817,9 +845,11 @@ def test_runtime_codex_stage_replaces_untrusted_model_evidence(
     fixture: Fixture,
 ) -> None:
     run_id = fixture.create(RunState.DRAFT)
+    requests: list[object] = []
 
     class FakeCodex:
         def run_stage(self, request: object) -> StageResult:
+            requests.append(request)
             worktree = request.worktree  # type: ignore[attr-defined]
             (worktree / "design.md").write_text("design", encoding="utf-8")
             (worktree / "implementation-plan.md").write_text(
@@ -860,6 +890,7 @@ def test_runtime_codex_stage_replaces_untrusted_model_evidence(
     )
     assert evidence.kind == "design_passed"
     assert json.loads(evidence.payload_json)["artifact_hashes"]
+    assert requests[0].expected_skill == "delivery-planning"  # type: ignore[attr-defined]
     with pytest.raises(KeyError):
         fixture.repository.get_evidence("model-invented")
 
@@ -889,6 +920,14 @@ def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
             "UPDATE runs SET state = ? WHERE run_id = ?",
             (RunState.IMPLEMENTING.value, run_id),
         )
+    if stage == "review_fix":
+        with fixture.repository.database.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state = ?, pr_number = 42 WHERE run_id = ?",
+                (RunState.MONITORING_CI_REVIEW.value, run_id),
+            )
+        fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+        fixture.orchestrator().step(run_id)
     worktree = fixture.root / "worktrees" / run_id
     worktree.mkdir(parents=True)
     captured: list[object] = []
@@ -2533,6 +2572,17 @@ def test_monitor_distinguishes_waiting_from_actionable_failure(
             (run_id,),
         )
     fixture.github.snapshot_result = Snapshot(SHA, **changes)
+    if changes.get("unresolved_thread_ids"):
+        fixture.github.actionable_reviews = (
+            ReviewThread(
+                thread_id="PRRT_actionable",
+                resolved=False,
+                outdated=False,
+                path="src/example.py",
+                line=17,
+                comments=("Please fix this issue.",),
+            ),
+        )
     for kind in ("acceptance_passed", "internal_review_passed"):
         fixture.repository.register_evidence(
             run_id, f"{kind}-ok", kind, {"sha": SHA, "passed": True}
@@ -2541,6 +2591,192 @@ def test_monitor_distinguishes_waiting_from_actionable_failure(
     outcome = fixture.orchestrator().step(run_id)
 
     assert outcome.state is expected_state
+
+
+def test_monitor_binds_actionable_review_content_and_attempt_to_fix_event(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
+            (run_id,),
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA,
+        review_status="changes_requested",
+        unresolved_thread_ids=("PRRT_actionable",),
+    )
+    fixture.github.actionable_reviews = (
+        ReviewThread(
+            thread_id="PRRT_actionable",
+            resolved=False,
+            outdated=False,
+            path="src/example.py",
+            line=17,
+            comments=("Handle the empty input before indexing.",),
+        ),
+    )
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.FIXING_CI_REVIEW
+    event = fixture.repository.list_events(run_id)[-1]
+    evidence_ids = event.evidence_ids
+    assert len(evidence_ids) == 1
+    evidence = fixture.repository.get_evidence(evidence_ids[0])
+    payload = json.loads(evidence.payload_json)
+    assert evidence.kind == "ci_review_fix_request"
+    assert payload["attempt"] == 1
+    assert payload["existing_attempts"] == 0
+    assert payload["feedback"]["threads"] == [
+        {
+            "comments": ["Handle the empty input before indexing."],
+            "line": 17,
+            "path": "src/example.py",
+            "thread_id": "PRRT_actionable",
+        }
+    ]
+
+
+def test_runtime_review_fix_receives_event_bound_feedback_and_attempt(
+    fixture: Fixture,
+) -> None:
+    run_id, _ = approve_fixture_run(fixture)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ?, pr_number = 42 WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+    fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+    fixture.orchestrator().step(run_id)
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+    captured: list[object] = []
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            captured.append(request)
+            return StageResult(
+                status="blocked",
+                summary="captured",
+                evidence=(),
+                findings=(),
+                next_action="host decides",
+            )
+
+    executor = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        codex_factory=lambda: FakeCodex(),
+    )
+    executor.execute(
+        "review_fix",
+        fixture.repository.get_run(run_id),
+        config(fixture.root),
+        fixture.root / "runs" / run_id,
+    )
+
+    request = captured[0]
+    scope = json.loads(request.approval_scope)  # type: ignore[attr-defined]
+    assert request.attempt == 1  # type: ignore[attr-defined]
+    assert scope["actionable_feedback"]["feedback"] == {
+        "checks_status": "failed",
+        "review_status": None,
+        "threads": [],
+    }
+    assert set(scope["approved_artifacts"]) == {
+        "requirement.md",
+        "design.md",
+        "implementation-plan.md",
+    }
+
+
+def test_monitor_stops_same_feedback_after_two_automatic_fix_rounds(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
+            (run_id,),
+        )
+    fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+    orchestrator = fixture.orchestrator()
+
+    first = orchestrator.step(run_id)
+    assert first.state is RunState.FIXING_CI_REVIEW
+    first_payload = json.loads(
+        next(
+            evidence.payload_json
+            for evidence in fixture.repository.list_evidence(run_id)
+            if evidence.kind == "ci_review_fix_request"
+        )
+    )
+    fingerprint = first_payload["feedback_fingerprint"]
+    second = fixture.repository.register_evidence(
+        run_id,
+        f"ci-review-fix-request:{run_id}:{fingerprint}:2",
+        "ci_review_fix_request",
+        {**first_payload, "attempt": 2, "existing_attempts": 1},
+    )
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+    fixture.repository.transition_with_evidence(
+        run_id,
+        RunState.MONITORING_CI_REVIEW,
+        RunState.FIXING_CI_REVIEW,
+        "CI_OR_REVIEW_CHANGES_REQUIRED",
+        (second,),
+    )
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+
+    stopped = orchestrator.step(run_id)
+
+    assert stopped.state is RunState.REVIEW_DECISION_REQUIRED
+    assert stopped.action == "review_fix_limit_reached"
+    assert "two automatic fix rounds" in (stopped.blocked_reason or "")
+    requests = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "ci_review_fix_request"
+    ]
+    assert len(requests) == 2
+
+
+def test_monitor_resets_attempt_for_changed_feedback_fingerprint(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
+            (run_id,),
+        )
+    fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+    orchestrator = fixture.orchestrator()
+    orchestrator.step(run_id)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA, review_status="changes_requested"
+    )
+
+    changed = orchestrator.step(run_id)
+
+    assert changed.state is RunState.FIXING_CI_REVIEW
+    latest = fixture.repository.get_evidence(changed.evidence_ids[0])
+    assert json.loads(latest.payload_json)["attempt"] == 1
 
 
 @pytest.mark.parametrize("bad_payload", [

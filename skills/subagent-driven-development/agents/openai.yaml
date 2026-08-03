@@ -1,4 +1,0 @@
-interface:
-  display_name: "Development Executor"
-  short_description: "Implement an approved delivery plan safely"
-  default_prompt: "Use $subagent-driven-development to implement the approved plan."

@@ -1,6 +1,10 @@
 __pycache__/
 .pytest_cache/
 /.pytest_*/
+/.pytest-*/
+/.review-*/
+/.security-*/
+/.test-tmp/
 .coverage
 htmlcov/
 dist/

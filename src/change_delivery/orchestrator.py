@@ -19,7 +19,7 @@ from change_delivery.approval import (
     load_approval,
     verify_approval,
 )
-from change_delivery.adapters.github import PullRequestRef
+from change_delivery.adapters.github import PullRequestRef, ReviewThread
 from change_delivery.domain import (
     ProjectConfig,
     RunRecord,
@@ -27,6 +27,7 @@ from change_delivery.domain import (
     StageResult,
     StepOutcome,
 )
+from change_delivery.evidence import sha256_payload
 from change_delivery.repository import RunRepository
 from change_delivery.process import ProcessTimeoutError
 from change_delivery.state_machine import READY_TO_MERGE_EVIDENCE
@@ -42,6 +43,9 @@ class GitHubPort(Protocol):
     def ensure_draft_pr(
         self, branch: str, base: str, title: str, body: str
     ) -> object: ...
+    def list_actionable_reviews(
+        self, pr_number: int
+    ) -> tuple[ReviewThread, ...]: ...
 
 
 class StageExecutor(Protocol):
@@ -1380,16 +1384,75 @@ class Orchestrator:
                 or snapshot.review_status == "changes_requested"
                 or bool(snapshot.unresolved_thread_ids)
             ):
+                feedback = self._actionable_feedback(
+                    github, run.pr_number, snapshot
+                )
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        feedback,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                existing_attempts = self._review_fix_attempts(
+                    run.run_id, fingerprint
+                )
+                if existing_attempts >= 2:
+                    limit = self.repository.register_evidence(
+                        run.run_id,
+                        f"review-fix-limit:{run.run_id}:{fingerprint}",
+                        "review_fix_limit_reached",
+                        {
+                            "feedback_fingerprint": fingerprint,
+                            "attempts": existing_attempts,
+                            "pr_number": run.pr_number,
+                        },
+                    )
+                    self.repository.transition_with_evidence(
+                        run.run_id,
+                        RunState.MONITORING_CI_REVIEW,
+                        RunState.REVIEW_DECISION_REQUIRED,
+                        "REVIEW_FIX_LIMIT_REACHED",
+                        (limit,),
+                    )
+                    return StepOutcome(
+                        state=RunState.REVIEW_DECISION_REQUIRED,
+                        action="review_fix_limit_reached",
+                        blocked_reason=(
+                            "same feedback remained after two automatic fix rounds"
+                        ),
+                        evidence_ids=(limit.evidence_id,),
+                    )
+                attempt = existing_attempts + 1
+                request = self.repository.register_evidence(
+                    run.run_id,
+                    (
+                        f"ci-review-fix-request:{run.run_id}:"
+                        f"{fingerprint}:{attempt}"
+                    ),
+                    "ci_review_fix_request",
+                    {
+                        "attempt": attempt,
+                        "existing_attempts": existing_attempts,
+                        "feedback": feedback,
+                        "feedback_fingerprint": fingerprint,
+                        "head_sha": run.head_sha,
+                        "pr_number": run.pr_number,
+                    },
+                )
                 self.repository.transition_with_evidence(
                     run.run_id,
                     RunState.MONITORING_CI_REVIEW,
                     RunState.FIXING_CI_REVIEW,
                     "CI_OR_REVIEW_CHANGES_REQUIRED",
+                    (request,),
                 )
                 return StepOutcome(
                     state=RunState.FIXING_CI_REVIEW,
                     action="ci_review_changes_required",
                     blocked_reason="CI or review gates require changes",
+                    evidence_ids=(request.evidence_id,),
                 )
             return StepOutcome(
                 state=run.state,
@@ -1416,6 +1479,10 @@ class Orchestrator:
         by_kind = {}
         for evidence in self.repository.list_evidence(run.run_id):
             payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(
+                evidence.sha256, sha256_payload(payload)
+            ):
+                raise ValueError("review fix attempt evidence digest mismatch")
             if (
                 type(payload) is dict
                 and payload.get("sha") == run.head_sha
@@ -1444,6 +1511,72 @@ class Orchestrator:
             action="ready_to_merge",
             evidence_ids=tuple(ref.evidence_id for ref in gate_refs),
         )
+
+    @staticmethod
+    def _actionable_feedback(
+        github: object,
+        pr_number: int,
+        snapshot: object,
+    ) -> dict[str, object]:
+        threads = github.list_actionable_reviews(pr_number)  # type: ignore[attr-defined]
+        if not isinstance(threads, tuple) or any(
+            not isinstance(thread, ReviewThread) for thread in threads
+        ):
+            raise ValueError("actionable review facts are invalid")
+        thread_ids = tuple(thread.thread_id for thread in threads)
+        if thread_ids != tuple(sorted(set(thread_ids))):
+            raise ValueError("actionable review facts are not stable and unique")
+        if set(thread_ids) != set(snapshot.unresolved_thread_ids):
+            raise ValueError("actionable review facts changed during observation")
+        return {
+            "checks_status": (
+                "failed" if snapshot.checks_status == "failed" else None
+            ),
+            "review_status": (
+                "changes_requested"
+                if snapshot.review_status == "changes_requested"
+                else None
+            ),
+            "threads": [
+                {
+                    "thread_id": thread.thread_id,
+                    "path": thread.path,
+                    "line": thread.line,
+                    "comments": list(thread.comments),
+                }
+                for thread in threads
+            ],
+        }
+
+    def _review_fix_attempts(
+        self,
+        run_id: str,
+        fingerprint: str,
+    ) -> int:
+        bound_ids = {
+            evidence_id
+            for event in self.repository.list_events(run_id)
+            if event.to_state is RunState.FIXING_CI_REVIEW
+            for evidence_id in event.evidence_ids
+        }
+        attempts: set[int] = set()
+        for evidence in self.repository.list_evidence(run_id):
+            if (
+                evidence.evidence_id not in bound_ids
+                or evidence.kind != "ci_review_fix_request"
+            ):
+                continue
+            payload = json.loads(evidence.payload_json)
+            if (
+                type(payload) is dict
+                and payload.get("feedback_fingerprint") == fingerprint
+                and type(payload.get("attempt")) is int
+                and 1 <= payload["attempt"] <= 2
+            ):
+                attempts.add(payload["attempt"])
+        if attempts and attempts != set(range(1, max(attempts) + 1)):
+            raise ValueError("review fix attempt history is not contiguous")
+        return len(attempts)
 
     def cancel(self, run_id: str) -> StepOutcome:
         run = self.repository.get_run(run_id)

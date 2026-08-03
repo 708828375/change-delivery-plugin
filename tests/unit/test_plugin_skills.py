@@ -42,6 +42,22 @@ def test_change_delivery_is_explicit_and_enforces_public_entry_gates() -> None:
         assert required in body
 
 
+def test_delivery_planning_is_internal_and_design_only() -> None:
+    body, metadata = _skill("delivery-planning")
+
+    assert metadata["policy"]["allow_implicit_invocation"] is False
+    assert "$delivery-planning" in metadata["interface"]["default_prompt"]
+    for required in (
+        "requirement.md",
+        "design.md",
+        "implementation-plan.md",
+        "Do not edit product code",
+        "Do not approve",
+        "structured stage result",
+    ):
+        assert required in body
+
+
 def test_delivery_implement_is_single_writer_tdd_and_worktree_scoped() -> None:
     body, metadata = _skill("delivery-implement")
 

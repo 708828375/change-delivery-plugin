@@ -1,0 +1,7 @@
+interface:
+  display_name: "Delivery Planning"
+  short_description: "Create an approved-scope delivery design and plan"
+  default_prompt: "Use $delivery-planning to create the delivery design and plan."
+
+policy:
+  allow_implicit_invocation: false

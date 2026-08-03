@@ -14,7 +14,11 @@ import time
 from collections.abc import Callable
 from uuid import uuid4
 
-from change_delivery.adapters.codex import CodexAdapter, StageExecutionRequest
+from change_delivery.adapters.codex import (
+    CodexAdapter,
+    StageExecutionRequest,
+    assert_fix_attempt_allowed,
+)
 from change_delivery.adapters.git import GitAdapter
 from change_delivery.adapters.http import ReadOnlyHttpClient
 from change_delivery.adapters.project import (
@@ -25,15 +29,17 @@ from change_delivery.domain import (
     AcceptanceCheckResult,
     ProjectConfig,
     RunRecord,
+    RunState,
     StageResult,
     stage_result_schema_json,
 )
+from change_delivery.evidence import sha256_payload
 from change_delivery.process import ProcessRunner
 from change_delivery.repository import RunRepository
 
 
 _STAGE_SKILLS = {
-    "design": "writing-plans",
+    "design": "delivery-planning",
     "implementation": "delivery-implement",
     "internal_review": "delivery-review",
     "review_fix": "delivery-implement",
@@ -90,6 +96,18 @@ class RuntimeStageExecutor:
             if stage == "design"
             else self._worktree(run.run_id)
         )
+        review_fix_scope = (
+            self._review_fix_scope(run) if stage == "review_fix" else None
+        )
+        review_fix_attempt = 1
+        if review_fix_scope is not None:
+            actionable_feedback = review_fix_scope["actionable_feedback"]
+            if not isinstance(actionable_feedback, dict):
+                raise ValueError("review fix feedback scope is invalid")
+            candidate_attempt = actionable_feedback.get("attempt")
+            if type(candidate_attempt) is not int:
+                raise ValueError("review fix attempt is invalid")
+            review_fix_attempt = candidate_attempt
         request = StageExecutionRequest(
             run_id=run.run_id,
             stage=stage,
@@ -103,7 +121,16 @@ class RuntimeStageExecutor:
             ),
             worktree=worktree,
             head_sha=run.head_sha or self._design_head(config),
-            approval_scope=self._approval_scope(stage, run, run_root),
+            approval_scope=(
+                json.dumps(
+                    review_fix_scope,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                if review_fix_scope is not None
+                else self._approval_scope(stage, run, run_root)
+            ),
             automation_limit="Stop at READY_TO_MERGE; never merge or release.",
             allowed_actions=self._allowed_actions(stage),
             forbidden_actions=(
@@ -120,7 +147,7 @@ class RuntimeStageExecutor:
                 if stage == "internal_review"
                 else "writer"
             ),
-            attempt=1,
+            attempt=review_fix_attempt,
             timeout_seconds=config.codex_timeout_seconds,
         )
         result = self._codex().run_stage(request)
@@ -463,6 +490,78 @@ class RuntimeStageExecutor:
         )
         if len(scope) > 20_000:
             raise ValueError("approved artifacts exceed Codex scope limit")
+        return scope
+
+    def _review_fix_scope(self, run: RunRecord) -> dict[str, object]:
+        if run.state is not RunState.FIXING_CI_REVIEW:
+            raise ValueError("review fix stage requires its dedicated run state")
+        entering = next(
+            (
+                event
+                for event in reversed(self._repository.list_events(run.run_id))
+                if event.to_state is RunState.FIXING_CI_REVIEW
+                and event.from_state is RunState.MONITORING_CI_REVIEW
+            ),
+            None,
+        )
+        if entering is None:
+            raise ValueError("review fix request event is missing")
+        requests = []
+        for evidence_id in entering.evidence_ids:
+            evidence = self._repository.get_evidence(evidence_id)
+            if evidence.kind == "ci_review_fix_request":
+                requests.append(evidence)
+        if len(requests) != 1:
+            raise ValueError("review fix request evidence is missing or ambiguous")
+        payload = json.loads(requests[0].payload_json)
+        if not hmac.compare_digest(
+            requests[0].sha256, sha256_payload(payload)
+        ):
+            raise ValueError("review fix request evidence digest mismatch")
+        if (
+            type(payload) is not dict
+            or type(payload.get("attempt")) is not int
+            or type(payload.get("existing_attempts")) is not int
+            or type(payload.get("feedback_fingerprint")) is not str
+            or type(payload.get("feedback")) is not dict
+            or payload.get("head_sha") != run.head_sha
+            or payload.get("pr_number") != run.pr_number
+            or payload["attempt"] != payload["existing_attempts"] + 1
+        ):
+            raise ValueError("review fix request evidence is invalid")
+        actual_fingerprint = hashlib.sha256(
+            json.dumps(
+                payload["feedback"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(
+            payload["feedback_fingerprint"], actual_fingerprint
+        ):
+            raise ValueError("review fix feedback fingerprint is invalid")
+        assert_fix_attempt_allowed(
+            payload["feedback_fingerprint"], payload["existing_attempts"]
+        )
+        artifacts = {
+            name: contents.decode("utf-8")
+            for name, contents in self._repository.get_approved_artifacts(
+                run.run_id
+            ).items()
+        }
+        scope = {
+            "approved_artifacts": artifacts,
+            "actionable_feedback": payload,
+        }
+        encoded = json.dumps(
+            scope,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(encoded) > 20_000:
+            raise ValueError("review fix scope exceeds Codex scope limit")
         return scope
 
 

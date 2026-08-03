@@ -1,4 +1,0 @@
-interface:
-  display_name: "Delivery Verification"
-  short_description: "Verify an implementation with required checks"
-  default_prompt: "Use $verification-before-completion to verify the delivery worktree."

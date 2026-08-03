@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import os
@@ -22,6 +24,144 @@ RAW_LOG_GLOBS = (
 REPORT_GLOBS = ("reports/*.md", "sanitized-summary.md")
 _RAW_RETENTION = timedelta(days=30)
 _REPORT_RETENTION = timedelta(days=180)
+
+
+class _StableDirectoryHandle:
+    """Hold a directory identity and, on Windows, deny rename/delete sharing."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.canonical_path: Path | None = None
+        self._handle: int | None = None
+
+    def __enter__(self) -> _StableDirectoryHandle:
+        if os.name == "nt":
+            self._open_windows()
+        else:
+            self._open_posix()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is None:
+            return
+        if os.name == "nt":
+            _windows_kernel32().CloseHandle(handle)
+        else:
+            os.close(handle)
+
+    def _open_posix(self) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            os.close(descriptor)
+            raise ValueError("stable handle target is not a directory")
+        self._handle = descriptor
+        self.canonical_path = self.path.resolve(strict=True)
+
+    def _open_windows(self) -> None:
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", ctypes.c_ulong),
+                ("creation_time_low", ctypes.c_ulong),
+                ("creation_time_high", ctypes.c_ulong),
+                ("access_time_low", ctypes.c_ulong),
+                ("access_time_high", ctypes.c_ulong),
+                ("write_time_low", ctypes.c_ulong),
+                ("write_time_high", ctypes.c_ulong),
+                ("volume_serial", ctypes.c_ulong),
+                ("file_size_high", ctypes.c_ulong),
+                ("file_size_low", ctypes.c_ulong),
+                ("link_count", ctypes.c_ulong),
+                ("file_index_high", ctypes.c_ulong),
+                ("file_index_low", ctypes.c_ulong),
+            ]
+
+        kernel32 = _windows_kernel32()
+        handle = kernel32.CreateFileW(
+            str(self.path),
+            0x0080,  # FILE_READ_ATTRIBUTES
+            0x00000001 | 0x00000002,  # exclude FILE_SHARE_DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            error = ctypes.get_last_error()
+            if error in {2, 3}:
+                raise FileNotFoundError(error, "directory no longer exists", self.path)
+            raise ctypes.WinError(error)
+        information = FileInformation()
+        if not kernel32.GetFileInformationByHandle(
+            handle, ctypes.byref(information)
+        ):
+            error = ctypes.get_last_error()
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError(error)
+        if not information.attributes & 0x10 or information.attributes & 0x400:
+            kernel32.CloseHandle(handle)
+            raise ValueError("stable handle target is unsafe")
+        try:
+            self.canonical_path = _windows_final_path(kernel32, handle)
+        except (OSError, ValueError):
+            kernel32.CloseHandle(handle)
+            raise
+        self._handle = int(handle)
+
+
+def _windows_final_path(kernel32: object, handle: int) -> Path:
+    buffer = ctypes.create_unicode_buffer(32_768)
+    length = kernel32.GetFinalPathNameByHandleW(
+        handle, buffer, len(buffer), 0
+    )
+    if length == 0 or length >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        raise ValueError("UNC retention paths are not supported")
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _windows_kernel32() -> object:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+    )
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
 
 
 @contextmanager
@@ -99,32 +239,115 @@ class RetentionService:
                 "SELECT run_id, state, pinned FROM runs ORDER BY run_id"
             ).fetchall()
         terminal_values = {state.value for state in TERMINAL_STATES}
-        for row in rows:
-            if row["state"] not in terminal_values:
-                continue
-            run_dir = self.runtime_root / "runs" / row["run_id"]
-            if not self._safe_directory(run_dir, root):
-                unsafe.append(str(run_dir))
-                continue
-            known = self._known_paths(run_dir)
-            unknown.extend(self._unknown_files(run_dir, known, unsafe))
-            for path in sorted(known):
-                category = known[path]
-                if category == "report" and path.name == "sanitized-summary.md":
-                    authoritative = self.repository.get_run(row["run_id"])
-                    if authoritative.pinned:
-                        continue
-                age = self._age(path, current, run_dir, unsafe)
-                threshold = _RAW_RETENTION if category == "raw" else _REPORT_RETENTION
-                if age is None or age <= threshold:
-                    continue
-                if not self._safe_unlink(path, run_dir):
-                    unsafe.append(str(path))
-                    continue
-                if category == "raw":
-                    deleted_raw += 1
-                else:
-                    deleted_reports += 1
+        terminal_rows = [
+            row for row in rows if row["state"] in terminal_values
+        ]
+        if terminal_rows:
+            runs_dir = root / "runs"
+            try:
+                with self._stable_directory(root) as stable_root:
+                    assert stable_root.canonical_path is not None
+                    with self._stable_directory(
+                        runs_dir,
+                        expected_parent=stable_root.canonical_path,
+                    ) as stable_runs:
+                        assert stable_runs.canonical_path is not None
+                        for row in terminal_rows:
+                            run_dir = runs_dir / row["run_id"]
+                            try:
+                                with self._stable_directory(
+                                    run_dir,
+                                    expected_parent=stable_runs.canonical_path,
+                                ) as stable_run:
+                                    assert stable_run.canonical_path is not None
+                                    if not self._safe_directory(run_dir, root):
+                                        unsafe.append(str(run_dir))
+                                        continue
+                                    with ExitStack() as containers:
+                                        locked_containers: dict[
+                                            str, _StableDirectoryHandle
+                                        ] = {}
+                                        container_unsafe = False
+                                        for name in ("logs", "evidence", "reports"):
+                                            container = run_dir / name
+                                            try:
+                                                stable_container = (
+                                                    containers.enter_context(
+                                                        self._stable_directory(
+                                                            container,
+                                                            expected_parent=(
+                                                                stable_run.canonical_path
+                                                            ),
+                                                        )
+                                                    )
+                                                )
+                                            except FileNotFoundError:
+                                                continue
+                                            except (OSError, ValueError):
+                                                unsafe.append(str(container))
+                                                container_unsafe = True
+                                                break
+                                            locked_containers[name] = stable_container
+                                        if container_unsafe:
+                                            continue
+                                        known = self._known_paths(
+                                            run_dir, locked_containers
+                                        )
+                                        unknown.extend(
+                                            self._unknown_files(
+                                                run_dir, known, unsafe
+                                            )
+                                        )
+                                        for path in sorted(known):
+                                            category = known[path]
+                                            if (
+                                                category == "report"
+                                                and path.name == "sanitized-summary.md"
+                                            ):
+                                                authoritative = (
+                                                    self.repository.get_run(
+                                                        row["run_id"]
+                                                    )
+                                                )
+                                                if authoritative.pinned:
+                                                    continue
+                                            age = self._age(
+                                                path, current, run_dir, unsafe
+                                            )
+                                            threshold = (
+                                                _RAW_RETENTION
+                                                if category == "raw"
+                                                else _REPORT_RETENTION
+                                            )
+                                            if age is None or age <= threshold:
+                                                continue
+                                            stable_parent = (
+                                                stable_run
+                                                if path.parent == run_dir
+                                                else locked_containers.get(
+                                                    path.parent.name
+                                                )
+                                            )
+                                            if (
+                                                stable_parent is None
+                                                or stable_parent.canonical_path is None
+                                                or not self._safe_unlink(
+                                                    path,
+                                                    stable_parent.canonical_path,
+                                                )
+                                            ):
+                                                unsafe.append(str(path))
+                                                continue
+                                            if category == "raw":
+                                                deleted_raw += 1
+                                            else:
+                                                deleted_reports += 1
+                            except (OSError, ValueError):
+                                unsafe.append(str(run_dir))
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    "runtime directory identity cannot be stabilized"
+                ) from exc
         return RetentionResult(
             deleted_raw_logs=deleted_raw,
             deleted_reports=deleted_reports,
@@ -140,6 +363,20 @@ class RetentionService:
         if resolved != current:
             raise ValueError("runtime root identity changed during validation")
         return resolved
+
+    @contextmanager
+    def _stable_directory(
+        self, directory: Path, *, expected_parent: Path | None = None,
+    ) -> Iterator[_StableDirectoryHandle]:
+        with _StableDirectoryHandle(directory) as stable:
+            resolved = stable.canonical_path
+            if resolved is None:
+                raise ValueError("stable directory identity is unavailable")
+            if expected_parent is not None:
+                if resolved.parent != expected_parent:
+                    raise ValueError("stable directory escaped its expected parent")
+            yield stable
+
     def _safe_directory(self, directory: Path, root: Path) -> bool:
         try:
             metadata = directory.lstat()
@@ -154,12 +391,21 @@ class RetentionService:
         except (OSError, ValueError):
             return False
 
-    def _known_paths(self, run_dir: Path) -> dict[Path, str]:
+    def _known_paths(
+        self,
+        run_dir: Path,
+        locked_containers: dict[str, _StableDirectoryHandle],
+    ) -> dict[Path, str]:
         known: dict[Path, str] = {}
         for pattern in RAW_LOG_GLOBS:
+            if pattern.partition("/")[0] not in locked_containers:
+                continue
             for path in run_dir.glob(pattern):
                 known[path] = "raw"
         for pattern in REPORT_GLOBS:
+            container = pattern.partition("/")[0]
+            if "/" in pattern and container not in locked_containers:
+                continue
             for path in run_dir.glob(pattern):
                 known[path] = "report"
         return known
@@ -229,7 +475,9 @@ class RetentionService:
             unsafe.append(str(path))
             return None
 
-    def _safe_unlink(self, path: Path, run_dir: Path) -> bool:
+    def _safe_unlink(self, path: Path, expected_parent: Path) -> bool:
+        if os.name == "nt":
+            return self._safe_unlink_windows(path, expected_parent)
         descriptor: int | None = None
         try:
             before = path.lstat()
@@ -238,11 +486,7 @@ class RetentionService:
                 or self._is_reparse(before)
                 or not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
-                or path.resolve(strict=True).parent != path.parent.resolve(strict=True)
-                or (
-                    path.parent != run_dir
-                    and path.parent.name not in {"logs", "evidence", "reports"}
-                )
+                or path.resolve(strict=True).parent != expected_parent
             ):
                 return False
             descriptor = os.open(
@@ -259,9 +503,6 @@ class RetentionService:
                 or after.st_nlink != 1
             ):
                 return False
-            # Windows refuses to unlink while this descriptor is held.
-            os.close(descriptor)
-            descriptor = None
             final = path.lstat()
             if (
                 (final.st_dev, final.st_ino) != identity
@@ -276,3 +517,69 @@ class RetentionService:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+
+    def _safe_unlink_windows(
+        self, path: Path, expected_parent: Path,
+    ) -> bool:
+        class FileInformation(ctypes.Structure):
+            _fields_ = [
+                ("attributes", ctypes.c_ulong),
+                ("creation_time_low", ctypes.c_ulong),
+                ("creation_time_high", ctypes.c_ulong),
+                ("access_time_low", ctypes.c_ulong),
+                ("access_time_high", ctypes.c_ulong),
+                ("write_time_low", ctypes.c_ulong),
+                ("write_time_high", ctypes.c_ulong),
+                ("volume_serial", ctypes.c_ulong),
+                ("file_size_high", ctypes.c_ulong),
+                ("file_size_low", ctypes.c_ulong),
+                ("link_count", ctypes.c_ulong),
+                ("file_index_high", ctypes.c_ulong),
+                ("file_index_low", ctypes.c_ulong),
+            ]
+
+        class FileDispositionInformation(ctypes.Structure):
+            _fields_ = [("delete_file", ctypes.c_int)]
+
+        kernel32 = _windows_kernel32()
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x00010000 | 0x0080,  # DELETE | FILE_READ_ATTRIBUTES
+            0x00000001 | 0x00000002,  # exclude FILE_SHARE_DELETE
+            None,
+            3,  # OPEN_EXISTING
+            0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            return False
+        try:
+            information = FileInformation()
+            if not kernel32.GetFileInformationByHandle(
+                handle, ctypes.byref(information)
+            ):
+                return False
+            if (
+                information.attributes & 0x10
+                or information.attributes & 0x400
+                or information.link_count != 1
+            ):
+                return False
+            final_path = _windows_final_path(kernel32, handle)
+            if os.path.normcase(str(final_path.parent)) != os.path.normcase(
+                str(expected_parent)
+            ):
+                return False
+            disposition = FileDispositionInformation(delete_file=1)
+            return bool(
+                kernel32.SetFileInformationByHandle(
+                    handle,
+                    4,  # FileDispositionInfo
+                    ctypes.byref(disposition),
+                    ctypes.sizeof(disposition),
+                )
+            )
+        except (OSError, ValueError):
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
