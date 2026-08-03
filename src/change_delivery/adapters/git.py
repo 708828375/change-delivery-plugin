@@ -402,6 +402,38 @@ class GitAdapter:
                 branch_shas=branch_shas,
             )
 
+    def identity_attestation(self, remote: str) -> GitDiscoveryAttestation:
+        """Attest the local repository and registered remote without network I/O."""
+
+        self._require_bound_remote(remote)
+        with self._attestation_lock, self._open_repository_handle() as handle:
+            if handle.identity != self._repository_identity:
+                raise RemoteIdentityChanged(
+                    "identity_attestation",
+                    reason="repository identity changed before attestation",
+                )
+            initial_remote = self._read_remote_snapshot()
+            final_remote = self._read_remote_snapshot()
+            with self._open_repository_handle() as current:
+                if current.identity != self._repository_identity:
+                    raise RemoteIdentityChanged(
+                        "identity_attestation",
+                        reason="repository identity changed during attestation",
+                    )
+            expected_remote = (self._fetch_url, self._push_url)
+            if initial_remote != expected_remote or final_remote != expected_remote:
+                raise RemoteIdentityChanged(
+                    "identity_attestation",
+                    reason="remote identity changed during attestation",
+                )
+        return GitDiscoveryAttestation(
+            repository=self._repository_identity,
+            remote=remote,
+            remote_fetch_url=self._fetch_url,
+            remote_push_url=self._push_url,
+            branch_shas={},
+        )
+
     def remote_heads_attestation(
         self,
         remote: str,

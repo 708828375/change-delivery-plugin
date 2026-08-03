@@ -319,6 +319,28 @@ def test_discovery_attestation_binds_repo_remote_and_branch_shas(
     assert len(remote_snapshots) == 2
 
 
+def test_identity_attestation_binds_repo_and_remote_without_network(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    remote, _, repo, _ = local_remote
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner)
+
+    attestation = adapter.identity_attestation("origin")
+
+    assert attestation.repository.canonical_path == repo.resolve()
+    assert attestation.remote == "origin"
+    assert attestation.remote_fetch_url == str(remote)
+    assert attestation.remote_push_url == str(remote)
+    assert attestation.branch_shas == {}
+    operations = [git_operation_args(spec.args) for spec in runner.specs]
+    assert all(operation[:1] != ("ls-remote",) for operation in operations)
+    assert sum(
+        operation[:2] == ("config", "--get-regexp")
+        for operation in operations
+    ) == 2
+
+
 def test_discovery_attestation_rejects_repository_identity_replacement(
     local_remote: tuple[Path, Path, Path, str],
     monkeypatch,

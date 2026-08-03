@@ -65,12 +65,11 @@ class FakeGit:
             {"develop": DEVELOP_SHA, "test": TEST_SHA}
         ]
 
-    def remote_heads_attestation(
+    def identity_attestation(
         self,
         remote: str,
-        branches: tuple[str, ...],
     ) -> GitDiscoveryAttestation:
-        self.read_calls.append((remote, branches))
+        self.read_calls.append((remote, ()))
         return GitDiscoveryAttestation(
             repository=RepositoryIdentity(
                 canonical_path=self.attested_repo_path,
@@ -80,17 +79,31 @@ class FakeGit:
             remote=remote,
             remote_fetch_url=self.remote_fetch_url,
             remote_push_url=self.remote_push_url,
-            branch_shas=self.branch_snapshots.pop(0)
-            if len(self.branch_snapshots) > 1
-            else self.branch_snapshots[0],
+            branch_shas={},
         )
-
-    discovery_attestation = remote_heads_attestation
 
 
 class FakeGitHub:
     def __init__(self) -> None:
         self.write_calls: list[object] = []
+        self.read_calls: list[tuple[str, ...]] = []
+        self.branch_snapshots = [
+            {"develop": DEVELOP_SHA, "test": TEST_SHA}
+        ]
+
+    def branch_heads(self, branches: tuple[str, ...]) -> dict[str, str]:
+        self.read_calls.append(branches)
+        return (
+            self.branch_snapshots.pop(0)
+            if len(self.branch_snapshots) > 1
+            else self.branch_snapshots[0]
+        )
+
+
+class FakeGitHubForLocal(FakeGitHub):
+    def __init__(self, heads: dict[str, str]) -> None:
+        super().__init__()
+        self.branch_snapshots = [heads]
 
 
 class RecordingProcessRunner:
@@ -144,6 +157,7 @@ def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
     assert report.candidate_checks == fixture_config.required_pre_pr_checks
     assert fake_git.write_calls == []
     assert fake_github.write_calls == []
+    assert fake_github.read_calls == [("develop", "test")]
     assert fake_http.calls == []
 
 
@@ -215,8 +229,12 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
     }
     assert factory_calls == [fixture_config]
     assert fake_git.read_calls == [
-        ("origin", ("develop", "test")),
-        ("origin", ("develop", "test")),
+        ("origin", ()),
+        ("origin", ()),
+    ]
+    assert fake_github.read_calls == [
+        ("develop", "test"),
+        ("develop", "test"),
     ]
     assert fake_git.write_calls == []
     assert fake_github.write_calls == []
@@ -472,14 +490,15 @@ def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
     requirement.write_text("read-only discovery", encoding="utf-8")
     fake_http = FakeHttp({"git_sha": TEST_SHA})
     fake_git = FakeGit(fixture_config)
-    fake_git.branch_snapshots = [
+    fake_github = FakeGitHub()
+    fake_github.branch_snapshots = [
         {"develop": DEVELOP_SHA, "test": TEST_SHA},
         {"develop": DEVELOP_SHA, "test": "c" * 40},
     ]
     adapter = ExampleProjectAdapter(
         fixture_config,
         git=fake_git,
-        github=FakeGitHub(),
+        github=fake_github,
         http=fake_http,
         file_exists=lambda _path: False,
     )
@@ -504,8 +523,8 @@ def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
     payload = json.loads(stderr.getvalue())
     assert payload["version_probe"]["reason_code"] == "remote_changed_during_probe"
     assert fake_git.read_calls == [
-        ("origin", ("develop", "test")),
-        ("origin", ("develop", "test")),
+        ("origin", ()),
+        ("origin", ()),
     ]
 
 
@@ -623,6 +642,9 @@ def test_default_cli_discovery_uses_real_read_only_remote_and_no_runtime_writes(
         project_loader=lambda _project_id: (config, "c" * 64),
         discovery_http_factory=lambda: client,
         discovery_git_runner=runner,
+        discovery_github_factory=lambda _config: FakeGitHubForLocal(
+            {"develop": base_sha, "test": test_sha}
+        ),
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -642,7 +664,7 @@ def test_default_cli_discovery_uses_real_read_only_remote_and_no_runtime_writes(
     assert payload["test_sha"] == test_sha
     assert [call[0] for call in transport.calls] == [endpoint]
     operations = [spec.args for spec in runner.specs]
-    assert sum("ls-remote" in operation for operation in operations) == 2
+    assert all("ls-remote" not in operation for operation in operations)
     assert all(
         forbidden not in operation
         for operation in operations

@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from change_delivery.cli import CliServices
+from change_delivery.cli import CliServices, CliUsageError, _github_fixed_environment
 
 
 def test_python_module_help_is_available() -> None:
@@ -18,6 +18,38 @@ def test_python_module_help_is_available() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Change Delivery" in result.stdout
+
+
+def test_github_config_is_pinned_under_trusted_userprofile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "profile"
+    appdata = profile / "AppData" / "Roaming"
+    config = appdata / "GitHub CLI"
+    config.mkdir(parents=True)
+    monkeypatch.setenv("USERPROFILE", str(profile))
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    assert _github_fixed_environment(("GH_CONFIG_DIR",)) == {
+        "GH_CONFIG_DIR": str(config.resolve())
+    }
+    assert _github_fixed_environment(("GH_TOKEN",)) == {}
+
+
+def test_github_config_rejects_appdata_outside_userprofile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "profile"
+    (profile / "AppData" / "Roaming" / "GitHub CLI").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(profile))
+    monkeypatch.setenv("APPDATA", str(outside))
+
+    with pytest.raises(CliUsageError, match="APPDATA"):
+        _github_fixed_environment(("GH_CONFIG_DIR",))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")

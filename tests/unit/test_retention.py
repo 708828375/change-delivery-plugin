@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from io import StringIO
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -207,6 +208,13 @@ def test_retention_keeps_file_handle_bound_through_delete(
     assert result.deleted_raw_logs == 1
     assert not candidate.exists()
     assert not parked.exists()
+
+
+def test_windows_delete_disposition_uses_one_byte_boolean_abi() -> None:
+    source = inspect.getsource(RetentionService._safe_unlink_windows)
+
+    assert '("delete_file", ctypes.c_ubyte)' in source
+    assert '("delete_file", ctypes.c_int)' not in source
 
 
 def test_successful_concurrent_pin_preserves_expired_summary(

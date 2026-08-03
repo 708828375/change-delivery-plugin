@@ -7,7 +7,7 @@ $fixedSourceRoot = (
 if ($fixedSourceRoot -cne 'C:\Users\ExampleUser\change-delivery-plugin') {
     throw 'Tick entrypoint is not running from the fixed source root.'
 }
-$TrustedHostSecuritySha256 = '68dea7d3167cea65f47b90c5ec1be6da6ebc1d84aaf66d7400b7b9de90e6d6c7'
+$TrustedHostSecuritySha256 = '918ba38a2f81a5a1fe501ccaacdd9fce599395fa4a28fbe5411a4fd0931bc7c2'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -104,7 +104,10 @@ try {
     if ($identity.module_root -cne $fixedModuleRoot) {
         throw 'Runtime module root does not match $PSScriptRoot\..\src.'
     }
-    $moduleStreams = @(Open-ModuleTreeHandles (Join-Path $fixedModuleRoot 'change_delivery') @($hostConfig.module_manifest))
+    $trustedModuleTree = Join-Path $fixedModuleRoot 'change_delivery'
+    Assert-NoPythonBytecode $trustedModuleTree
+    $moduleStreams = @(Open-ModuleTreeHandles $trustedModuleTree @($hostConfig.module_manifest))
+    Assert-NoPythonBytecode $trustedModuleTree
 
 
     $pythonPath = [string] $hostConfig.python_path
@@ -141,8 +144,19 @@ try {
     $env:PYTHONPATH = $null
     $env:PYTHONHOME = $null
     $env:PYTHONUTF8 = '1'
-    $bootstrap = "import runpy,sys; root=sys.argv.pop(1); sys.path.insert(0,root); runpy.run_module('change_delivery',run_name='__main__')"
-    & $pythonPath -I -c $bootstrap $moduleRoot tick `
+    $env:PYTHONDONTWRITEBYTECODE = '1'
+    $bootstrap = (
+        "import importlib.machinery as m,runpy,sys;" +
+        "sys.dont_write_bytecode=True;sys.implementation.cache_tag=None;" +
+        "sys.path_hooks[:]=[m.FileFinder.path_hook(" +
+        "(m.SourceFileLoader,m.SOURCE_SUFFIXES)," +
+        "(m.ExtensionFileLoader,m.EXTENSION_SUFFIXES))];" +
+        "sys.path_importer_cache.clear();root=sys.argv.pop(1);" +
+        "sys.path.insert(0,root);" +
+        "runpy.run_module('change_delivery',run_name='__main__')"
+    )
+    Assert-NoPythonBytecode $trustedModuleTree
+    & $pythonPath -I -B -c $bootstrap $moduleRoot tick `
         --plugin-root $runtimeRoot --json
     exit $LASTEXITCODE
 }

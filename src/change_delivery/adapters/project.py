@@ -46,11 +46,14 @@ class HttpReader(Protocol):
 
 
 class GitReader(Protocol):
-    def remote_heads_attestation(
+    def identity_attestation(
         self,
         remote: str,
-        branches: tuple[str, ...],
     ) -> GitDiscoveryAttestation: ...
+
+
+class GitHubReader(Protocol):
+    def branch_heads(self, branches: tuple[str, ...]) -> dict[str, str]: ...
 
 
 class DiscoveryReport(FrozenModel):
@@ -78,7 +81,7 @@ class ExampleProjectAdapter:
         config: ProjectConfig,
         *,
         git: GitReader,
-        github: object,
+        github: GitHubReader,
         http: HttpReader,
         file_exists: Callable[[Path], bool] = Path.is_file,
     ) -> None:
@@ -93,13 +96,13 @@ class ExampleProjectAdapter:
             raise ValueError("ExampleProject discovery is read-only and requires dry_run")
         enforce_project_test_endpoint(self.config)
         branches = (self.config.base_branch, self.config.test_branch)
-        attestation = self.git.remote_heads_attestation(
-            self.config.remote,
-            branches,
-        )
+        attestation = self.git.identity_attestation(self.config.remote)
         self._verify_git_attestation(attestation)
+        branch_shas = self.github.branch_heads(branches)
+        if set(branch_shas) != set(branches):
+            raise ValueError("GitHub branch heads do not match config")
         remote_shas = {
-            f"{self.config.remote}/{branch}": attestation.branch_shas[branch]
+            f"{self.config.remote}/{branch}": branch_shas[branch]
             for branch in branches
         }
         for sha in remote_shas.values():
@@ -183,12 +186,8 @@ class ExampleProjectAdapter:
                 expected,
             ):
                 raise ValueError(f"Git attestation {label} does not match config")
-        expected_branches = {
-            self.config.base_branch,
-            self.config.test_branch,
-        }
-        if set(attestation.branch_shas) != expected_branches:
-            raise ValueError("Git attestation branches do not match config")
+        if attestation.branch_shas:
+            raise ValueError("Git identity attestation unexpectedly included refs")
 
 
 def discover_registration(

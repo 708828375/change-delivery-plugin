@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = '68dea7d3167cea65f47b90c5ec1be6da6ebc1d84aaf66d7400b7b9de90e6d6c7'
+$TrustedHostSecuritySha256 = '918ba38a2f81a5a1fe501ccaacdd9fce599395fa4a28fbe5411a4fd0931bc7c2'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -52,8 +52,10 @@ Assert-NoReparseChain $moduleRoot
 [void](Resolve-RegularFile (
     Join-Path $moduleRoot 'change_delivery\__init__.py'
 ) '__init__.py')
+Assert-NoPythonBytecode (Join-Path $moduleRoot 'change_delivery')
 $moduleManifest = @(Read-TrustedModuleManifest)
 Assert-ModuleTreeManifest (Join-Path $moduleRoot 'change_delivery') $moduleManifest
+Assert-NoPythonBytecode (Join-Path $moduleRoot 'change_delivery')
 
 $python = Resolve-TrustedPythonIdentity
 $codex = Resolve-OfficialCodexIdentity

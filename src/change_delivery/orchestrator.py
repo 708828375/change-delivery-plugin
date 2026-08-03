@@ -1384,28 +1384,71 @@ class Orchestrator:
                 or snapshot.review_status == "changes_requested"
                 or bool(snapshot.unresolved_thread_ids)
             ):
-                feedback = self._actionable_feedback(
+                untrusted_data = self._actionable_feedback(
                     github, run.pr_number, snapshot
                 )
-                fingerprint = hashlib.sha256(
+                issues = self._feedback_issues(untrusted_data)
+                if not issues:
+                    missing = self.repository.register_evidence(
+                        run.run_id,
+                        f"actionable-feedback-missing:{run.run_id}:{run.head_sha}",
+                        "actionable_feedback_missing",
+                        {
+                            "checks_status": snapshot.checks_status,
+                            "review_status": snapshot.review_status,
+                            "pr_number": run.pr_number,
+                        },
+                    )
+                    self.repository.transition_with_evidence(
+                        run.run_id,
+                        RunState.MONITORING_CI_REVIEW,
+                        RunState.REVIEW_DECISION_REQUIRED,
+                        "ACTIONABLE_FEEDBACK_MISSING",
+                        (missing,),
+                    )
+                    return StepOutcome(
+                        state=RunState.REVIEW_DECISION_REQUIRED,
+                        action="actionable_feedback_missing",
+                        blocked_reason="remote failure lacks actionable details",
+                        evidence_ids=(missing.evidence_id,),
+                    )
+                feedback_fingerprint = hashlib.sha256(
                     json.dumps(
-                        feedback,
+                        untrusted_data,
                         ensure_ascii=False,
                         separators=(",", ":"),
                         sort_keys=True,
                     ).encode("utf-8")
                 ).hexdigest()
-                existing_attempts = self._review_fix_attempts(
-                    run.run_id, fingerprint
+                attempt_counts = self._review_fix_attempts(
+                    run.run_id,
+                    tuple(issue["issue_fingerprint"] for issue in issues),
                 )
-                if existing_attempts >= 2:
+                exhausted = [
+                    issue
+                    for issue in issues
+                    if attempt_counts[issue["issue_fingerprint"]] >= 2
+                ]
+                if exhausted:
+                    limit_identity = hashlib.sha256(
+                        json.dumps(
+                            sorted(
+                                issue["issue_fingerprint"]
+                                for issue in exhausted
+                            ),
+                            separators=(",", ":"),
+                        ).encode("ascii")
+                    ).hexdigest()
                     limit = self.repository.register_evidence(
                         run.run_id,
-                        f"review-fix-limit:{run.run_id}:{fingerprint}",
+                        f"review-fix-limit:{run.run_id}:{limit_identity}",
                         "review_fix_limit_reached",
                         {
-                            "feedback_fingerprint": fingerprint,
-                            "attempts": existing_attempts,
+                            "exhausted_issue_fingerprints": sorted(
+                                issue["issue_fingerprint"]
+                                for issue in exhausted
+                            ),
+                            "attempts": 2,
                             "pr_number": run.pr_number,
                         },
                     )
@@ -1424,21 +1467,42 @@ class Orchestrator:
                         ),
                         evidence_ids=(limit.evidence_id,),
                     )
-                attempt = existing_attempts + 1
+                issue_attempts = [
+                    {
+                        **issue,
+                        "existing_attempts": attempt_counts[
+                            issue["issue_fingerprint"]
+                        ],
+                        "attempt": (
+                            attempt_counts[issue["issue_fingerprint"]] + 1
+                        ),
+                    }
+                    for issue in issues
+                ]
+                attempt = max(item["attempt"] for item in issue_attempts)
+                request_identity = hashlib.sha256(
+                    json.dumps(
+                        sorted(
+                            item["issue_fingerprint"]
+                            for item in issue_attempts
+                        ),
+                        separators=(",", ":"),
+                    ).encode("ascii")
+                ).hexdigest()
                 request = self.repository.register_evidence(
                     run.run_id,
                     (
                         f"ci-review-fix-request:{run.run_id}:"
-                        f"{fingerprint}:{attempt}"
+                        f"{request_identity}:{attempt}"
                     ),
                     "ci_review_fix_request",
                     {
                         "attempt": attempt,
-                        "existing_attempts": existing_attempts,
-                        "feedback": feedback,
-                        "feedback_fingerprint": fingerprint,
+                        "issues": issue_attempts,
+                        "feedback_fingerprint": feedback_fingerprint,
                         "head_sha": run.head_sha,
                         "pr_number": run.pr_number,
+                        "untrusted_data": untrusted_data,
                     },
                 )
                 self.repository.transition_with_evidence(
@@ -1482,7 +1546,7 @@ class Orchestrator:
             if not hmac.compare_digest(
                 evidence.sha256, sha256_payload(payload)
             ):
-                raise ValueError("review fix attempt evidence digest mismatch")
+                raise ValueError("merge gate evidence digest mismatch")
             if (
                 type(payload) is dict
                 and payload.get("sha") == run.head_sha
@@ -1529,14 +1593,14 @@ class Orchestrator:
         if set(thread_ids) != set(snapshot.unresolved_thread_ids):
             raise ValueError("actionable review facts changed during observation")
         return {
-            "checks_status": (
-                "failed" if snapshot.checks_status == "failed" else None
-            ),
-            "review_status": (
-                "changes_requested"
-                if snapshot.review_status == "changes_requested"
-                else None
-            ),
+            "failed_checks": [
+                fact.model_dump(mode="json")
+                for fact in snapshot.failed_checks
+            ],
+            "requested_reviews": [
+                fact.model_dump(mode="json")
+                for fact in snapshot.requested_reviews
+            ],
             "threads": [
                 {
                     "thread_id": thread.thread_id,
@@ -1548,18 +1612,53 @@ class Orchestrator:
             ],
         }
 
+    @staticmethod
+    def _feedback_issues(
+        untrusted_data: dict[str, object],
+    ) -> tuple[dict[str, str], ...]:
+        identities: set[tuple[str, ...]] = set()
+        for check in untrusted_data["failed_checks"]:  # type: ignore[union-attr]
+            identities.add(
+                (
+                    "ci_check",
+                    check["kind"],
+                    check.get("workflow") or "",
+                    check["name"],
+                )
+            )
+        for review in untrusted_data["requested_reviews"]:  # type: ignore[union-attr]
+            identities.add(("requested_review", review["review_id"]))
+        for thread in untrusted_data["threads"]:  # type: ignore[union-attr]
+            identities.add(("review_thread", thread["thread_id"]))
+        issues = []
+        for identity in sorted(identities):
+            encoded = json.dumps(
+                identity,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            issues.append(
+                {
+                    "issue_identity": encoded,
+                    "issue_fingerprint": hashlib.sha256(
+                        encoded.encode("ascii")
+                    ).hexdigest(),
+                }
+            )
+        return tuple(issues)
+
     def _review_fix_attempts(
         self,
         run_id: str,
-        fingerprint: str,
-    ) -> int:
+        fingerprints: tuple[str, ...],
+    ) -> dict[str, int]:
         bound_ids = {
             evidence_id
             for event in self.repository.list_events(run_id)
             if event.to_state is RunState.FIXING_CI_REVIEW
             for evidence_id in event.evidence_ids
         }
-        attempts: set[int] = set()
+        attempts = {fingerprint: set() for fingerprint in fingerprints}
         for evidence in self.repository.list_evidence(run_id):
             if (
                 evidence.evidence_id not in bound_ids
@@ -1567,16 +1666,38 @@ class Orchestrator:
             ):
                 continue
             payload = json.loads(evidence.payload_json)
-            if (
-                type(payload) is dict
-                and payload.get("feedback_fingerprint") == fingerprint
-                and type(payload.get("attempt")) is int
-                and 1 <= payload["attempt"] <= 2
+            if not hmac.compare_digest(
+                evidence.sha256, sha256_payload(payload)
             ):
-                attempts.add(payload["attempt"])
-        if attempts and attempts != set(range(1, max(attempts) + 1)):
-            raise ValueError("review fix attempt history is not contiguous")
-        return len(attempts)
+                raise ValueError("review fix attempt evidence digest mismatch")
+            if type(payload) is not dict or type(payload.get("issues")) is not list:
+                raise ValueError("review fix attempt evidence is invalid")
+            for issue in payload["issues"]:
+                if (
+                    type(issue) is not dict
+                    or type(issue.get("issue_identity")) is not str
+                    or type(issue.get("issue_fingerprint")) is not str
+                    or type(issue.get("attempt")) is not int
+                    or not 1 <= issue["attempt"] <= 2
+                ):
+                    raise ValueError("review fix issue attempt is invalid")
+                fingerprint = issue["issue_fingerprint"]
+                actual_fingerprint = hashlib.sha256(
+                    issue["issue_identity"].encode("ascii")
+                ).hexdigest()
+                if not hmac.compare_digest(fingerprint, actual_fingerprint):
+                    raise ValueError("review fix issue identity is invalid")
+                if fingerprint in attempts:
+                    attempts[fingerprint].add(issue["attempt"])
+        for issue_attempts in attempts.values():
+            if issue_attempts and issue_attempts != set(
+                range(1, max(issue_attempts) + 1)
+            ):
+                raise ValueError("review fix attempt history is not contiguous")
+        return {
+            fingerprint: len(issue_attempts)
+            for fingerprint, issue_attempts in attempts.items()
+        }
 
     def cancel(self, run_id: str) -> StepOutcome:
         run = self.repository.get_run(run_id)

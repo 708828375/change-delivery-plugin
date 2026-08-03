@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any, Literal, Protocol
+from urllib.parse import quote, urlsplit
 
 from pydantic import Field, ValidationError, field_validator
 
@@ -21,10 +22,11 @@ _REPOSITORY = re.compile(
 _THREAD_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{2,255}={0,2}$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _GH_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
+_GH_CONFIG_ENV_NAME = "GH_CONFIG_DIR"
 _MERGED_PR_FIELDS = "number,state,headRefOid,mergeCommit,statusCheckRollup"
 _PR_FIELDS = "number,url,baseRefName,headRefName,isDraft,headRefOid"
 _SNAPSHOT_FIELDS = (
-    "headRefOid,mergeable,reviewDecision,statusCheckRollup,isDraft"
+    "headRefOid,mergeable,reviewDecision,statusCheckRollup,latestReviews,isDraft"
 )
 _KNOWN_CHECK_CONCLUSIONS = frozenset(
     {
@@ -145,6 +147,62 @@ class ReviewThread(FrozenModel):
         return value
 
 
+class FailedCheckFact(FrozenModel):
+    kind: Literal["check_run", "status_context"]
+    name: str = Field(min_length=1, max_length=512, strict=True)
+    workflow: str | None = Field(default=None, max_length=512, strict=True)
+    conclusion: str = Field(min_length=1, max_length=64, strict=True)
+    details_url: str | None = Field(default=None, max_length=2048, strict=True)
+
+    @field_validator("name", "workflow", "conclusion")
+    @classmethod
+    def validate_bounded_text(cls, value: str | None) -> str | None:
+        if value is not None and any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        ):
+            raise ValueError("check fact contains control characters")
+        return value
+
+    @field_validator("details_url")
+    @classmethod
+    def validate_details_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or any(ord(character) < 32 for character in value)
+        ):
+            raise ValueError("check details URL is unsafe")
+        return value
+
+
+class RequestedReviewFact(FrozenModel):
+    review_id: str = Field(
+        pattern=r"^[A-Za-z0-9_][A-Za-z0-9_-]{2,255}={0,2}$",
+        strict=True,
+    )
+    author: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?$",
+        strict=True,
+    )
+    body: str = Field(min_length=1, max_length=10_000, strict=True)
+
+    @field_validator("body")
+    @classmethod
+    def validate_body(cls, value: str) -> str:
+        _validate_body(value, allow_empty=False)
+        if not value.strip():
+            raise ValueError("requested review body is blank")
+        return value
+
+
 class CheckSnapshot(FrozenModel):
     head_sha: str = Field(pattern=r"^[0-9a-f]{40}$", strict=True)
     mergeable: bool = Field(strict=True)
@@ -152,6 +210,8 @@ class CheckSnapshot(FrozenModel):
     checks_status: Literal["passed", "pending", "failed"]
     unresolved_thread_ids: tuple[str, ...]
     is_draft: bool = Field(strict=True)
+    failed_checks: tuple[FailedCheckFact, ...] = ()
+    requested_reviews: tuple[RequestedReviewFact, ...] = ()
 
     @property
     def review_decision(self) -> bool:
@@ -289,9 +349,29 @@ class GitHubAdapter:
         self._repo_path = repo_path
         self._owner, self._name = repository.split("/", 1)
         configured_credentials = set(project_config.credentials)
-        self._env_names = tuple(
+        self._env_names = (_GH_CONFIG_ENV_NAME,) + tuple(
             name for name in _GH_ENV_NAMES if name in configured_credentials
         )
+
+    def branch_heads(self, branches: tuple[str, ...]) -> dict[str, str]:
+        """Return stable authoritative GitHub branch heads without mutation."""
+
+        if (
+            not isinstance(branches, tuple)
+            or not branches
+            or len(set(branches)) != len(branches)
+        ):
+            raise ValueError("branches must be a non-empty unique tuple")
+        for branch in branches:
+            _validate_branch(branch)
+        first = self._branch_heads_sample(branches)
+        second = self._branch_heads_sample(branches)
+        if first != second:
+            raise SnapshotChanged(
+                "branch_heads",
+                "branch head evidence changed",
+            )
+        return second
 
     def find_pr(self, head: str, base: str) -> PullRequestRef | None:
         """Return an existing exact PR without creating or mutating it."""
@@ -420,6 +500,7 @@ class GitHubAdapter:
                 "mergeable",
                 "reviewDecision",
                 "statusCheckRollup",
+                "latestReviews",
                 "isDraft",
             },
             "snapshot",
@@ -448,6 +529,17 @@ class GitHubAdapter:
                 if not thread.resolved and not thread.outdated
             )
         )
+        try:
+            failed_checks = self._failed_checks(
+                payload["statusCheckRollup"]
+            )
+            requested_reviews = self._requested_reviews(
+                payload["latestReviews"]
+            )
+        except (ValidationError, ValueError, TypeError):
+            raise GitHubError(
+                "snapshot", "actionable failure facts were invalid"
+            ) from None
         return CheckSnapshot(
             head_sha=sha,
             mergeable=mergeable_raw == "MERGEABLE",
@@ -463,6 +555,8 @@ class GitHubAdapter:
             checks_status=checks_status,
             unresolved_thread_ids=actionable_ids,
             is_draft=is_draft,
+            failed_checks=failed_checks,
+            requested_reviews=requested_reviews,
         )
 
     def list_actionable_reviews(
@@ -849,6 +943,91 @@ class GitHubAdapter:
         return "pending"
 
     @staticmethod
+    def _failed_checks(raw_checks: Any) -> tuple[FailedCheckFact, ...]:
+        GitHubAdapter._normalize_checks(raw_checks)
+        facts: list[FailedCheckFact] = []
+        for raw in raw_checks:
+            typename = raw["__typename"]
+            if typename == "CheckRun":
+                if not (
+                    raw["status"] == "COMPLETED"
+                    and raw["conclusion"]
+                    in {
+                        "FAILURE",
+                        "CANCELLED",
+                        "TIMED_OUT",
+                        "ACTION_REQUIRED",
+                        "STARTUP_FAILURE",
+                    }
+                ):
+                    continue
+                facts.append(
+                    FailedCheckFact(
+                        kind="check_run",
+                        name=raw["name"],
+                        workflow=raw.get("workflowName") or None,
+                        conclusion=raw["conclusion"],
+                        details_url=raw.get("detailsUrl") or None,
+                    )
+                )
+            elif raw["state"] in {"ERROR", "FAILURE"}:
+                facts.append(
+                    FailedCheckFact(
+                        kind="status_context",
+                        name=raw["context"],
+                        conclusion=raw["state"],
+                        details_url=raw.get("targetUrl") or None,
+                    )
+                )
+        return tuple(
+            sorted(
+                facts,
+                key=lambda fact: (
+                    fact.kind,
+                    fact.workflow or "",
+                    fact.name,
+                    fact.conclusion,
+                    fact.details_url or "",
+                ),
+            )
+        )
+
+    @staticmethod
+    def _requested_reviews(raw_reviews: Any) -> tuple[RequestedReviewFact, ...]:
+        if not isinstance(raw_reviews, list) or len(raw_reviews) > 100:
+            raise GitHubError("snapshot", "latest reviews were invalid")
+        facts: list[RequestedReviewFact] = []
+        try:
+            for raw in raw_reviews:
+                if not isinstance(raw, dict) or not {
+                    "id",
+                    "author",
+                    "body",
+                    "state",
+                }.issubset(raw):
+                    raise TypeError
+                if raw["state"] != "CHANGES_REQUESTED":
+                    continue
+                author = raw["author"]
+                if not isinstance(author, dict) or set(author) != {"login"}:
+                    raise TypeError
+                body = raw["body"]
+                if not isinstance(body, str):
+                    raise TypeError
+                if not body.strip():
+                    continue
+                facts.append(
+                    RequestedReviewFact(
+                        review_id=raw["id"],
+                        author=author["login"],
+                        body=body,
+                    )
+                )
+        except (TypeError, ValueError, ValidationError):
+            raise GitHubError("snapshot", "latest reviews were invalid") from None
+        return tuple(sorted(facts, key=lambda fact: fact.review_id))
+
+    @staticmethod
     def _normalize_checks(raw_checks: Any) -> tuple[tuple[str, ...], ...]:
         if not isinstance(raw_checks, list):
             raise GitHubError("snapshot", "check rollup was invalid")
@@ -1003,12 +1182,19 @@ class GitHubAdapter:
     ) -> tuple[object, ...]:
         # parse_snapshot validates all gate fields and unknown states.
         self.parse_snapshot(payload, ())
+        snapshot = self.parse_snapshot(payload, ())
         return (
             self._payload_sha(payload, "snapshot"),
             payload["mergeable"],
             payload["reviewDecision"],
             payload["isDraft"],
             self._normalize_checks(payload["statusCheckRollup"]),
+            tuple(
+                fact.model_dump_json() for fact in snapshot.failed_checks
+            ),
+            tuple(
+                fact.model_dump_json() for fact in snapshot.requested_reviews
+            ),
         )
 
     @staticmethod
@@ -1105,3 +1291,43 @@ class GitHubAdapter:
                 env_names=self._env_names,
             )
         )
+
+    def _branch_heads_sample(
+        self,
+        branches: tuple[str, ...],
+    ) -> dict[str, str]:
+        heads: dict[str, str] = {}
+        for branch in branches:
+            endpoint = (
+                f"repos/{self._owner}/{self._name}/git/ref/heads/"
+                f"{quote(branch, safe='')}"
+            )
+            result = self._execute(
+                (
+                    "api",
+                    "--method",
+                    "GET",
+                    endpoint,
+                    "--jq",
+                    "{sha:.object.sha}",
+                )
+            )
+            if result.exit_code != 0:
+                raise GitHubError(
+                    "branch_heads",
+                    "authoritative branch head lookup failed",
+                )
+            try:
+                payload = json.loads(result.stdout)
+                if not isinstance(payload, dict) or set(payload) != {"sha"}:
+                    raise TypeError
+                sha = payload["sha"]
+                if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+                    raise TypeError
+            except (json.JSONDecodeError, TypeError):
+                raise GitHubError(
+                    "branch_heads",
+                    "branch head response was invalid",
+                ) from None
+            heads[branch] = sha.lower()
+        return heads

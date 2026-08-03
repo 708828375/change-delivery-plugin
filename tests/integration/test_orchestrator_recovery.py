@@ -16,7 +16,12 @@ import pytest
 import change_delivery.cli as cli_module
 from change_delivery.approval import build_approval, save_approval
 from change_delivery.adapters.codex import CodexAdapter
-from change_delivery.adapters.github import PullRequestRef, ReviewThread
+from change_delivery.adapters.github import (
+    FailedCheckFact,
+    PullRequestRef,
+    RequestedReviewFact,
+    ReviewThread,
+)
 from change_delivery.database import Database
 from change_delivery.cli import CliServices, main
 from change_delivery.config import load_project_config
@@ -45,6 +50,18 @@ NEW_SHA = "c" * 40
 TREE_SHA = "d" * 40
 OTHER_TREE_SHA = "e" * 40
 CONFIG_HASH = "c" * 64
+FAILED_CHECK = FailedCheckFact(
+    kind="check_run",
+    name="unit-tests",
+    workflow="CI",
+    conclusion="FAILURE",
+    details_url="https://github.com/owner/repo/actions/runs/7",
+)
+REQUESTED_REVIEW = RequestedReviewFact(
+    review_id="PRR_actionable",
+    author="reviewer",
+    body="Add a regression test for the timeout path.",
+)
 
 
 def config(tmp_path: Path) -> ProjectConfig:
@@ -186,6 +203,8 @@ class Snapshot:
     unresolved_thread_ids: tuple[str, ...] = ()
     mergeable: bool = True
     is_draft: bool = False
+    failed_checks: tuple[FailedCheckFact, ...] = ()
+    requested_reviews: tuple[RequestedReviewFact, ...] = ()
 
     @property
     def checks_passed(self) -> bool:
@@ -926,7 +945,9 @@ def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
                 "UPDATE runs SET state = ?, pr_number = 42 WHERE run_id = ?",
                 (RunState.MONITORING_CI_REVIEW.value, run_id),
             )
-        fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+        fixture.github.snapshot_result = Snapshot(
+            SHA, checks_status="failed", failed_checks=(FAILED_CHECK,)
+        )
         fixture.orchestrator().step(run_id)
     worktree = fixture.root / "worktrees" / run_id
     worktree.mkdir(parents=True)
@@ -2571,7 +2592,17 @@ def test_monitor_distinguishes_waiting_from_actionable_failure(
             "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
             (run_id,),
         )
-    fixture.github.snapshot_result = Snapshot(SHA, **changes)
+    actionable_facts: dict[str, object] = {}
+    if changes.get("checks_status") == "failed":
+        actionable_facts["failed_checks"] = (FAILED_CHECK,)
+    if (
+        changes.get("review_status") == "changes_requested"
+        and not changes.get("unresolved_thread_ids")
+    ):
+        actionable_facts["requested_reviews"] = (REQUESTED_REVIEW,)
+    fixture.github.snapshot_result = Snapshot(
+        SHA, **changes, **actionable_facts
+    )
     if changes.get("unresolved_thread_ids"):
         fixture.github.actionable_reviews = (
             ReviewThread(
@@ -2628,8 +2659,8 @@ def test_monitor_binds_actionable_review_content_and_attempt_to_fix_event(
     payload = json.loads(evidence.payload_json)
     assert evidence.kind == "ci_review_fix_request"
     assert payload["attempt"] == 1
-    assert payload["existing_attempts"] == 0
-    assert payload["feedback"]["threads"] == [
+    assert payload["issues"][0]["existing_attempts"] == 0
+    assert payload["untrusted_data"]["threads"] == [
         {
             "comments": ["Handle the empty input before indexing."],
             "line": 17,
@@ -2648,7 +2679,9 @@ def test_runtime_review_fix_receives_event_bound_feedback_and_attempt(
             "UPDATE runs SET state = ?, pr_number = 42 WHERE run_id = ?",
             (RunState.MONITORING_CI_REVIEW.value, run_id),
         )
-    fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+    fixture.github.snapshot_result = Snapshot(
+        SHA, checks_status="failed", failed_checks=(FAILED_CHECK,)
+    )
     fixture.orchestrator().step(run_id)
     worktree = fixture.root / "worktrees" / run_id
     worktree.mkdir(parents=True)
@@ -2680,9 +2713,9 @@ def test_runtime_review_fix_receives_event_bound_feedback_and_attempt(
     request = captured[0]
     scope = json.loads(request.approval_scope)  # type: ignore[attr-defined]
     assert request.attempt == 1  # type: ignore[attr-defined]
-    assert scope["actionable_feedback"]["feedback"] == {
-        "checks_status": "failed",
-        "review_status": None,
+    assert scope["actionable_feedback"]["untrusted_data"] == {
+        "failed_checks": [FAILED_CHECK.model_dump(mode="json")],
+        "requested_reviews": [],
         "threads": [],
     }
     assert set(scope["approved_artifacts"]) == {
@@ -2701,37 +2734,20 @@ def test_monitor_stops_same_feedback_after_two_automatic_fix_rounds(
             "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
             (run_id,),
         )
-    fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+    fixture.github.snapshot_result = Snapshot(
+        SHA, checks_status="failed", failed_checks=(FAILED_CHECK,)
+    )
     orchestrator = fixture.orchestrator()
 
     first = orchestrator.step(run_id)
     assert first.state is RunState.FIXING_CI_REVIEW
-    first_payload = json.loads(
-        next(
-            evidence.payload_json
-            for evidence in fixture.repository.list_evidence(run_id)
-            if evidence.kind == "ci_review_fix_request"
-        )
-    )
-    fingerprint = first_payload["feedback_fingerprint"]
-    second = fixture.repository.register_evidence(
-        run_id,
-        f"ci-review-fix-request:{run_id}:{fingerprint}:2",
-        "ci_review_fix_request",
-        {**first_payload, "attempt": 2, "existing_attempts": 1},
-    )
     with fixture.repository.database.transaction() as connection:
         connection.execute(
             "UPDATE runs SET state = ? WHERE run_id = ?",
             (RunState.MONITORING_CI_REVIEW.value, run_id),
         )
-    fixture.repository.transition_with_evidence(
-        run_id,
-        RunState.MONITORING_CI_REVIEW,
-        RunState.FIXING_CI_REVIEW,
-        "CI_OR_REVIEW_CHANGES_REQUIRED",
-        (second,),
-    )
+    second = orchestrator.step(run_id)
+    assert second.state is RunState.FIXING_CI_REVIEW
     with fixture.repository.database.transaction() as connection:
         connection.execute(
             "UPDATE runs SET state = ? WHERE run_id = ?",
@@ -2751,6 +2767,129 @@ def test_monitor_stops_same_feedback_after_two_automatic_fix_rounds(
     assert len(requests) == 2
 
 
+def test_same_thread_comment_changes_do_not_reset_two_round_budget(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA, unresolved_thread_ids=("PRRT_stable",)
+    )
+    orchestrator = fixture.orchestrator()
+    for comment in ("first wording", "clarified wording"):
+        fixture.github.actionable_reviews = (
+            ReviewThread(
+                thread_id="PRRT_stable",
+                resolved=False,
+                outdated=False,
+                path="src/app.py",
+                line=9,
+                comments=(comment,),
+            ),
+        )
+        assert orchestrator.step(run_id).state is RunState.FIXING_CI_REVIEW
+        with fixture.repository.database.transaction() as connection:
+            connection.execute(
+                "UPDATE runs SET state = ? WHERE run_id = ?",
+                (RunState.MONITORING_CI_REVIEW.value, run_id),
+            )
+    fixture.github.actionable_reviews = (
+        ReviewThread(
+            thread_id="PRRT_stable",
+            resolved=False,
+            outdated=False,
+            path="src/app.py",
+            line=10,
+            comments=("third wording",),
+        ),
+    )
+
+    stopped = orchestrator.step(run_id)
+
+    assert stopped.state is RunState.REVIEW_DECISION_REQUIRED
+    assert stopped.action == "review_fix_limit_reached"
+
+
+def test_existing_thread_budget_is_not_reset_when_another_thread_is_added(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
+    orchestrator = fixture.orchestrator()
+    thread_a = ReviewThread(
+        thread_id="PRRT_thread_a",
+        resolved=False,
+        outdated=False,
+        path="a.py",
+        line=1,
+        comments=("fix A",),
+    )
+    thread_b = ReviewThread(
+        thread_id="PRRT_thread_b",
+        resolved=False,
+        outdated=False,
+        path="b.py",
+        line=2,
+        comments=("fix B",),
+    )
+    fixture.github.snapshot_result = Snapshot(
+        SHA, unresolved_thread_ids=("PRRT_thread_a",)
+    )
+    fixture.github.actionable_reviews = (thread_a,)
+    assert orchestrator.step(run_id).state is RunState.FIXING_CI_REVIEW
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA,
+        unresolved_thread_ids=("PRRT_thread_a", "PRRT_thread_b"),
+    )
+    fixture.github.actionable_reviews = (thread_a, thread_b)
+    assert orchestrator.step(run_id).state is RunState.FIXING_CI_REVIEW
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.MONITORING_CI_REVIEW.value, run_id),
+        )
+
+    stopped = orchestrator.step(run_id)
+
+    assert stopped.state is RunState.REVIEW_DECISION_REQUIRED
+    assert stopped.action == "review_fix_limit_reached"
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        Snapshot(SHA, checks_status="failed"),
+        Snapshot(SHA, review_status="changes_requested"),
+    ],
+)
+def test_monitor_pauses_when_remote_failure_has_no_actionable_details(
+    fixture: Fixture,
+    snapshot: Snapshot,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
+    fixture.github.snapshot_result = snapshot
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.REVIEW_DECISION_REQUIRED
+    assert outcome.action == "actionable_feedback_missing"
+
+
 def test_monitor_resets_attempt_for_changed_feedback_fingerprint(
     fixture: Fixture,
 ) -> None:
@@ -2760,7 +2899,9 @@ def test_monitor_resets_attempt_for_changed_feedback_fingerprint(
             "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
             (run_id,),
         )
-    fixture.github.snapshot_result = Snapshot(SHA, checks_status="failed")
+    fixture.github.snapshot_result = Snapshot(
+        SHA, checks_status="failed", failed_checks=(FAILED_CHECK,)
+    )
     orchestrator = fixture.orchestrator()
     orchestrator.step(run_id)
     with fixture.repository.database.transaction() as connection:
@@ -2769,7 +2910,9 @@ def test_monitor_resets_attempt_for_changed_feedback_fingerprint(
             (RunState.MONITORING_CI_REVIEW.value, run_id),
         )
     fixture.github.snapshot_result = Snapshot(
-        SHA, review_status="changes_requested"
+        SHA,
+        review_status="changes_requested",
+        requested_reviews=(REQUESTED_REVIEW,),
     )
 
     changed = orchestrator.step(run_id)

@@ -224,12 +224,40 @@ def _environment_secrets(names: tuple[str, ...]) -> dict[str, str]:
     return {
         name: value
         for name in names
-        if (value := os.environ.get(name)) is not None
+        if name in {"GH_TOKEN", "GITHUB_TOKEN"}
+        and (value := os.environ.get(name)) is not None
     }
 
 
+def _github_fixed_environment(names: tuple[str, ...]) -> dict[str, str]:
+    if "GH_CONFIG_DIR" not in names:
+        return {}
+    profile_value = os.environ.get("USERPROFILE")
+    if not profile_value:
+        raise CliUsageError("USERPROFILE is unavailable for GitHub authentication")
+    profile = Path(profile_value).resolve(strict=True)
+    if not profile.is_dir():
+        raise CliUsageError("USERPROFILE is not a trusted directory")
+    expected_appdata = (profile / "AppData" / "Roaming").resolve(strict=True)
+    appdata_value = os.environ.get("APPDATA")
+    if appdata_value is not None:
+        appdata = Path(appdata_value).resolve(strict=True)
+        if appdata != expected_appdata:
+            raise CliUsageError("APPDATA is not bound to USERPROFILE")
+    config_dir = (expected_appdata / "GitHub CLI").resolve(strict=True)
+    if not config_dir.is_dir() or config_dir.parent != expected_appdata:
+        raise CliUsageError("GitHub CLI configuration directory is unavailable")
+    return {"GH_CONFIG_DIR": str(config_dir)}
+
+
 def _github_port(config: Any) -> GitHubAdapter:
-    return GitHubAdapter(ProcessRunner(_environment_secrets), config)
+    return GitHubAdapter(
+        ProcessRunner(
+            _environment_secrets,
+            fixed_environment_provider=_github_fixed_environment,
+        ),
+        config,
+    )
 
 
 @dataclass
@@ -247,6 +275,7 @@ class CliServices:
     discovery_factory: Callable[[Any], Any] | None = None
     discovery_http_factory: Callable[[], Any] | None = None
     discovery_git_runner: Any | None = None
+    discovery_github_factory: Callable[[Any], Any] | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = validate_runtime_root(
@@ -261,10 +290,12 @@ class CliServices:
         if self.discovery_factory is None:
             http_factory = self.discovery_http_factory
             runner = self.discovery_git_runner
+            github_factory = self.discovery_github_factory or _github_port
             self.discovery_factory = lambda config: _project_discovery(
                 config,
                 http=http_factory(),
                 runner=runner,
+                github=github_factory(config),
             )
 
     def load_project(self, project_id: str) -> tuple[Any, str]:
@@ -370,7 +401,10 @@ def _project_discovery(
     *,
     http: Any,
     runner: Any | None = None,
+    github: Any | None = None,
 ) -> ExampleProjectAdapter:
+    if github is None:
+        github = _github_port(config)
     return ExampleProjectAdapter(
         config,
         git=GitAdapter(
@@ -383,7 +417,7 @@ def _project_discovery(
             runner=runner,
             discovery_only=True,
         ),
-        github=object(),
+        github=github,
         http=http,
     )
 

@@ -539,7 +539,7 @@ class RetentionService:
             ]
 
         class FileDispositionInformation(ctypes.Structure):
-            _fields_ = [("delete_file", ctypes.c_int)]
+            _fields_ = [("delete_file", ctypes.c_ubyte)]
 
         kernel32 = _windows_kernel32()
         handle = kernel32.CreateFileW(

@@ -521,17 +521,47 @@ class RuntimeStageExecutor:
         if (
             type(payload) is not dict
             or type(payload.get("attempt")) is not int
-            or type(payload.get("existing_attempts")) is not int
+            or type(payload.get("issues")) is not list
+            or not payload["issues"]
             or type(payload.get("feedback_fingerprint")) is not str
-            or type(payload.get("feedback")) is not dict
+            or type(payload.get("untrusted_data")) is not dict
             or payload.get("head_sha") != run.head_sha
             or payload.get("pr_number") != run.pr_number
-            or payload["attempt"] != payload["existing_attempts"] + 1
         ):
             raise ValueError("review fix request evidence is invalid")
+        attempts = []
+        for issue in payload["issues"]:
+            if (
+                type(issue) is not dict
+                or set(issue) != {
+                    "issue_identity",
+                    "issue_fingerprint",
+                    "existing_attempts",
+                    "attempt",
+                }
+                or type(issue["issue_identity"]) is not str
+                or type(issue["issue_fingerprint"]) is not str
+                or type(issue["existing_attempts"]) is not int
+                or type(issue["attempt"]) is not int
+                or issue["attempt"] != issue["existing_attempts"] + 1
+            ):
+                raise ValueError("review fix issue evidence is invalid")
+            issue_fingerprint = hashlib.sha256(
+                issue["issue_identity"].encode("ascii")
+            ).hexdigest()
+            if not hmac.compare_digest(
+                issue["issue_fingerprint"], issue_fingerprint
+            ):
+                raise ValueError("review fix issue fingerprint is invalid")
+            assert_fix_attempt_allowed(
+                issue["issue_fingerprint"], issue["existing_attempts"]
+            )
+            attempts.append(issue["attempt"])
+        if payload["attempt"] != max(attempts):
+            raise ValueError("review fix aggregate attempt is invalid")
         actual_fingerprint = hashlib.sha256(
             json.dumps(
-                payload["feedback"],
+                payload["untrusted_data"],
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -541,9 +571,6 @@ class RuntimeStageExecutor:
             payload["feedback_fingerprint"], actual_fingerprint
         ):
             raise ValueError("review fix feedback fingerprint is invalid")
-        assert_fix_attempt_allowed(
-            payload["feedback_fingerprint"], payload["existing_attempts"]
-        )
         artifacts = {
             name: contents.decode("utf-8")
             for name, contents in self._repository.get_approved_artifacts(

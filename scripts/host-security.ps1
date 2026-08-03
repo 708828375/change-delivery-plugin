@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
 $script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = 'f7f93d467dda6bafe68e891dc619f1fb96e8a0cc9d2377e9a591dd0a377100d3'
+$script:TrustedModuleManifestSha256 = '7539abc7439e06f70baddb260b3e1539cb5f749e51c48340193aa1d88171fc03'
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -300,6 +300,21 @@ function Resolve-TrustedPythonIdentity() {
     return [PSCustomObject]@{
         path = $path
         sha256 = Get-FileSha256 $path
+    }
+}
+
+function Assert-NoPythonBytecode([string] $ModuleRoot) {
+    $root = (Resolve-Path -LiteralPath $ModuleRoot -ErrorAction Stop).ProviderPath
+    Assert-NoReparseChain $root
+    $forbidden = @(
+        Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop |
+        Where-Object {
+            ($_.PSIsContainer -and $_.Name -ceq '__pycache__') -or
+            (-not $_.PSIsContainer -and $_.Extension -ieq '.pyc')
+        }
+    )
+    if ($forbidden.Count -ne 0) {
+        throw 'Trusted Python module tree contains forbidden bytecode or cache directories.'
     }
 }
 

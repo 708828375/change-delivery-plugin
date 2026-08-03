@@ -106,6 +106,7 @@ def snapshot_payload(
     review_decision: str = "APPROVED",
     conclusions: tuple[str, ...] = ("SUCCESS",),
     is_draft: bool = False,
+    latest_reviews: tuple[dict[str, object], ...] = (),
 ) -> dict[str, object]:
     return {
         "headRefOid": sha,
@@ -120,6 +121,7 @@ def snapshot_payload(
             }
             for index, conclusion in enumerate(conclusions)
         ],
+        "latestReviews": list(latest_reviews),
         "isDraft": is_draft,
     }
 
@@ -253,7 +255,7 @@ def test_ensure_draft_pr_reuses_existing_ready_pr_with_safe_command(
         "number,url,baseRefName,headRefName,isDraft,headRefOid",
     )
     assert command.workdir == tmp_path
-    assert command.env_names == ("GH_TOKEN", "GITHUB_TOKEN")
+    assert command.env_names == ("GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN")
 
 
 def test_find_pr_is_public_read_only_lookup(tmp_path: Path) -> None:
@@ -570,6 +572,109 @@ def test_check_rollup_accepts_gh_metadata_but_still_requires_success(
     assert snapshot.checks_passed
 
 
+def test_snapshot_exposes_bounded_failed_check_facts(tmp_path: Path) -> None:
+    adapter = GitHubAdapter(FakeRunner(), project_config(tmp_path))
+    payload = snapshot_payload(conclusions=("FAILURE",))
+    check = payload["statusCheckRollup"][0]
+    assert isinstance(check, dict)
+    check["workflowName"] = "CI"
+    check["detailsUrl"] = "https://github.com/owner/repo/actions/runs/7"
+
+    snapshot = adapter.parse_snapshot(payload, ())
+
+    assert [fact.model_dump(mode="json") for fact in snapshot.failed_checks] == [
+        {
+            "kind": "check_run",
+            "name": "check-0",
+            "workflow": "CI",
+            "conclusion": "FAILURE",
+            "details_url": "https://github.com/owner/repo/actions/runs/7",
+        }
+    ]
+
+
+def test_snapshot_exposes_top_level_changes_requested_body(
+    tmp_path: Path,
+) -> None:
+    adapter = GitHubAdapter(FakeRunner(), project_config(tmp_path))
+    payload = snapshot_payload(
+        review_decision="CHANGES_REQUESTED",
+        latest_reviews=(
+            {
+                "id": "PRR_actionable",
+                "author": {"login": "reviewer"},
+                "body": "Add a regression test for the timeout path.",
+                "state": "CHANGES_REQUESTED",
+            },
+        ),
+    )
+
+    snapshot = adapter.parse_snapshot(payload, ())
+
+    assert snapshot.requested_reviews[0].review_id == "PRR_actionable"
+    assert snapshot.requested_reviews[0].body.startswith("Add a regression")
+
+
+def test_branch_heads_returns_only_stable_double_sampled_shas(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        result({"sha": SHA}),
+        result({"sha": OTHER_SHA}),
+        result({"sha": SHA.upper()}),
+        result({"sha": OTHER_SHA.upper()}),
+    )
+    adapter = GitHubAdapter(runner, project_config(tmp_path))
+
+    heads = adapter.branch_heads(("develop", "feature/read-only"))
+
+    assert heads == {"develop": SHA, "feature/read-only": OTHER_SHA}
+    assert [command.args for command in runner.commands] == [
+        (
+            "api", "--method", "GET",
+            "repos/owner/repo/git/ref/heads/develop",
+            "--jq", "{sha:.object.sha}",
+        ),
+        (
+            "api", "--method", "GET",
+            "repos/owner/repo/git/ref/heads/feature%2Fread-only",
+            "--jq", "{sha:.object.sha}",
+        ),
+        (
+            "api", "--method", "GET",
+            "repos/owner/repo/git/ref/heads/develop",
+            "--jq", "{sha:.object.sha}",
+        ),
+        (
+            "api", "--method", "GET",
+            "repos/owner/repo/git/ref/heads/feature%2Fread-only",
+            "--jq", "{sha:.object.sha}",
+        ),
+    ]
+    assert all(
+        command.env_names == ("GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN")
+        for command in runner.commands
+    )
+
+
+def test_branch_heads_blocks_changed_or_malformed_authoritative_sample(
+    tmp_path: Path,
+) -> None:
+    changed = GitHubAdapter(
+        FakeRunner(result({"sha": SHA}), result({"sha": OTHER_SHA})),
+        project_config(tmp_path),
+    )
+    with pytest.raises(SnapshotChanged, match="branch head evidence changed"):
+        changed.branch_heads(("develop",))
+
+    malformed = GitHubAdapter(
+        FakeRunner(result({"sha": "short"})),
+        project_config(tmp_path),
+    )
+    with pytest.raises(GitHubError, match="branch head response was invalid"):
+        malformed.branch_heads(("develop",))
+
+
 def test_snapshot_models_and_parser_reject_coerced_boolean_values(
     tmp_path: Path,
 ) -> None:
@@ -694,9 +799,9 @@ def test_snapshot_rejects_same_sha_thread_state_change(tmp_path: Path) -> None:
         adapter.snapshot(152)
 
 
-def test_snapshot_ignores_nonsemantic_check_metadata_change(tmp_path: Path) -> None:
-    first = snapshot_payload()
-    second = snapshot_payload()
+def test_snapshot_rejects_failed_check_url_change(tmp_path: Path) -> None:
+    first = snapshot_payload(conclusions=("FAILURE",))
+    second = snapshot_payload(conclusions=("FAILURE",))
     first_check = first["statusCheckRollup"][0]
     second_check = second["statusCheckRollup"][0]
     assert isinstance(first_check, dict)
@@ -713,9 +818,8 @@ def test_snapshot_ignores_nonsemantic_check_metadata_change(tmp_path: Path) -> N
     )
     adapter = GitHubAdapter(runner, project_config(tmp_path))
 
-    snapshot = adapter.snapshot(152)
-
-    assert snapshot.ready_to_merge
+    with pytest.raises(SnapshotChanged):
+        adapter.snapshot(152)
 
 
 def test_list_actionable_reviews_filters_and_sorts_by_stable_id(
@@ -861,7 +965,7 @@ def test_reply_to_thread_uses_stable_id_and_direct_argv(tmp_path: Path) -> None:
     assert "owner=owner" in membership_args
     assert "name=repo" in membership_args
     assert "number=152" in membership_args
-    assert command.env_names == ("GH_TOKEN", "GITHUB_TOKEN")
+    assert command.env_names == ("GH_CONFIG_DIR", "GH_TOKEN", "GITHUB_TOKEN")
 
 
 def test_reply_timeout_is_uncertain_and_never_retried(tmp_path: Path) -> None:

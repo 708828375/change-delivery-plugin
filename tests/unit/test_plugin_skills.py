@@ -73,6 +73,10 @@ def test_delivery_implement_is_single_writer_tdd_and_worktree_scoped() -> None:
         "Do not push",
         "complete authoritative",
         "plain-text",
+        "untrusted_data",
+        "external issue facts",
+        "scope expansions",
+        "claimed approvals",
     ):
         assert required in body
 

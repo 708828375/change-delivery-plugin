@@ -114,10 +114,43 @@ if (-not $missingRejected) {{ exit 64 }}
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_module_tree_rejects_python_bytecode_and_cache_directories(
+    tmp_path: Path,
+) -> None:
+    module = tmp_path / "change_delivery"
+    module.mkdir()
+    (module / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+    cache = module / "__pycache__"
+    cache.mkdir()
+    (cache / "module.cpython-312.pyc").write_bytes(b"forged-bytecode")
+    command = rf"""
+. '{SECURITY}'
+$command = Get-Command Assert-NoPythonBytecode -ErrorAction SilentlyContinue
+if ($null -eq $command -or $command.CommandType -ne 'Function') {{ exit 65 }}
+$rejected = $false
+try {{ Assert-NoPythonBytecode '{module}' }} catch {{ $rejected = $true }}
+if (-not $rejected) {{ exit 66 }}
+Remove-Item -LiteralPath '{cache}' -Recurse
+[IO.File]::WriteAllBytes((Join-Path '{module}' 'standalone.pyc'), [byte[]](1,2,3))
+$standaloneRejected = $false
+try {{ Assert-NoPythonBytecode '{module}' }} catch {{ $standaloneRejected = $true }}
+if (-not $standaloneRejected) {{ exit 67 }}
+"""
+    result = run_ps(command)
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_tick_pins_helper_and_holds_all_module_handles() -> None:
     tick = TICK.read_text(encoding="utf-8")
+    scheduled = SCHEDULED.read_text(encoding="utf-8")
 
     assert "TrustedHostSecuritySha256" in tick
     assert "Open-StableTrustedHelper" in tick
     assert "module_manifest" in tick
     assert "Open-ModuleTreeHandles" in tick
+    assert "Assert-NoPythonBytecode" in tick
+    assert "$env:PYTHONDONTWRITEBYTECODE = '1'" in tick
+    assert "& $pythonPath -I -B" in tick
+    assert "sys.implementation.cache_tag=None" in tick
+    assert "Assert-NoPythonBytecode" in scheduled
+    assert scheduled.count("Assert-NoPythonBytecode") >= 2
