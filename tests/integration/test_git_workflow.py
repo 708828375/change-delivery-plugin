@@ -156,6 +156,54 @@ def adapter_for(
     return GitAdapter(repo, runner=runner, **arguments)
 
 
+def test_authoritative_remote_heads_ignore_stale_tracking_refs_and_leave_no_lock(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    _, seed, repo, base_sha = local_remote
+    git(seed, "branch", "test", base_sha)
+    git(seed, "push", "origin", "test")
+    advanced_test_sha = commit_file(seed, "test.txt", "advanced\n", "advance test")
+    git(seed, "push", "origin", "HEAD:test")
+    local_develop_sha = commit_file(
+        repo,
+        "local-only.txt",
+        "ahead\n",
+        "local develop ahead",
+    )
+    assert local_develop_sha != base_sha
+    assert git(repo, "show-ref", "--verify", "refs/remotes/origin/test", check=False).returncode != 0
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner, discovery_only=True)
+
+    attestation = adapter.remote_heads_attestation(
+        "origin",
+        ("develop", "test"),
+    )
+
+    assert attestation.branch_shas == {
+        "develop": base_sha,
+        "test": advanced_test_sha,
+    }
+    operations = [git_operation_args(spec.args) for spec in runner.specs]
+    assert any(
+        operation
+        == (
+            "ls-remote",
+            "--refs",
+            str(local_remote[0]),
+            "refs/heads/develop",
+            "refs/heads/test",
+        )
+        for operation in operations
+    )
+    mutating = {"push", "branch", "worktree", "fetch"}
+    assert all(operation[0] not in mutating for operation in operations), operations
+    assert not adapter.discovery_lock_path.exists()
+    with pytest.raises(BlockedError, match="discovery-only"):
+        adapter.fetch("origin")
+    assert not adapter.discovery_lock_path.exists()
+
+
 def test_fetch_remote_sha_and_worktree_use_fetched_remote_base(
     local_remote: tuple[Path, Path, Path, str],
     tmp_path: Path,

@@ -2084,7 +2084,7 @@ def test_cli_start_dry_run_bypasses_draft_creation_path(
     assert payload["status"] == "passed"
     assert payload["base_sha"] == SHA
     assert payload["test_sha"] == OTHER_SHA
-    assert discovery.calls == 1
+    assert discovery.calls == 2
     assert fixture.repository.list_active_runs() == []
     assert not (fixture.root / "runs").exists()
 

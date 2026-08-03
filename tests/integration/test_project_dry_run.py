@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 from email.message import Message
 from io import StringIO
 from pathlib import Path
@@ -30,6 +31,9 @@ from change_delivery.adapters.project import (
 )
 from change_delivery.cli import CliServices, main
 from change_delivery.config import load_project_config
+from change_delivery.domain import CommandSpec, ProjectConfig
+from change_delivery.locking import project_lock_path
+from change_delivery.process import ProcessResult, ProcessRunner
 
 
 DEVELOP_SHA = "a" * 40
@@ -57,8 +61,11 @@ class FakeGit:
         self.remote_push_url = config.remote_push_url
         self.read_calls: list[tuple[str, tuple[str, ...]]] = []
         self.write_calls: list[object] = []
+        self.branch_snapshots = [
+            {"develop": DEVELOP_SHA, "test": TEST_SHA}
+        ]
 
-    def discovery_attestation(
+    def remote_heads_attestation(
         self,
         remote: str,
         branches: tuple[str, ...],
@@ -73,16 +80,36 @@ class FakeGit:
             remote=remote,
             remote_fetch_url=self.remote_fetch_url,
             remote_push_url=self.remote_push_url,
-            branch_shas={
-                "develop": DEVELOP_SHA,
-                "test": TEST_SHA,
-            },
+            branch_shas=self.branch_snapshots.pop(0)
+            if len(self.branch_snapshots) > 1
+            else self.branch_snapshots[0],
         )
+
+    discovery_attestation = remote_heads_attestation
 
 
 class FakeGitHub:
     def __init__(self) -> None:
         self.write_calls: list[object] = []
+
+
+class RecordingProcessRunner:
+    def __init__(self) -> None:
+        self.specs: list[CommandSpec] = []
+        self.delegate = ProcessRunner(
+            lambda _names: {},
+            fixed_environment_provider=lambda _names: {
+                "GIT_CONFIG_NOSYSTEM": "true",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "false",
+                "GCM_INTERACTIVE": "never",
+                "GIT_SSH_COMMAND": "ssh -o BatchMode=yes",
+            },
+        )
+
+    def run(self, spec: CommandSpec) -> ProcessResult:
+        self.specs.append(spec)
+        return self.delegate.run(spec)
 
 
 @pytest.fixture
@@ -146,6 +173,7 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (fixture_config, "c" * 64),
         discovery_factory=discovery_factory,
+        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -182,11 +210,15 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         "version_probe": {
             "status": "passed",
             "reason": "deployed SHA matches origin/test",
+            "reason_code": "deployed_sha_matches",
             "deployed_sha": TEST_SHA,
         },
     }
     assert factory_calls == [fixture_config]
-    assert fake_git.read_calls == [("origin", ("develop", "test"))]
+    assert fake_git.read_calls == [
+        ("origin", ("develop", "test")),
+        ("origin", ("develop", "test")),
+    ]
     assert fake_git.write_calls == []
     assert fake_github.write_calls == []
     assert fake_http.calls == [
@@ -199,18 +231,18 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
 
 
 @pytest.mark.parametrize(
-    ("body", "reason_fragment"),
+    ("body", "reason_code"),
     (
-        ({}, "40 hexadecimal"),
-        ({"git_sha": "short"}, "40 hexadecimal"),
-        ({"git_sha": DEVELOP_SHA}, "does not match origin/test"),
+        ({}, "version_evidence_invalid"),
+        ({"git_sha": "short"}, "version_evidence_invalid"),
+        ({"git_sha": DEVELOP_SHA}, "deployed_sha_mismatch"),
     ),
 )
 def test_cli_start_dry_run_blocks_bad_version_evidence_without_writes(
     fixture_config,
     tmp_path: Path,
     body: object,
-    reason_fragment: str,
+    reason_code: str,
 ) -> None:
     requirement = tmp_path / "requirement.md"
     requirement.write_text("read-only discovery", encoding="utf-8")
@@ -228,6 +260,7 @@ def test_cli_start_dry_run_blocks_bad_version_evidence_without_writes(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (fixture_config, "c" * 64),
         discovery_factory=lambda _config: adapter,
+        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -255,7 +288,7 @@ def test_cli_start_dry_run_blocks_bad_version_evidence_without_writes(
     assert payload["base_sha"] == DEVELOP_SHA
     assert payload["test_sha"] == TEST_SHA
     assert payload["version_probe"]["status"] == "blocked"
-    assert reason_fragment in payload["version_probe"]["reason"]
+    assert payload["version_probe"]["reason_code"] == reason_code
     assert fake_git.write_calls == []
     assert fake_github.write_calls == []
     assert not (tmp_path / "runtime" / "state.sqlite3").exists()
@@ -276,6 +309,7 @@ def test_cli_start_dry_run_refuses_production_enabled_config_before_io(
         plugin_root=tmp_path / "runtime",
         project_loader=lambda _project_id: (production_config, "c" * 64),
         discovery_factory=lambda config: factory_calls.append(config),
+        dry_run_endpoint_policy=lambda _config: None,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -300,6 +334,234 @@ def test_cli_start_dry_run_refuses_production_enabled_config_before_io(
     assert payload["status"] == "blocked"
     assert "production" in payload["version_probe"]["reason"]
     assert factory_calls == []
+
+
+def test_cli_start_dry_run_blocks_non_test_project_endpoint_before_io(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    production_endpoint = fixture_config.model_copy(
+        update={"version_endpoint": "https://api.example.invalid/health"}
+    )
+    factory_calls = []
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (production_endpoint, "c" * 64),
+        discovery_factory=lambda config: factory_calls.append(config),
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "start", "--project", "example-backend",
+            "--requirement-file", str(requirement), "--dry-run", "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 2
+    payload = json.loads(stderr.getvalue())
+    assert payload["version_probe"]["reason_code"] == "endpoint_not_allowed"
+    assert factory_calls == []
+
+
+def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    fake_http = FakeHttp({"git_sha": TEST_SHA})
+    fake_git = FakeGit(fixture_config)
+    fake_git.branch_snapshots = [
+        {"develop": DEVELOP_SHA, "test": TEST_SHA},
+        {"develop": DEVELOP_SHA, "test": "c" * 40},
+    ]
+    adapter = ExampleProjectAdapter(
+        fixture_config,
+        git=fake_git,
+        github=FakeGitHub(),
+        http=fake_http,
+        file_exists=lambda _path: False,
+    )
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (fixture_config, "c" * 64),
+        discovery_factory=lambda _config: adapter,
+        dry_run_endpoint_policy=lambda _config: None,
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "start", "--project", "example-backend",
+            "--requirement-file", str(requirement), "--dry-run", "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 2
+    payload = json.loads(stderr.getvalue())
+    assert payload["version_probe"]["reason_code"] == "remote_changed_during_probe"
+    assert fake_git.read_calls == [
+        ("origin", ("develop", "test")),
+        ("origin", ("develop", "test")),
+    ]
+
+
+def test_cli_start_dry_run_never_echoes_dependency_exception_text(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    secret = "ghp_dependency_secret_123456789"
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (fixture_config, "c" * 64),
+        discovery_factory=lambda _config: (_ for _ in ()).throw(
+            RuntimeError(secret)
+        ),
+        dry_run_endpoint_policy=lambda _config: None,
+    )
+    stderr = StringIO()
+
+    result = main(
+        [
+            "start", "--project", "example-backend",
+            "--requirement-file", str(requirement), "--dry-run", "--json",
+        ],
+        services=services,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert result == 2
+    assert secret not in stderr.getvalue()
+    payload = json.loads(stderr.getvalue())
+    assert payload["version_probe"] == {
+        "status": "blocked",
+        "reason": "read-only dependency failed",
+        "reason_code": "dependency_failed",
+        "deployed_sha": None,
+    }
+
+
+def test_default_cli_discovery_uses_real_read_only_remote_and_no_runtime_writes(
+    tmp_path: Path,
+) -> None:
+    def git(cwd: Path, *args: str) -> str:
+        import subprocess
+
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    remote = tmp_path / "origin.git"
+    repo = tmp_path / "repo"
+    remote.mkdir()
+    repo.mkdir()
+    git(remote, "init", "--bare")
+    git(repo, "init", "-b", "develop")
+    git(repo, "config", "user.name", "Dry Run Test")
+    git(repo, "config", "user.email", "dry-run@example.invalid")
+    (repo / "base.txt").write_text("base", encoding="utf-8")
+    git(repo, "add", "base.txt")
+    git(repo, "commit", "-m", "base")
+    base_sha = git(repo, "rev-parse", "HEAD").lower()
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "origin", "develop")
+    git(repo, "checkout", "-b", "test")
+    (repo / "test.txt").write_text("test", encoding="utf-8")
+    git(repo, "add", "test.txt")
+    git(repo, "commit", "-m", "test")
+    test_sha = git(repo, "rev-parse", "HEAD").lower()
+    git(repo, "push", "origin", "test")
+    git(repo, "checkout", "develop")
+    endpoint = "https://api.test.example.invalid/health"
+    config = ProjectConfig.model_validate(
+        {
+            "project_id": "example-backend",
+            "repo_path": repo.resolve(),
+            "remote": "origin",
+            "remote_fetch_url": str(remote.resolve()),
+            "remote_push_url": str(remote.resolve()),
+            "base_branch": "develop",
+            "test_branch": "test",
+            "github_repository": "example-org/example_backend",
+            "version_endpoint": endpoint,
+            "version_sha_field": "git_sha",
+            "required_pre_pr_checks": [
+                {
+                    "executable": "python",
+                    "args": ["-m", "pytest"],
+                    "workdir": repo.resolve(),
+                }
+            ],
+        }
+    )
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("discover only", encoding="utf-8")
+    runner = RecordingProcessRunner()
+    transport = FakeTransport(
+        (FakeResponse({"git_sha": test_sha}, url=endpoint),)
+    )
+    client = ReadOnlyHttpClient(transport=transport)
+    runtime = tmp_path / "runtime"
+    before_repo_refs = git(repo, "show-ref")
+    before_remote_refs = git(remote, "show-ref")
+    before_status = git(repo, "status", "--porcelain=v1")
+    services = CliServices(
+        plugin_root=runtime,
+        project_loader=lambda _project_id: (config, "c" * 64),
+        discovery_http_factory=lambda: client,
+        discovery_git_runner=runner,
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "start", "--project", "example-backend",
+            "--requirement-file", str(requirement), "--dry-run", "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 0, stderr.getvalue()
+    payload = json.loads(stdout.getvalue())
+    assert payload["base_sha"] == base_sha
+    assert payload["test_sha"] == test_sha
+    assert [call[0] for call in transport.calls] == [endpoint]
+    operations = [spec.args for spec in runner.specs]
+    assert sum("ls-remote" in operation for operation in operations) == 2
+    assert all(
+        forbidden not in operation
+        for operation in operations
+        for forbidden in ("push", "branch", "worktree", "fetch")
+    )
+    assert git(repo, "show-ref") == before_repo_refs
+    assert git(remote, "show-ref") == before_remote_refs
+    assert git(repo, "status", "--porcelain=v1") == before_status
+    assert not project_lock_path(repo).exists()
+    assert not (runtime / "state.sqlite3").exists()
+    assert not (runtime / "runs").exists()
+    assert not (runtime / "worktrees").exists()
 
 
 def test_project_dry_run_requires_literal_true(fixture_config) -> None:

@@ -203,6 +203,8 @@ class RemoteIdentityChanged(GitError):
 def _project_write(method):
     @wraps(method)
     def locked(self, *args, **kwargs):
+        if self._discovery_only:
+            raise BlockedError("discovery-only Git adapter forbids writes")
         self.discovery_lock_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with self._project_file_lock, self._attestation_lock:
@@ -237,6 +239,7 @@ class GitAdapter:
         runner: Runner | None = None,
         git_executable: str = "git",
         lock_root: Path | None = None,
+        discovery_only: bool = False,
     ) -> None:
         unresolved_repo = Path(repo_path).absolute()
         self._reject_reparse_components(unresolved_repo)
@@ -268,7 +271,11 @@ class GitAdapter:
             fixed_environment_provider=_git_environment,
         )
         self._git_executable = git_executable
-        self._require_primary_repo()
+        if not isinstance(discovery_only, bool):
+            raise TypeError("discovery_only must be a boolean")
+        self._discovery_only = discovery_only
+        if not discovery_only:
+            self._require_primary_repo()
         self._validate_remote_name(remote)
         self._require_registered_remote(remote)
         self._validate_branch(base_branch)
@@ -394,6 +401,60 @@ class GitAdapter:
                 remote_push_url=self._push_url,
                 branch_shas=branch_shas,
             )
+
+    def remote_heads_attestation(
+        self,
+        remote: str,
+        branches: tuple[str, ...],
+    ) -> GitDiscoveryAttestation:
+        """Read exact branch heads from the registered remote without local writes."""
+        self._require_bound_remote(remote)
+        if (
+            not isinstance(branches, tuple)
+            or not branches
+            or len(set(branches)) != len(branches)
+        ):
+            raise ValueError("discovery branches must be a non-empty unique tuple")
+        for branch in branches:
+            self._validate_branch(branch)
+        refs = tuple(f"refs/heads/{branch}" for branch in branches)
+        with self._attestation_lock, self._open_repository_handle() as handle:
+            if handle.identity != self._repository_identity:
+                raise RemoteIdentityChanged(
+                    "remote_heads_attestation",
+                    reason="repository identity changed before remote discovery",
+                )
+            initial_remote = self._read_remote_snapshot()
+            result = self._run(
+                "remote_heads_snapshot",
+                self._fetch_scoped(
+                    ("ls-remote", "--refs", self._fetch_url, *refs)
+                ),
+            )
+            branch_shas = self._parse_remote_heads(
+                result.stdout,
+                branches,
+            )
+            final_remote = self._read_remote_snapshot()
+            with self._open_repository_handle() as current:
+                if current.identity != self._repository_identity:
+                    raise RemoteIdentityChanged(
+                        "remote_heads_attestation",
+                        reason="repository identity changed during remote discovery",
+                    )
+            expected_remote = (self._fetch_url, self._push_url)
+            if initial_remote != expected_remote or final_remote != expected_remote:
+                raise RemoteIdentityChanged(
+                    "remote_heads_attestation",
+                    reason="remote identity changed during remote discovery",
+                )
+        return GitDiscoveryAttestation(
+            repository=self._repository_identity,
+            remote=remote,
+            remote_fetch_url=self._fetch_url,
+            remote_push_url=self._push_url,
+            branch_shas=branch_shas,
+        )
 
     @_project_write
     def create_worktree(
@@ -1019,6 +1080,36 @@ class GitAdapter:
             raise GitError(
                 "discovery_refs_snapshot",
                 reason="remote refs snapshot is incomplete",
+            )
+        return observed
+
+    def _parse_remote_heads(
+        self,
+        stdout: str,
+        branches: tuple[str, ...],
+    ) -> dict[str, str]:
+        expected = {
+            f"refs/heads/{branch}": branch for branch in branches
+        }
+        observed: dict[str, str] = {}
+        for line in stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or fields[1] not in expected:
+                raise GitError(
+                    "remote_heads_snapshot",
+                    reason="remote heads snapshot is malformed",
+                )
+            branch = expected[fields[1]]
+            if branch in observed:
+                raise GitError(
+                    "remote_heads_snapshot",
+                    reason="remote heads snapshot contains duplicates",
+                )
+            observed[branch] = self._normalize_sha(fields[0])
+        if set(observed) != set(branches):
+            raise GitError(
+                "remote_heads_snapshot",
+                reason="remote heads snapshot is incomplete",
             )
         return observed
 

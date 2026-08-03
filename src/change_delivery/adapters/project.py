@@ -25,6 +25,19 @@ _PYTEST_CONFIGS = (
     "tox.ini",
     "setup.cfg",
 )
+EXAMPLE_PROJECT_PROJECT_ID = "example-backend"
+EXAMPLE_PROJECT_TEST_VERSION_ENDPOINT = "https://api.test.example.invalid/health"
+
+
+def enforce_project_test_endpoint(config: ProjectConfig) -> None:
+    """Bind ExampleProject dry-runs to the code-owned test environment identity."""
+    if config.project_id != EXAMPLE_PROJECT_PROJECT_ID:
+        return
+    if not hmac.compare_digest(
+        config.version_endpoint,
+        EXAMPLE_PROJECT_TEST_VERSION_ENDPOINT,
+    ):
+        raise ValueError("ExampleProject dry-run endpoint is not the test endpoint")
 
 
 class HttpReader(Protocol):
@@ -32,7 +45,7 @@ class HttpReader(Protocol):
 
 
 class GitReader(Protocol):
-    def discovery_attestation(
+    def remote_heads_attestation(
         self,
         remote: str,
         branches: tuple[str, ...],
@@ -78,7 +91,7 @@ class ExampleProjectAdapter:
         if dry_run is not True:
             raise ValueError("ExampleProject discovery is read-only and requires dry_run")
         branches = (self.config.base_branch, self.config.test_branch)
-        attestation = self.git.discovery_attestation(
+        attestation = self.git.remote_heads_attestation(
             self.config.remote,
             branches,
         )

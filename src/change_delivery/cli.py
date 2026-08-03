@@ -26,7 +26,10 @@ from change_delivery.config import load_project_config, load_project_config_byte
 from change_delivery.adapters.git import GitAdapter, GitError
 from change_delivery.adapters.github import GitHubAdapter
 from change_delivery.adapters.http import ReadOnlyHttpClient
-from change_delivery.adapters.project import ExampleProjectAdapter
+from change_delivery.adapters.project import (
+    ExampleProjectAdapter,
+    enforce_project_test_endpoint,
+)
 from change_delivery.approval import (
     ApprovalSnapshot,
     REQUIRED_ARTIFACT_NAMES,
@@ -242,6 +245,9 @@ class CliServices:
     base_sha_provider: Callable[[Any], str] | None = None
     release_service: Any | None = None
     discovery_factory: Callable[[Any], Any] | None = None
+    discovery_http_factory: Callable[[], Any] | None = None
+    discovery_git_runner: Any | None = None
+    dry_run_endpoint_policy: Callable[[Any], None] | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = validate_runtime_root(
@@ -251,8 +257,18 @@ class CliServices:
             self.registration_verifier = LocalRegistrationVerifier()
         if self.base_sha_provider is None:
             self.base_sha_provider = _registered_base_sha
+        if self.discovery_http_factory is None:
+            self.discovery_http_factory = ReadOnlyHttpClient
+        if self.dry_run_endpoint_policy is None:
+            self.dry_run_endpoint_policy = enforce_project_test_endpoint
         if self.discovery_factory is None:
-            self.discovery_factory = _project_discovery
+            http_factory = self.discovery_http_factory
+            runner = self.discovery_git_runner
+            self.discovery_factory = lambda config: _project_discovery(
+                config,
+                http=http_factory(),
+                runner=runner,
+            )
 
     def load_project(self, project_id: str) -> tuple[Any, str]:
         if self.project_loader is not None:
@@ -346,7 +362,12 @@ def _registered_base_sha(config: Any) -> str:
     return adapter.remote_sha(config.remote, config.base_branch)
 
 
-def _project_discovery(config: Any) -> ExampleProjectAdapter:
+def _project_discovery(
+    config: Any,
+    *,
+    http: Any,
+    runner: Any | None = None,
+) -> ExampleProjectAdapter:
     return ExampleProjectAdapter(
         config,
         git=GitAdapter(
@@ -356,9 +377,11 @@ def _project_discovery(config: Any) -> ExampleProjectAdapter:
             test_branch=config.test_branch,
             expected_fetch_url=config.remote_fetch_url,
             expected_push_url=config.remote_push_url,
+            runner=runner,
+            discovery_only=True,
         ),
         github=object(),
-        http=ReadOnlyHttpClient(),
+        http=http,
     )
 
 
@@ -563,19 +586,45 @@ def _start_dry_run(project: Any, services: CliServices) -> dict[str, Any]:
         "version_probe": {
             "status": "blocked",
             "reason": "read-only discovery did not complete",
+            "reason_code": "discovery_incomplete",
             "deployed_sha": None,
         },
     }
+    endpoint_policy = services.dry_run_endpoint_policy
+    if endpoint_policy is None:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "test endpoint policy is unavailable",
+            "reason_code": "endpoint_policy_unavailable",
+            "deployed_sha": None,
+        }
+        return report
+    try:
+        endpoint_policy(project)
+    except Exception:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "configured endpoint is not an approved test endpoint",
+            "reason_code": "endpoint_not_allowed",
+            "deployed_sha": None,
+        }
+        return report
     if project.production_enabled:
         report["version_probe"] = {
             "status": "blocked",
             "reason": "production-enabled project discovery is forbidden",
+            "reason_code": "production_access_forbidden",
             "deployed_sha": None,
         }
         return report
     factory = services.discovery_factory
     if factory is None:
-        report["version_probe"]["reason"] = "discovery adapter is unavailable"
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "discovery adapter is unavailable",
+            "reason_code": "dependency_unavailable",
+            "deployed_sha": None,
+        }
         return report
     try:
         adapter = factory(project)
@@ -594,12 +643,62 @@ def _start_dry_run(project: Any, services: CliServices) -> dict[str, Any]:
                 "test_sha": test_sha,
             }
         )
-        deployed_sha = adapter.deployed_sha()
-    except Exception as error:
+    except Exception:
         report["version_probe"] = {
             "status": "blocked",
-            "reason": redact_text(str(error) or type(error).__name__, {}),
+            "reason": "read-only dependency failed",
+            "reason_code": "dependency_failed",
             "deployed_sha": None,
+        }
+        return report
+    try:
+        deployed_sha = adapter.deployed_sha()
+    except ValueError:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "version response lacks a valid deployment SHA",
+            "reason_code": "version_evidence_invalid",
+            "deployed_sha": None,
+        }
+        return report
+    except Exception:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "version endpoint probe failed",
+            "reason_code": "version_probe_failed",
+            "deployed_sha": None,
+        }
+        return report
+    try:
+        final_discovery = adapter.discover(dry_run=True)
+    except Exception:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "remote branch heads could not be resampled",
+            "reason_code": "remote_resample_failed",
+            "deployed_sha": deployed_sha,
+        }
+        return report
+    initial_facts = (
+        str(discovery.repo_path),
+        discovery.remote,
+        discovery.base_branch,
+        discovery.test_branch,
+        discovery.remote_shas,
+    )
+    final_facts = (
+        str(final_discovery.repo_path),
+        final_discovery.remote,
+        final_discovery.base_branch,
+        final_discovery.test_branch,
+        final_discovery.remote_shas,
+    )
+    if initial_facts != final_facts:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "remote branch heads changed during version probe",
+            "reason_code": "remote_changed_during_probe",
+            "deployed_sha": deployed_sha,
         }
         return report
     expected_ref = f"{report['remote']}/{report['test_branch']}"
@@ -607,6 +706,7 @@ def _start_dry_run(project: Any, services: CliServices) -> dict[str, Any]:
         report["version_probe"] = {
             "status": "blocked",
             "reason": f"deployed SHA does not match {expected_ref}",
+            "reason_code": "deployed_sha_mismatch",
             "deployed_sha": deployed_sha,
         }
         return report
@@ -617,6 +717,7 @@ def _start_dry_run(project: Any, services: CliServices) -> dict[str, Any]:
             "version_probe": {
                 "status": "passed",
                 "reason": f"deployed SHA matches {expected_ref}",
+                "reason_code": "deployed_sha_matches",
                 "deployed_sha": deployed_sha,
             },
         }
