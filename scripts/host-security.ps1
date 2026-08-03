@@ -4,7 +4,8 @@ Set-StrictMode -Version Latest
 $script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
 $script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = 'e6d2545239d7067dffa17d9fddaba463512ef7243c97ca6321ee105d458fb5d8'
+$script:TrustedModuleManifestSha256 = 'f3dc29d003b1a1d6a8af1124d5b416bea5ab1b1f25c0771ec33122a8c98e22f7'
+$script:StableManifestReadProbe = $null
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -63,6 +64,8 @@ $script:RuntimeHostFields = @(
     'module_root',
     'codex_path',
     'codex_sha256',
+    'gh_path',
+    'gh_sha256',
     'codex_package_root',
     'codex_parent_version',
     'codex_platform_dependency',
@@ -149,6 +152,62 @@ function Assert-ExactJsonProperties([object] $Value, [string[]] $Names) {
 
 function Get-FileSha256([string] $Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Read-StableUtf8File(
+    [string] $Path,
+    [string] $ExpectedSha256,
+    [string] $ExpectedName
+) {
+    if ($ExpectedSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw 'Trusted UTF-8 file hash is invalid.'
+    }
+    $file = Resolve-RegularFile $Path $ExpectedName
+    $stream = [IO.File]::Open(
+        $file,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::Read
+    )
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $actualHash = [BitConverter]::ToString(
+                $algorithm.ComputeHash($stream)
+            ).Replace('-', '').ToLowerInvariant()
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+        if ($actualHash -cne $ExpectedSha256) {
+            throw 'Trusted UTF-8 file hash differs from its trust anchor.'
+        }
+        if ($null -ne $script:StableManifestReadProbe) {
+            & $script:StableManifestReadProbe $file
+        }
+        $stream.Position = 0
+        $reader = [IO.StreamReader]::new(
+            $stream,
+            [Text.UTF8Encoding]::new($false, $true),
+            $true,
+            4096,
+            $true
+        )
+        try {
+            $text = $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
+        if ($stream.Position -ne $stream.Length) {
+            throw 'Trusted UTF-8 file was not read completely.'
+        }
+        [void](Resolve-RegularFile $file $ExpectedName)
+        return $text
+    }
+    finally {
+        $stream.Dispose()
+    }
 }
 
 function Get-PlatformContract() {
@@ -303,6 +362,28 @@ function Resolve-TrustedPythonIdentity() {
     }
 }
 
+function Resolve-InstalledGitHubCliIdentity() {
+    $commands = @(
+        Get-Command 'gh.exe' -CommandType Application -ErrorAction Stop
+    )
+    if ($commands.Count -lt 1) {
+        throw 'GitHub CLI native executable is unavailable.'
+    }
+    $path = Resolve-RegularFile ([string] $commands[0].Source) 'gh.exe'
+    $versionOutput = @(& $path --version)
+    if (
+        $LASTEXITCODE -ne 0 -or
+        $versionOutput.Count -lt 1 -or
+        [string] $versionOutput[0] -notmatch '^gh version [0-9]+\.[0-9]+\.[0-9]+'
+    ) {
+        throw 'GitHub CLI failed its direct native version contract.'
+    }
+    return [PSCustomObject]@{
+        path = $path
+        sha256 = Get-FileSha256 $path
+    }
+}
+
 function Assert-NoPythonBytecode([string] $ModuleRoot) {
     $root = (Resolve-Path -LiteralPath $ModuleRoot -ErrorAction Stop).ProviderPath
     Assert-NoReparseChain $root
@@ -442,6 +523,78 @@ function Assert-ClosedPythonModuleRoot(
     Assert-ModuleTreeManifest $packageRoot $Expected
 }
 
+function New-TrustedModuleArchive(
+    [string] $ArchivePath,
+    [object[]] $ModuleStreams,
+    [object[]] $Expected
+) {
+    Add-Type -AssemblyName System.IO.Compression -ErrorAction Stop
+    if (-not [IO.Path]::IsPathRooted($ArchivePath)) {
+        throw 'Trusted module archive path must be absolute.'
+    }
+    [void](ConvertTo-CanonicalModuleManifest $Expected)
+    if ($ModuleStreams.Count -ne $Expected.Count -or $Expected.Count -eq 0) {
+        throw 'Trusted module archive inputs do not match the manifest.'
+    }
+    $parent = Split-Path -Parent $ArchivePath
+    Assert-NoReparseChain $parent
+    if (Test-Path -LiteralPath $ArchivePath) {
+        throw 'Trusted module archive path already exists.'
+    }
+    $stream = [IO.File]::Open(
+        $ArchivePath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::ReadWrite,
+        [IO.FileShare]::Read
+    )
+    try {
+        $archive = [IO.Compression.ZipArchive]::new(
+            $stream,
+            [IO.Compression.ZipArchiveMode]::Create,
+            $true,
+            [Text.Encoding]::UTF8
+        )
+        try {
+            for ($index = 0; $index -lt $Expected.Count; $index++) {
+                $source = $ModuleStreams[$index]
+                if ($source -isnot [IO.FileStream] -or -not $source.CanRead) {
+                    throw 'Trusted module archive source is not a readable stable handle.'
+                }
+                $source.Position = 0
+                $entryName = 'change_delivery/' + [string] $Expected[$index].relative_path
+                $entry = $archive.CreateEntry(
+                    $entryName,
+                    [IO.Compression.CompressionLevel]::NoCompression
+                )
+                $target = $entry.Open()
+                try {
+                    $source.CopyTo($target)
+                }
+                finally {
+                    $target.Dispose()
+                }
+                $source.Position = 0
+            }
+        }
+        finally {
+            $archive.Dispose()
+        }
+        $stream.Flush($true)
+        $stream.Position = 0
+        return [PSCustomObject]@{
+            path = $ArchivePath
+            stream = $stream
+        }
+    }
+    catch {
+        $stream.Dispose()
+        if (Test-Path -LiteralPath $ArchivePath) {
+            [IO.File]::Delete($ArchivePath)
+        }
+        throw
+    }
+}
+
 function Assert-ModuleTreeManifest([string] $ModuleRoot, [object[]] $Expected) {
     $actual = Get-ModuleTreeManifest $ModuleRoot
     if (
@@ -457,11 +610,10 @@ function Read-TrustedModuleManifest() {
         throw 'Trusted module manifest has not been finalized.'
     }
     $path = Join-Path $script:HostSecurityRoot 'trusted-module-manifest.json'
-    $file = Resolve-RegularFile $path 'trusted-module-manifest.json'
-    if ((Get-FileSha256 $file) -cne $script:TrustedModuleManifestSha256) {
-        throw 'Trusted module manifest hash differs from the embedded trust anchor.'
-    }
-    $value = [IO.File]::ReadAllText($file, [Text.UTF8Encoding]::new($false, $true)) |
+    $value = Read-StableUtf8File `
+        $path `
+        $script:TrustedModuleManifestSha256 `
+        'trusted-module-manifest.json' |
         ConvertFrom-Json
     $manifest = @($value)
     [void](ConvertTo-CanonicalModuleManifest $manifest)
@@ -624,7 +776,8 @@ function Assert-StrictRuntimeHost([object] $Config, [string] $SourceRoot) {
     }
     if (
         $Config.python_sha256 -notmatch '^[0-9a-f]{64}$' -or
-        $Config.codex_sha256 -notmatch '^[0-9a-f]{64}$'
+        $Config.codex_sha256 -notmatch '^[0-9a-f]{64}$' -or
+        $Config.gh_sha256 -notmatch '^[0-9a-f]{64}$'
     ) {
         throw 'Runtime executable identity hash is invalid.'
     }
@@ -669,6 +822,13 @@ function Assert-StrictRuntimeHost([object] $Config, [string] $SourceRoot) {
             throw "Runtime Codex package identity field $($pair.Key) differs."
         }
     }
+    $ghPath = Resolve-RegularFile ([string] $Config.gh_path) 'gh.exe'
+    if (
+        $Config.gh_path -cne $ghPath -or
+        $Config.gh_sha256 -cne (Get-FileSha256 $ghPath)
+    ) {
+        throw 'Runtime GitHub CLI identity differs from its installed trust anchor.'
+    }
     if ($Config.auth_mode -eq 'auth_file') {
         if ($Config.auth_source -isnot [string]) {
             throw 'auth_file runtime host requires one auth source.'
@@ -685,6 +845,10 @@ function Assert-StrictRuntimeHost([object] $Config, [string] $SourceRoot) {
     return [PSCustomObject]@{
         python = $python
         codex = $codex
+        gh = [PSCustomObject]@{
+            path = $ghPath
+            sha256 = [string] $Config.gh_sha256
+        }
         module_root = $actualModule
     }
 }

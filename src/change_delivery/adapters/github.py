@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlsplit
 
@@ -23,6 +27,9 @@ _THREAD_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{2,255}={0,2}$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _GH_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
 _GH_CONFIG_ENV_NAME = "GH_CONFIG_DIR"
+_GH_EXECUTABLE_ENV_NAME = "CHANGE_DELIVERY_GH_EXECUTABLE"
+_GH_SHA256_ENV_NAME = "CHANGE_DELIVERY_GH_SHA256"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MERGED_PR_FIELDS = "number,state,headRefOid,mergeCommit,statusCheckRollup"
 _PR_FIELDS = "number,url,baseRefName,headRefName,isDraft,headRefOid"
 _SNAPSHOT_FIELDS = (
@@ -337,7 +344,14 @@ def _exact_keys(
 
 
 class GitHubAdapter:
-    def __init__(self, runner: Runner, project_config: ProjectConfig) -> None:
+    def __init__(
+        self,
+        runner: Runner,
+        project_config: ProjectConfig,
+        *,
+        gh_executable: Path | None = None,
+        gh_sha256: str | None = None,
+    ) -> None:
         repository = project_config.github_repository
         if not _REPOSITORY.fullmatch(repository):
             raise ValueError("GitHub repository binding is invalid")
@@ -348,6 +362,17 @@ class GitHubAdapter:
         self._repository = repository
         self._repo_path = repo_path
         self._owner, self._name = repository.split("/", 1)
+        if gh_executable is None:
+            configured_path = os.environ.get(_GH_EXECUTABLE_ENV_NAME)
+            if configured_path is None:
+                raise ValueError("trusted GitHub CLI executable is not configured")
+            gh_executable = Path(configured_path)
+        if gh_sha256 is None:
+            gh_sha256 = os.environ.get(_GH_SHA256_ENV_NAME)
+        self._gh_executable, self._gh_identity = self._validate_executable(
+            gh_executable,
+            gh_sha256,
+        )
         configured_credentials = set(project_config.credentials)
         self._env_names = (_GH_CONFIG_ENV_NAME,) + tuple(
             name for name in _GH_ENV_NAMES if name in configured_credentials
@@ -1304,15 +1329,90 @@ class GitHubAdapter:
             raise GitHubError("review_threads", "thread was invalid") from None
 
     def _execute(self, args: Sequence[str]) -> ProcessResult:
+        try:
+            executable, identity = self._validate_executable(
+                self._gh_executable,
+                self._gh_identity[-1],
+            )
+        except ValueError:
+            raise GitHubError(
+                "execute",
+                "GitHub CLI executable identity changed",
+            ) from None
+        if identity != self._gh_identity:
+            raise GitHubError(
+                "execute",
+                "GitHub CLI executable identity changed",
+            )
         return self._runner.run(
             CommandSpec(
-                executable="gh",
+                executable=str(executable),
                 args=tuple(args),
                 workdir=self._repo_path,
                 timeout_seconds=60,
                 env_names=self._env_names,
             )
         )
+
+    @staticmethod
+    def _validate_executable(
+        path: Path,
+        expected_sha256: str | None,
+    ) -> tuple[Path, tuple[int, int, int, int, str]]:
+        expected_name = "gh.exe" if os.name == "nt" else "gh"
+        if (
+            not path.is_absolute()
+            or not isinstance(expected_sha256, str)
+            or _SHA256.fullmatch(expected_sha256) is None
+        ):
+            raise ValueError(
+                "GitHub CLI binding requires an absolute path and SHA-256"
+            )
+        try:
+            before = path.lstat()
+            resolved = path.resolve(strict=True)
+            resolved_info = resolved.lstat()
+            if (
+                path.is_symlink()
+                or resolved.is_symlink()
+                or not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(resolved_info.st_mode)
+                or int(before.st_nlink) != 1
+                or int(resolved_info.st_nlink) != 1
+                or (int(before.st_dev), int(before.st_ino))
+                != (int(resolved_info.st_dev), int(resolved_info.st_ino))
+                or (resolved.name.casefold() if os.name == "nt" else resolved.name)
+                != expected_name
+                or bool(
+                    getattr(before, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                )
+            ):
+                raise ValueError("GitHub CLI executable must be one ordinary file")
+            with resolved.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+                after_handle = os.fstat(handle.fileno())
+            after_path = resolved.lstat()
+        except (OSError, AttributeError):
+            raise ValueError("GitHub CLI executable cannot be read safely") from None
+        identities = tuple(
+            (
+                int(info.st_dev),
+                int(info.st_ino),
+                int(info.st_size),
+                int(info.st_mtime_ns),
+            )
+            for info in (before, resolved_info, opened, after_handle, after_path)
+        )
+        if (
+            any(identity != identities[0] for identity in identities[1:])
+            or not stat.S_ISREG(after_path.st_mode)
+            or int(after_path.st_nlink) != 1
+            or not hmac.compare_digest(digest, expected_sha256)
+        ):
+            raise ValueError("GitHub CLI executable identity changed")
+        return resolved, (*identities[0], digest)
 
     def _branch_heads_sample(
         self,

@@ -769,16 +769,28 @@ def test_default_cli_wires_git_and_github_adapters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     git_initializations: list[tuple[object, dict[str, object]]] = []
-    github_initializations: list[tuple[object, object]] = []
+    github_initializations: list[tuple[object, object, dict[str, object]]] = []
 
     class StubGitAdapter:
         def __init__(self, repo_path: object, **kwargs: object) -> None:
             git_initializations.append((repo_path, kwargs))
 
     class StubGitHubAdapter:
-        def __init__(self, runner: object, project: object) -> None:
-            github_initializations.append((runner, project))
+        def __init__(
+            self,
+            runner: object,
+            project: object,
+            **kwargs: object,
+        ) -> None:
+            github_initializations.append((runner, project, kwargs))
 
+    gh = fixture.root / ("gh.exe" if os.name == "nt" else "gh")
+    gh.write_bytes(b"trusted-gh")
+    monkeypatch.setenv("CHANGE_DELIVERY_GH_EXECUTABLE", str(gh))
+    monkeypatch.setenv(
+        "CHANGE_DELIVERY_GH_SHA256",
+        hashlib.sha256(gh.read_bytes()).hexdigest(),
+    )
     monkeypatch.setattr(cli_module, "GitAdapter", StubGitAdapter)
     monkeypatch.setattr(cli_module, "GitHubAdapter", StubGitHubAdapter)
     services = CliServices(
@@ -796,6 +808,7 @@ def test_default_cli_wires_git_and_github_adapters(
     assert git_initializations
     assert isinstance(github, StubGitHubAdapter)
     assert github_initializations
+    assert github_initializations[0][2]["gh_executable"] == gh.resolve()
     assert orchestrator.stage_executor is not None
     assert orchestrator.worktree_port is not None
     assert orchestrator.commit_port is not None
@@ -2917,6 +2930,32 @@ def test_monitor_pauses_when_remote_failure_has_no_actionable_details(
     assert outcome.action == "actionable_feedback_missing"
 
 
+def test_monitor_pauses_mixed_ci_failure_instead_of_sending_metadata_to_codex(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA,
+        checks_status="failed",
+        failed_checks=(FAILED_CHECK,),
+        review_status="changes_requested",
+        requested_reviews=(REQUESTED_REVIEW,),
+    )
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.REVIEW_DECISION_REQUIRED
+    assert outcome.action == "actionable_feedback_missing"
+    assert not any(
+        evidence.kind == "ci_review_fix_request"
+        for evidence in fixture.repository.list_evidence(run_id)
+    )
+
+
 def test_review_fix_push_replies_once_and_recovery_does_not_duplicate(
     fixture: Fixture,
 ) -> None:
@@ -2976,6 +3015,46 @@ def test_review_fix_push_replies_once_and_recovery_does_not_duplicate(
     waiting = orchestrator.step(run_id)
     assert waiting.state is RunState.MONITORING_CI_REVIEW
     assert waiting.action == "awaiting_review_update"
+
+
+def test_review_fix_push_rejects_tampered_request_before_thread_reply(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    thread = ReviewThread(
+        thread_id="PRRT_tampered_request",
+        resolved=False,
+        outdated=False,
+        path="src/app.py",
+        line=12,
+        comments=("Please handle empty input.",),
+    )
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA, unresolved_thread_ids=(thread.thread_id,)
+    )
+    fixture.github.actionable_reviews = (thread,)
+    requested = fixture.orchestrator().step(run_id)
+    evidence_id = requested.evidence_ids[0]
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE evidence SET payload_json = ? WHERE evidence_id = ?",
+            ('{"tampered":true}', evidence_id),
+        )
+        connection.execute(
+            "UPDATE runs SET state = ?, head_sha = ? WHERE run_id = ?",
+            (RunState.PUSHING_FEATURE.value, NEW_SHA, run_id),
+        )
+    fixture.git.remote_feature_sha = NEW_SHA
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.PUSHING_FEATURE
+    assert outcome.action == "review_fix_cycle_blocked"
+    assert fixture.github.reply_calls == 0
 
 
 def test_top_level_same_problem_across_review_ids_shares_budget(

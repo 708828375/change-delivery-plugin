@@ -61,6 +61,8 @@ def test_scheduler_installer_pins_native_codex_auth_and_runtime_host() -> None:
     assert "[ValidateSet('auth_file', 'api_key')]" in script
     assert "OPENAI_API_KEY" in script
     assert "runtime-host.json" in script
+    assert "gh_path" in script
+    assert "gh_sha256" in script
     assert "FileMode]::CreateNew" in script
     assert "Codex Change Delivery Tick" in script
     assert "InteractiveToken" in script
@@ -77,7 +79,10 @@ def test_tick_consumes_explicit_host_auth_and_native_codex() -> None:
     assert "auth_mode" in script
     assert "auth_source" in script
     assert "codex_path" in script
+    assert "gh_path" in script
     assert "OPENAI_API_KEY = $null" in script
     assert "CHANGE_DELIVERY_AUTH_MODE" in script
     assert "CHANGE_DELIVERY_AUTH_SOURCE" in script
     assert "CHANGE_DELIVERY_CODEX_EXECUTABLE" in script
+    assert "CHANGE_DELIVERY_GH_EXECUTABLE" in script
+    assert "CHANGE_DELIVERY_GH_SHA256" in script

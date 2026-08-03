@@ -114,6 +114,48 @@ if (-not $missingRejected) {{ exit 64 }}
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_stable_trusted_file_read_fails_closed_on_replacement_race(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "trusted-module-manifest.json"
+    replacement = tmp_path / "replacement.json"
+    parked = tmp_path / "parked.json"
+    manifest.write_text('[{"trusted":true}]', encoding="utf-8")
+    replacement.write_text('[{"trusted":false}]', encoding="utf-8")
+    digest = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"(Get-FileHash -LiteralPath '{manifest}' -Algorithm SHA256).Hash.ToLowerInvariant()",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    command = rf"""
+. '{SECURITY}'
+$script:StableManifestReadProbe = {{
+  param($lockedPath)
+  Move-Item -LiteralPath $lockedPath -Destination '{parked}' -ErrorAction Stop
+  Move-Item -LiteralPath '{replacement}' -Destination $lockedPath -ErrorAction Stop
+}}
+$rejected = $false
+try {{
+  Read-StableUtf8File '{manifest}' '{digest}' 'trusted-module-manifest.json' | Out-Null
+}}
+catch {{ $rejected = $true }}
+if (-not $rejected) {{ exit 71 }}
+if (-not (Test-Path -LiteralPath '{manifest}' -PathType Leaf)) {{ exit 72 }}
+if (Test-Path -LiteralPath '{parked}') {{ exit 73 }}
+"""
+
+    result = run_ps(command)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_module_tree_rejects_python_bytecode_and_cache_directories(
     tmp_path: Path,
 ) -> None:
@@ -199,6 +241,57 @@ if (-not $rejected) {{ exit 70 }}
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_pinned_module_archive_ignores_source_tree_insertion_after_final_check(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "src"
+    package = source_root / "change_delivery"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("\n", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        "import sqlite3\n"
+        "assert not hasattr(sqlite3, 'PWNED')\n"
+        "print('SAFE_ARCHIVE')\n",
+        encoding="utf-8",
+    )
+    archive = tmp_path / "trusted.zip"
+    command = rf"""
+. '{SECURITY}'
+$expected = Get-ModuleTreeManifest '{package}'
+Assert-ClosedPythonModuleRoot '{source_root}' $expected
+$streams = @()
+$bundle = $null
+try {{
+  foreach ($entry in $expected) {{
+    $candidate = Join-Path '{package}' ([string] $entry.relative_path)
+    $streams += [IO.File]::Open(
+      $candidate, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
+    )
+  }}
+  $bundle = New-TrustedModuleArchive '{archive}' $streams $expected
+  Set-Content -LiteralPath (Join-Path '{source_root}' 'sqlite3.py') -Value 'PWNED = True'
+  [IO.File]::WriteAllBytes(
+    (Join-Path '{package}' 'evil.pyd'), [byte[]](1,2,3)
+  )
+  New-Item -ItemType Directory -Path (Join-Path '{package}' 'extra') | Out-Null
+  $bootstrap = "import runpy,sys;sys.dont_write_bytecode=True;" +
+    "sys.implementation.cache_tag=None;archive=sys.argv.pop(1);" +
+    "sys.path.insert(0,archive);" +
+    "runpy.run_module('change_delivery',run_name='__main__')"
+  $output = & 'C:\softs\python-3.12.10\python.exe' -I -B -c $bootstrap '{archive}'
+  if ($LASTEXITCODE -ne 0 -or ($output -join '') -cne 'SAFE_ARCHIVE') {{ exit 74 }}
+}}
+finally {{
+  if ($null -ne $bundle) {{ $bundle.stream.Dispose() }}
+  foreach ($stream in $streams) {{ $stream.Dispose() }}
+}}
+"""
+
+    result = run_ps(command)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_tick_pins_helper_and_holds_all_module_handles() -> None:
     tick = TICK.read_text(encoding="utf-8")
     scheduled = SCHEDULED.read_text(encoding="utf-8")
@@ -215,3 +308,7 @@ def test_tick_pins_helper_and_holds_all_module_handles() -> None:
     assert scheduled.count("Assert-NoPythonBytecode") >= 2
     assert "Assert-ClosedPythonModuleRoot" in tick
     assert "Assert-ClosedPythonModuleRoot" in scheduled
+    assert "New-TrustedModuleArchive" in tick
+    assert "& $pythonPath -I -B -c $bootstrap $moduleArchivePath" in tick
+    assert "sys.path.insert(0,archive)" in tick
+    assert "sys.path.insert(0,root)" not in tick

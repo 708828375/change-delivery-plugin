@@ -1,11 +1,17 @@
 import os
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
 
 import pytest
 
-from change_delivery.cli import CliServices, CliUsageError, _github_fixed_environment
+from change_delivery.cli import (
+    CliServices,
+    CliUsageError,
+    _github_executable_binding,
+    _github_fixed_environment,
+)
 
 
 def test_python_module_help_is_available() -> None:
@@ -50,6 +56,23 @@ def test_github_config_rejects_appdata_outside_userprofile(
 
     with pytest.raises(CliUsageError, match="APPDATA"):
         _github_fixed_environment(("GH_CONFIG_DIR",))
+
+
+def test_github_executable_binding_requires_installer_owned_absolute_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / ("gh.exe" if os.name == "nt" else "gh")
+    executable.write_bytes(b"trusted-gh")
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    monkeypatch.setenv("CHANGE_DELIVERY_GH_EXECUTABLE", str(executable))
+    monkeypatch.setenv("CHANGE_DELIVERY_GH_SHA256", digest)
+
+    assert _github_executable_binding() == (executable.resolve(strict=True), digest)
+
+    monkeypatch.setenv("CHANGE_DELIVERY_GH_EXECUTABLE", "gh")
+    with pytest.raises(CliUsageError, match="absolute"):
+        _github_executable_binding()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")

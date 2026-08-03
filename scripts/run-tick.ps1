@@ -7,7 +7,7 @@ $fixedSourceRoot = (
 if ($fixedSourceRoot -cne 'C:\Users\ExampleUser\change-delivery-plugin') {
     throw 'Tick entrypoint is not running from the fixed source root.'
 }
-$TrustedHostSecuritySha256 = '441ec7f64fb80e2c3ef030bb4a16faeef89bbf2e1c644a899e9a044866b4d4cc'
+$TrustedHostSecuritySha256 = '10bec6071209ee524ae143163628f07afa7eb40fee4e2ed3e6c2217139424f9b'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -74,8 +74,11 @@ $configStream = Open-StableFile $hostConfigPath
 $pythonStream = $null
 $moduleStream = $null
 $codexStream = $null
+$ghStream = $null
 $authStream = $null
 $moduleStreams = @()
+$moduleArchiveStream = $null
+$moduleArchivePath = $null
 try {
     if ($configStream.Length -le 0 -or $configStream.Length -gt 16KB) {
         throw 'Runtime host configuration has an invalid size.'
@@ -115,11 +118,13 @@ try {
     $pythonPath = [string] $hostConfig.python_path
     $moduleRoot = [string] $hostConfig.module_root
     $codexPath = [string] $hostConfig.codex_path
+    $ghPath = [string] $hostConfig.gh_path
     $authMode = [string] $hostConfig.auth_mode
     $moduleEntry = Join-Path $moduleRoot 'change_delivery\__init__.py'
     $pythonStream = Open-StableFile $pythonPath
     $moduleStream = Open-StableFile $moduleEntry
     $codexStream = Open-StableFile $codexPath
+    $ghStream = Open-StableFile $ghPath
 
     # Revalidate path, package graph, version and hashes while replacement is
     # prevented by the stable read handles.
@@ -143,33 +148,48 @@ try {
     }
     $env:CHANGE_DELIVERY_AUTH_MODE = $authMode
     $env:CHANGE_DELIVERY_CODEX_EXECUTABLE = $codexPath
+    $env:CHANGE_DELIVERY_GH_EXECUTABLE = $ghPath
+    $env:CHANGE_DELIVERY_GH_SHA256 = [string] $hostConfig.gh_sha256
     $env:PYTHONPATH = $null
     $env:PYTHONHOME = $null
     $env:PYTHONUTF8 = '1'
     $env:PYTHONDONTWRITEBYTECODE = '1'
     $bootstrap = (
-        "import importlib.machinery as m,runpy,sys;" +
+        "import runpy,sys;" +
         "sys.dont_write_bytecode=True;sys.implementation.cache_tag=None;" +
-        "sys.path_hooks[:]=[m.FileFinder.path_hook(" +
-        "(m.SourceFileLoader,m.SOURCE_SUFFIXES)," +
-        "(m.ExtensionFileLoader,m.EXTENSION_SUFFIXES))];" +
-        "sys.path_importer_cache.clear();root=sys.argv.pop(1);" +
-        "sys.path.insert(0,root);" +
+        "archive=sys.argv.pop(1);sys.path.insert(0,archive);" +
         "runpy.run_module('change_delivery',run_name='__main__')"
     )
     Assert-NoPythonBytecode $trustedModuleTree
     Assert-ClosedPythonModuleRoot $fixedModuleRoot @($hostConfig.module_manifest)
-    & $pythonPath -I -B -c $bootstrap $moduleRoot tick `
+    $moduleArchivePath = Join-Path $runtimeRoot (
+        '.trusted-module.' + [Guid]::NewGuid().ToString('N') + '.zip'
+    )
+    $moduleArchive = New-TrustedModuleArchive `
+        $moduleArchivePath `
+        $moduleStreams `
+        @($hostConfig.module_manifest)
+    $moduleArchiveStream = $moduleArchive.stream
+    & $pythonPath -I -B -c $bootstrap $moduleArchivePath tick `
         --plugin-root $runtimeRoot --json
     exit $LASTEXITCODE
 }
 finally {
+    if ($null -ne $moduleArchiveStream) {
+        $moduleArchiveStream.Dispose()
+    }
+    if ($null -ne $moduleArchivePath -and (Test-Path -LiteralPath $moduleArchivePath)) {
+        [IO.File]::Delete($moduleArchivePath)
+    }
     foreach ($stream in $moduleStreams) { $stream.Dispose() }
     if ($null -ne $authStream) {
         $authStream.Dispose()
     }
     if ($null -ne $codexStream) {
         $codexStream.Dispose()
+    }
+    if ($null -ne $ghStream) {
+        $ghStream.Dispose()
     }
     if ($null -ne $moduleStream) {
         $moduleStream.Dispose()

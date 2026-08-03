@@ -164,9 +164,10 @@ class LocalRegistrationVerifier:
         try:
             if config.base_branch == config.test_branch:
                 return False, "base and test branches must differ"
-            for executable in ("git", "gh", "codex"):
+            for executable in ("git", "codex"):
                 if shutil.which(executable) is None:
                     return False, f"required tool is unavailable: {executable}"
+            _github_port(config)
             adapter = GitAdapter(
                 config.repo_path,
                 remote=config.remote,
@@ -250,13 +251,42 @@ def _github_fixed_environment(names: tuple[str, ...]) -> dict[str, str]:
     return {"GH_CONFIG_DIR": str(config_dir)}
 
 
+def _github_executable_binding() -> tuple[Path, str]:
+    path_value = os.environ.get("CHANGE_DELIVERY_GH_EXECUTABLE")
+    digest = os.environ.get("CHANGE_DELIVERY_GH_SHA256")
+    if not path_value:
+        if os.name != "nt":
+            raise CliUsageError("trusted GitHub CLI executable is not configured")
+        path_value = r"C:\Program Files\GitHub CLI\gh.exe"
+        try:
+            with Path(path_value).open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        except OSError:
+            raise CliUsageError(
+                "trusted GitHub CLI executable is not configured"
+            ) from None
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise CliUsageError("trusted GitHub CLI executable must be absolute")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise CliUsageError("trusted GitHub CLI SHA-256 is not configured")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        raise CliUsageError("trusted GitHub CLI executable is unavailable") from None
+    return resolved, digest
+
+
 def _github_port(config: Any) -> GitHubAdapter:
+    executable, digest = _github_executable_binding()
     return GitHubAdapter(
         ProcessRunner(
             _environment_secrets,
             fixed_environment_provider=_github_fixed_environment,
         ),
         config,
+        gh_executable=executable,
+        gh_sha256=digest,
     )
 
 

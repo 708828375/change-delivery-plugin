@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = '441ec7f64fb80e2c3ef030bb4a16faeef89bbf2e1c644a899e9a044866b4d4cc'
+$TrustedHostSecuritySha256 = '10bec6071209ee524ae143163628f07afa7eb40fee4e2ed3e6c2217139424f9b'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
@@ -60,6 +60,7 @@ Assert-ClosedPythonModuleRoot $moduleRoot $moduleManifest
 
 $python = Resolve-TrustedPythonIdentity
 $codex = Resolve-OfficialCodexIdentity
+$gh = Resolve-InstalledGitHubCliIdentity
 $auth = Resolve-Authentication $AuthMode $AuthSource
 
 if ($Doctor) {
@@ -67,6 +68,7 @@ if ($Doctor) {
         auth_mode = $AuthMode
         available = $true
         native_codex_package = $true
+        trusted_github_cli = $true
         trusted_python = $true
         fixed_source = $true
     } | ConvertTo-Json -Compress
@@ -135,6 +137,8 @@ $configuration = [ordered]@{
     module_root = $moduleRoot
     codex_path = $codex.path
     codex_sha256 = $codex.sha256
+    gh_path = $gh.path
+    gh_sha256 = $gh.sha256
     codex_package_root = $codex.package_root
     codex_parent_version = $codex.parent_version
     codex_platform_dependency = $codex.platform_dependency

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import deque
+import hashlib
 import json
+import os
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -24,6 +26,20 @@ SHA = "a" * 40
 OTHER_SHA = "b" * 40
 REPOSITORY = "owner/repo"
 PR_URL = "https://github.com/owner/repo/pull/152"
+
+
+@pytest.fixture(autouse=True)
+def trusted_github_cli_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / ("gh.exe" if os.name == "nt" else "gh")
+    executable.write_bytes(b"test-github-cli")
+    monkeypatch.setenv("CHANGE_DELIVERY_GH_EXECUTABLE", str(executable))
+    monkeypatch.setenv(
+        "CHANGE_DELIVERY_GH_SHA256",
+        hashlib.sha256(executable.read_bytes()).hexdigest(),
+    )
 
 
 def result(
@@ -170,6 +186,53 @@ def timeout() -> ProcessTimeoutError:
     return ProcessTimeoutError("0123456789abcdef", "", "")
 
 
+def test_github_executable_is_absolute_and_ignores_malicious_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / ("gh.exe" if os.name == "nt" else "gh")
+    trusted.write_bytes(b"trusted-github-cli")
+    malicious_dir = tmp_path / "malicious"
+    malicious_dir.mkdir()
+    malicious = malicious_dir / trusted.name
+    malicious.write_bytes(b"steal GH_TOKEN")
+    monkeypatch.setenv("PATH", str(malicious_dir))
+    runner = FakeRunner(result(pr_payload()))
+
+    adapter = GitHubAdapter(
+        runner,
+        project_config(tmp_path),
+        gh_executable=trusted,
+        gh_sha256=hashlib.sha256(trusted.read_bytes()).hexdigest(),
+    )
+    adapter.find_pr("feature/cd-test", "develop")
+
+    assert runner.commands[0].executable == str(trusted.resolve(strict=True))
+    assert runner.commands[0].executable != str(malicious.resolve(strict=True))
+    assert runner.commands[0].env_names == (
+        "GH_CONFIG_DIR",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    )
+
+
+def test_github_executable_hash_is_revalidated_before_secret_bearing_run(
+    tmp_path: Path,
+) -> None:
+    trusted = tmp_path / ("gh.exe" if os.name == "nt" else "gh")
+    trusted.write_bytes(b"trusted-github-cli")
+    adapter = GitHubAdapter(
+        FakeRunner(result(pr_payload())),
+        project_config(tmp_path),
+        gh_executable=trusted,
+        gh_sha256=hashlib.sha256(trusted.read_bytes()).hexdigest(),
+    )
+    trusted.write_bytes(b"replaced-github-cli")
+
+    with pytest.raises(GitHubError, match="executable identity changed"):
+        adapter.find_pr("feature/cd-test", "develop")
+
+
 def test_models_are_frozen_extra_forbid_and_validate_identity() -> None:
     ref = PullRequestRef.model_validate(
         {
@@ -244,7 +307,10 @@ def test_ensure_draft_pr_reuses_existing_ready_pr_with_safe_command(
     assert not ref.is_draft
     assert len(runner.commands) == 1
     command = runner.commands[0]
-    assert command.executable == "gh"
+    assert Path(command.executable).is_absolute()
+    assert Path(command.executable).name.casefold() == (
+        "gh.exe" if os.name == "nt" else "gh"
+    )
     assert command.args == (
         "pr",
         "view",

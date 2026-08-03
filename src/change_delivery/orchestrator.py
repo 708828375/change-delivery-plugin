@@ -1288,14 +1288,9 @@ class Orchestrator:
         )
         if request is None:
             return ()
-        payload = json.loads(request.payload_json)
-        if (
-            type(payload) is not dict
-            or type(payload.get("issues")) is not list
-            or payload.get("head_sha") == run.head_sha
-            or run.head_sha is None
-            or run.pr_number is None
-        ):
+        try:
+            payload = self._validated_review_fix_request(request, run)
+        except (TypeError, ValueError, json.JSONDecodeError):
             return StepOutcome(
                 state=RunState.PUSHING_FEATURE,
                 action="review_fix_cycle_blocked",
@@ -1403,6 +1398,106 @@ class Orchestrator:
             )
             references.append(pushed)
         return tuple(references)
+
+    def _validated_review_fix_request(
+        self,
+        request: object,
+        run: RunRecord,
+    ) -> dict[str, object]:
+        payload = json.loads(request.payload_json)  # type: ignore[attr-defined]
+        if not hmac.compare_digest(
+            request.sha256,  # type: ignore[attr-defined]
+            sha256_payload(payload),
+        ):
+            raise ValueError("review fix request digest mismatch")
+        if (
+            type(payload) is not dict
+            or set(payload) != {
+                "attempt",
+                "issues",
+                "feedback_fingerprint",
+                "head_sha",
+                "pr_number",
+                "untrusted_data",
+            }
+            or type(payload["attempt"]) is not int
+            or type(payload["issues"]) is not list
+            or not payload["issues"]
+            or type(payload["feedback_fingerprint"]) is not str
+            or type(payload["untrusted_data"]) is not dict
+            or payload["head_sha"] == run.head_sha
+            or type(payload["head_sha"]) is not str
+            or payload["pr_number"] != run.pr_number
+            or run.head_sha is None
+            or run.pr_number is None
+        ):
+            raise ValueError("review fix request schema is invalid")
+        untrusted_data = payload["untrusted_data"]
+        if (
+            set(untrusted_data) != {
+                "failed_checks",
+                "requested_reviews",
+                "threads",
+            }
+            or untrusted_data["failed_checks"] != []
+            or type(untrusted_data["requested_reviews"]) is not list
+            or type(untrusted_data["threads"]) is not list
+        ):
+            raise ValueError("review fix untrusted data is invalid")
+        feedback_fingerprint = hashlib.sha256(
+            json.dumps(
+                untrusted_data,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        if not hmac.compare_digest(
+            payload["feedback_fingerprint"], feedback_fingerprint
+        ):
+            raise ValueError("review fix feedback fingerprint is invalid")
+        observed_issues = {
+            issue["issue_fingerprint"]: issue
+            for issue in self._feedback_issues(untrusted_data)
+        }
+        attempts = []
+        seen: set[str] = set()
+        for issue in payload["issues"]:
+            if (
+                type(issue) is not dict
+                or set(issue) != {
+                    "issue_identity",
+                    "issue_fingerprint",
+                    "observation_identity",
+                    "observation_fingerprint",
+                    "existing_attempts",
+                    "attempt",
+                }
+                or type(issue["existing_attempts"]) is not int
+                or type(issue["attempt"]) is not int
+                or issue["attempt"] != issue["existing_attempts"] + 1
+                or not 1 <= issue["attempt"] <= 2
+            ):
+                raise ValueError("review fix issue schema is invalid")
+            fingerprint = issue.get("issue_fingerprint")
+            if type(fingerprint) is not str or fingerprint in seen:
+                raise ValueError("review fix issue identity is invalid")
+            expected = observed_issues.get(fingerprint)
+            if expected is None or any(
+                issue.get(key) != expected[key]
+                for key in (
+                    "issue_identity",
+                    "issue_fingerprint",
+                    "observation_identity",
+                    "observation_fingerprint",
+                )
+            ):
+                raise ValueError("review fix issue does not match observation")
+            seen.add(fingerprint)
+            attempts.append(issue["attempt"])
+        if payload["attempt"] != max(attempts):
+            raise ValueError("review fix aggregate attempt is invalid")
+        return payload
 
     def _draft_pr(
         self,
@@ -1536,6 +1631,33 @@ class Orchestrator:
                 untrusted_data = self._actionable_feedback(
                     github, run.pr_number, snapshot
                 )
+                if untrusted_data["failed_checks"]:
+                    missing = self.repository.register_evidence(
+                        run.run_id,
+                        f"actionable-ci-details-missing:{run.run_id}:{run.head_sha}",
+                        "actionable_feedback_missing",
+                        {
+                            "checks_status": snapshot.checks_status,
+                            "review_status": snapshot.review_status,
+                            "pr_number": run.pr_number,
+                            "reason": "failed checks lack a trusted diagnostic summary",
+                        },
+                    )
+                    self.repository.transition_with_evidence(
+                        run.run_id,
+                        RunState.MONITORING_CI_REVIEW,
+                        RunState.REVIEW_DECISION_REQUIRED,
+                        "ACTIONABLE_CI_DETAILS_MISSING",
+                        (missing,),
+                    )
+                    return StepOutcome(
+                        state=RunState.REVIEW_DECISION_REQUIRED,
+                        action="actionable_feedback_missing",
+                        blocked_reason=(
+                            "failed checks lack a trusted diagnostic summary"
+                        ),
+                        evidence_ids=(missing.evidence_id,),
+                    )
                 issues = self._feedback_issues(untrusted_data)
                 if not issues:
                     missing = self.repository.register_evidence(
