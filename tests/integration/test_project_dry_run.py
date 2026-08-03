@@ -118,6 +118,10 @@ def fixture_config():
     return load_project_config(fixture).config
 
 
+def allow_fixture_endpoint(_config: ProjectConfig) -> None:
+    """Explicit test-only bypass for the intentionally unroutable fixture URL."""
+
+
 def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
     fake_http = FakeHttp({"git_sha": TEST_SHA})
     fake_git = FakeGit(fixture_config)
@@ -128,6 +132,7 @@ def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
         github=fake_github,
         http=fake_http,
         file_exists=lambda path: path.name in {"pyproject.toml", "pytest.ini"},
+        endpoint_policy=allow_fixture_endpoint,
     )
 
     report = adapter.discover(dry_run=True)
@@ -162,6 +167,7 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         github=fake_github,
         http=fake_http,
         file_exists=lambda _path: False,
+        endpoint_policy=allow_fixture_endpoint,
     )
     factory_calls = []
 
@@ -255,6 +261,7 @@ def test_cli_start_dry_run_blocks_bad_version_evidence_without_writes(
         github=fake_github,
         http=fake_http,
         file_exists=lambda _path: False,
+        endpoint_policy=allow_fixture_endpoint,
     )
     services = CliServices(
         plugin_root=tmp_path / "runtime",
@@ -369,6 +376,85 @@ def test_cli_start_dry_run_blocks_non_test_project_endpoint_before_io(
     assert factory_calls == []
 
 
+def test_cli_start_dry_run_blocks_non_project_project_before_factory_io(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    other_project = fixture_config.model_copy(
+        update={
+            "project_id": "other-backend",
+            "version_endpoint": "https://api.example.invalid/health",
+        }
+    )
+    factory_calls = []
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (other_project, "c" * 64),
+        discovery_factory=lambda config: factory_calls.append(config),
+    )
+    stderr = StringIO()
+
+    result = main(
+        [
+            "start", "--project", "other-backend",
+            "--requirement-file", str(requirement), "--dry-run", "--json",
+        ],
+        services=services,
+        stdout=StringIO(),
+        stderr=stderr,
+    )
+
+    assert result == 2
+    payload = json.loads(stderr.getvalue())
+    assert payload["version_probe"]["reason_code"] == "endpoint_not_allowed"
+    assert factory_calls == []
+
+
+def test_cli_load_project_rejects_requested_and_loaded_identity_mismatch(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    loader_calls = []
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda requested: (
+            loader_calls.append(requested) or fixture_config,
+            "c" * 64,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        services.load_project("other-backend")
+
+    assert loader_calls == ["other-backend"]
+
+
+def test_direct_project_adapter_blocks_production_endpoint_before_any_io(
+    fixture_config,
+) -> None:
+    production_config = fixture_config.model_copy(
+        update={"version_endpoint": "https://api.example.invalid/health"}
+    )
+    fake_git = FakeGit(production_config)
+    fake_http = FakeHttp({"git_sha": TEST_SHA})
+    adapter = ExampleProjectAdapter(
+        production_config,
+        git=fake_git,
+        github=FakeGitHub(),
+        http=fake_http,
+    )
+
+    with pytest.raises(ValueError, match="test endpoint"):
+        adapter.discover(dry_run=True)
+    with pytest.raises(ValueError, match="test endpoint"):
+        adapter.deployed_sha()
+
+    assert fake_git.read_calls == []
+    assert fake_http.calls == []
+
+
 def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
     fixture_config,
     tmp_path: Path,
@@ -387,6 +473,7 @@ def test_cli_start_dry_run_blocks_remote_change_during_http_probe(
         github=FakeGitHub(),
         http=fake_http,
         file_exists=lambda _path: False,
+        endpoint_policy=allow_fixture_endpoint,
     )
     services = CliServices(
         plugin_root=tmp_path / "runtime",
@@ -570,6 +657,7 @@ def test_project_dry_run_requires_literal_true(fixture_config) -> None:
         git=FakeGit(fixture_config),
         github=FakeGitHub(),
         http=FakeHttp({"git_sha": TEST_SHA}),
+        endpoint_policy=allow_fixture_endpoint,
     )
 
     with pytest.raises(ValueError, match="dry_run"):
@@ -591,6 +679,7 @@ def test_discovery_rejects_git_probe_bound_to_other_remote_url(
         git=fake_git,
         github=FakeGitHub(),
         http=FakeHttp({"git_sha": TEST_SHA}),
+        endpoint_policy=allow_fixture_endpoint,
     )
 
     with pytest.raises(ValueError, match="remote push URL"):
@@ -607,6 +696,7 @@ def test_discovery_rejects_git_attestation_for_other_repository(
         git=fake_git,
         github=FakeGitHub(),
         http=FakeHttp({"git_sha": TEST_SHA}),
+        endpoint_policy=allow_fixture_endpoint,
     )
 
     with pytest.raises(ValueError, match="repository path"):
@@ -622,6 +712,7 @@ def test_version_probe_requires_present_exact_40_hex_sha(
         git=FakeGit(fixture_config),
         github=FakeGitHub(),
         http=fake_http,
+        endpoint_policy=allow_fixture_endpoint,
     )
 
     assert adapter.version_matches(TEST_SHA)
@@ -646,6 +737,7 @@ def test_nested_version_sha_field_is_supported(fixture_config) -> None:
         git=FakeGit(config),
         github=FakeGitHub(),
         http=FakeHttp({"build": {"git_sha": TEST_SHA}}),
+        endpoint_policy=allow_fixture_endpoint,
     )
 
     assert adapter.deployed_sha() == TEST_SHA

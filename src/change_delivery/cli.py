@@ -272,11 +272,17 @@ class CliServices:
 
     def load_project(self, project_id: str) -> tuple[Any, str]:
         if self.project_loader is not None:
-            return self.project_loader(project_id)
-        loaded = load_project_config(
-            _child(self.plugin_root, "projects", f"{project_id}.yaml")
-        )
-        return loaded.config, loaded.config_hash
+            config, digest = self.project_loader(project_id)
+        else:
+            loaded = load_project_config(
+                _child(self.plugin_root, "projects", f"{project_id}.yaml")
+            )
+            config, digest = loaded.config, loaded.config_hash
+        if config.project_id != project_id:
+            raise CliUsageError(
+                "requested project identity does not match loaded configuration"
+            )
+        return config, digest
 
     def get_repository(self, *, create: bool = False) -> RunRepository:
         if self.repository is not None:

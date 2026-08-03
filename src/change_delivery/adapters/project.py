@@ -31,11 +31,12 @@ EXAMPLE_PROJECT_TEST_VERSION_ENDPOINT = "https://api.test.example.invalid/health
 
 def enforce_project_test_endpoint(config: ProjectConfig) -> None:
     """Bind ExampleProject dry-runs to the code-owned test environment identity."""
-    if config.project_id != EXAMPLE_PROJECT_PROJECT_ID:
-        return
-    if not hmac.compare_digest(
-        config.version_endpoint,
-        EXAMPLE_PROJECT_TEST_VERSION_ENDPOINT,
+    if (
+        not hmac.compare_digest(config.project_id, EXAMPLE_PROJECT_PROJECT_ID)
+        or not hmac.compare_digest(
+            config.version_endpoint,
+            EXAMPLE_PROJECT_TEST_VERSION_ENDPOINT,
+        )
     ):
         raise ValueError("ExampleProject dry-run endpoint is not the test endpoint")
 
@@ -80,16 +81,23 @@ class ExampleProjectAdapter:
         github: object,
         http: HttpReader,
         file_exists: Callable[[Path], bool] = Path.is_file,
+        endpoint_policy: Callable[[ProjectConfig], None] = (
+            enforce_project_test_endpoint
+        ),
     ) -> None:
+        if not callable(endpoint_policy):
+            raise TypeError("endpoint_policy must be callable")
         self.config = config
         self.git = git
         self.github = github
         self.http = http
         self._file_exists = file_exists
+        self._endpoint_policy = endpoint_policy
 
     def discover(self, *, dry_run: bool) -> DiscoveryReport:
         if dry_run is not True:
             raise ValueError("ExampleProject discovery is read-only and requires dry_run")
+        self._endpoint_policy(self.config)
         branches = (self.config.base_branch, self.config.test_branch)
         attestation = self.git.remote_heads_attestation(
             self.config.remote,
@@ -130,6 +138,7 @@ class ExampleProjectAdapter:
         )
 
     def deployed_sha(self) -> str:
+        self._endpoint_policy(self.config)
         body = self.http.get_json(self.config.version_endpoint)
         value: object = body
         for component in self.config.version_sha_field.split("."):

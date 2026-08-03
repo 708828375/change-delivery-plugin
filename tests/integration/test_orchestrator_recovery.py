@@ -998,6 +998,11 @@ def test_default_runtime_ports_deploy_with_exact_lease_then_require_host_accepta
     fixture: Fixture,
 ) -> None:
     run_id = fixture.create(RunState.DEPLOYING_TEST)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET project_id = ? WHERE run_id = ?",
+            ("example-backend", run_id),
+        )
     old_sha = "b" * 40
     calls: list[tuple[object, ...]] = []
 
@@ -1040,6 +1045,8 @@ def test_default_runtime_ports_deploy_with_exact_lease_then_require_host_accepta
     )
     configured = config(fixture.root).model_copy(
         update={
+            "project_id": "example-backend",
+            "version_endpoint": "https://api.test.example.invalid/health",
             "acceptance_check": command,
             "test_deploy_timeout_seconds": 5,
             "test_deploy_poll_interval_seconds": 1.0,
@@ -2056,10 +2063,16 @@ def test_cli_start_dry_run_bypasses_draft_creation_path(
             return OTHER_SHA
 
     discovery = DryDiscovery()
+    dry_run_config = config(fixture.root).model_copy(
+        update={
+            "project_id": "example-backend",
+            "version_endpoint": "https://api.test.example.invalid/health",
+        }
+    )
     services = CliServices(
         plugin_root=fixture.root,
         repository=fixture.repository,
-        project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        project_loader=lambda project_id: (dry_run_config, CONFIG_HASH),
         discovery_factory=lambda _project: discovery,
     )
     stdout, stderr = StringIO(), StringIO()
@@ -2068,7 +2081,7 @@ def test_cli_start_dry_run_bypasses_draft_creation_path(
         [
             "start",
             "--project",
-            "test-project",
+            "example-backend",
             "--requirement-file",
             str(requirement),
             "--dry-run",
