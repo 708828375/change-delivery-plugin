@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 from email.message import Message
+from io import StringIO
 from pathlib import Path
 import time
 from urllib.error import URLError
@@ -27,6 +28,7 @@ from change_delivery.adapters.project import (
     cleanup_matches_run,
     discover_registration,
 )
+from change_delivery.cli import CliServices, main
 from change_delivery.config import load_project_config
 
 
@@ -116,6 +118,188 @@ def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
     assert fake_git.write_calls == []
     assert fake_github.write_calls == []
     assert fake_http.calls == []
+
+
+def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    fake_http = FakeHttp({"git_sha": TEST_SHA.upper()})
+    fake_git = FakeGit(fixture_config)
+    fake_github = FakeGitHub()
+    adapter = ExampleProjectAdapter(
+        fixture_config,
+        git=fake_git,
+        github=fake_github,
+        http=fake_http,
+        file_exists=lambda _path: False,
+    )
+    factory_calls = []
+
+    def discovery_factory(config):
+        factory_calls.append(config)
+        return adapter
+
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (fixture_config, "c" * 64),
+        discovery_factory=discovery_factory,
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "start",
+            "--project",
+            "example-backend",
+            "--requirement-file",
+            str(requirement),
+            "--dry-run",
+            "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 0, stderr.getvalue()
+    payload = json.loads(stdout.getvalue())
+    assert payload == {
+        "ok": True,
+        "dry_run": True,
+        "status": "passed",
+        "project_id": "example-backend",
+        "repo_path": "C:\\Huamei\\projects\\code\\example_backend",
+        "remote": "origin",
+        "base_branch": "develop",
+        "base_sha": DEVELOP_SHA,
+        "test_branch": "test",
+        "test_sha": TEST_SHA,
+        "version_endpoint": "https://example.test.invalid/version",
+        "version_sha_field": "git_sha",
+        "version_probe": {
+            "status": "passed",
+            "reason": "deployed SHA matches origin/test",
+            "deployed_sha": TEST_SHA,
+        },
+    }
+    assert factory_calls == [fixture_config]
+    assert fake_git.read_calls == [("origin", ("develop", "test"))]
+    assert fake_git.write_calls == []
+    assert fake_github.write_calls == []
+    assert fake_http.calls == [
+        ("GET", "https://example.test.invalid/version")
+    ]
+    runtime = tmp_path / "runtime"
+    assert not (runtime / "state.sqlite3").exists()
+    assert not (runtime / "runs").exists()
+    assert not (runtime / "worktrees").exists()
+
+
+@pytest.mark.parametrize(
+    ("body", "reason_fragment"),
+    (
+        ({}, "40 hexadecimal"),
+        ({"git_sha": "short"}, "40 hexadecimal"),
+        ({"git_sha": DEVELOP_SHA}, "does not match origin/test"),
+    ),
+)
+def test_cli_start_dry_run_blocks_bad_version_evidence_without_writes(
+    fixture_config,
+    tmp_path: Path,
+    body: object,
+    reason_fragment: str,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    fake_http = FakeHttp(body)
+    fake_git = FakeGit(fixture_config)
+    fake_github = FakeGitHub()
+    adapter = ExampleProjectAdapter(
+        fixture_config,
+        git=fake_git,
+        github=fake_github,
+        http=fake_http,
+        file_exists=lambda _path: False,
+    )
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (fixture_config, "c" * 64),
+        discovery_factory=lambda _config: adapter,
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "start",
+            "--project",
+            "example-backend",
+            "--requirement-file",
+            str(requirement),
+            "--dry-run",
+            "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 2
+    assert stdout.getvalue() == ""
+    payload = json.loads(stderr.getvalue())
+    assert payload["ok"] is False
+    assert payload["dry_run"] is True
+    assert payload["status"] == "blocked"
+    assert payload["base_sha"] == DEVELOP_SHA
+    assert payload["test_sha"] == TEST_SHA
+    assert payload["version_probe"]["status"] == "blocked"
+    assert reason_fragment in payload["version_probe"]["reason"]
+    assert fake_git.write_calls == []
+    assert fake_github.write_calls == []
+    assert not (tmp_path / "runtime" / "state.sqlite3").exists()
+    assert not (tmp_path / "runtime" / "runs").exists()
+
+
+def test_cli_start_dry_run_refuses_production_enabled_config_before_io(
+    fixture_config,
+    tmp_path: Path,
+) -> None:
+    requirement = tmp_path / "requirement.md"
+    requirement.write_text("read-only discovery", encoding="utf-8")
+    production_config = fixture_config.model_copy(
+        update={"production_enabled": True}
+    )
+    factory_calls = []
+    services = CliServices(
+        plugin_root=tmp_path / "runtime",
+        project_loader=lambda _project_id: (production_config, "c" * 64),
+        discovery_factory=lambda config: factory_calls.append(config),
+    )
+    stdout, stderr = StringIO(), StringIO()
+
+    result = main(
+        [
+            "start",
+            "--project",
+            "example-backend",
+            "--requirement-file",
+            str(requirement),
+            "--dry-run",
+            "--json",
+        ],
+        services=services,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert result == 2
+    assert stdout.getvalue() == ""
+    payload = json.loads(stderr.getvalue())
+    assert payload["status"] == "blocked"
+    assert "production" in payload["version_probe"]["reason"]
+    assert factory_calls == []
 
 
 def test_project_dry_run_requires_literal_true(fixture_config) -> None:

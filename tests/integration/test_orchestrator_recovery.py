@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -2030,15 +2031,36 @@ def test_ready_merge_and_cleanup_are_observation_driven(
     assert cleanup.execute_calls == 1
 
 
-def test_cli_start_dry_run_creates_only_draft_artifacts(
+def test_cli_start_dry_run_bypasses_draft_creation_path(
     fixture: Fixture,
 ) -> None:
     requirement = fixture.root / "input.md"
     requirement.write_text("requirement", encoding="utf-8")
+
+    class DryDiscovery:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def discover(self, *, dry_run: bool):
+            assert dry_run is True
+            self.calls += 1
+            return SimpleNamespace(
+                repo_path=fixture.root.resolve(),
+                remote="origin",
+                base_branch="develop",
+                test_branch="test",
+                remote_shas={"origin/develop": SHA, "origin/test": OTHER_SHA},
+            )
+
+        def deployed_sha(self) -> str:
+            return OTHER_SHA
+
+    discovery = DryDiscovery()
     services = CliServices(
         plugin_root=fixture.root,
         repository=fixture.repository,
         project_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        discovery_factory=lambda _project: discovery,
     )
     stdout, stderr = StringIO(), StringIO()
 
@@ -2059,14 +2081,12 @@ def test_cli_start_dry_run_creates_only_draft_artifacts(
 
     assert result == 0, stderr.getvalue()
     payload = json.loads(stdout.getvalue())
-    run = fixture.repository.get_run(payload["run_id"])
-    assert run.state is RunState.DRAFT
-    assert {
-        path.name for path in (fixture.root / "runs" / run.run_id).iterdir()
-    } == {
-        "requirement.md", "design.md", "implementation-plan.md",
-        "approval.json", "evidence", "reports", "sanitized-summary.md",
-    }
+    assert payload["status"] == "passed"
+    assert payload["base_sha"] == SHA
+    assert payload["test_sha"] == OTHER_SHA
+    assert discovery.calls == 1
+    assert fixture.repository.list_active_runs() == []
+    assert not (fixture.root / "runs").exists()
 
 
 def test_cli_start_prepare_and_approve_lifecycle_is_hash_bound(

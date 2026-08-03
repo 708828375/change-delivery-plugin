@@ -25,6 +25,8 @@ from change_delivery.artifacts import ArtifactStore, validate_runtime_root
 from change_delivery.config import load_project_config, load_project_config_bytes
 from change_delivery.adapters.git import GitAdapter, GitError
 from change_delivery.adapters.github import GitHubAdapter
+from change_delivery.adapters.http import ReadOnlyHttpClient
+from change_delivery.adapters.project import ExampleProjectAdapter
 from change_delivery.approval import (
     ApprovalSnapshot,
     REQUIRED_ARTIFACT_NAMES,
@@ -239,6 +241,7 @@ class CliServices:
     scheduler: Any | None = None
     base_sha_provider: Callable[[Any], str] | None = None
     release_service: Any | None = None
+    discovery_factory: Callable[[Any], Any] | None = None
 
     def __post_init__(self) -> None:
         self.plugin_root = validate_runtime_root(
@@ -248,6 +251,8 @@ class CliServices:
             self.registration_verifier = LocalRegistrationVerifier()
         if self.base_sha_provider is None:
             self.base_sha_provider = _registered_base_sha
+        if self.discovery_factory is None:
+            self.discovery_factory = _project_discovery
 
     def load_project(self, project_id: str) -> tuple[Any, str]:
         if self.project_loader is not None:
@@ -339,6 +344,22 @@ def _registered_base_sha(config: Any) -> str:
     )
     adapter.fetch(config.remote)
     return adapter.remote_sha(config.remote, config.base_branch)
+
+
+def _project_discovery(config: Any) -> ExampleProjectAdapter:
+    return ExampleProjectAdapter(
+        config,
+        git=GitAdapter(
+            config.repo_path,
+            remote=config.remote,
+            base_branch=config.base_branch,
+            test_branch=config.test_branch,
+            expected_fetch_url=config.remote_fetch_url,
+            expected_push_url=config.remote_push_url,
+        ),
+        github=object(),
+        http=ReadOnlyHttpClient(),
+    )
 
 
 def _child(root: Path, *parts: str) -> Path:
@@ -493,6 +514,8 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     project, digest = services.load_project(args.project)
     contents = _stable_read(args.requirement_file, limit=MAX_REQUIREMENT_BYTES)
     contents.decode("utf-8")
+    if args.dry_run:
+        return _start_dry_run(project, services)
     run_id = f"run-{uuid4().hex}"
     store = ArtifactStore(services.plugin_root)
     repository = services.get_repository(create=True)
@@ -519,8 +542,87 @@ def _start(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         "ok": True,
         "run_id": run.run_id,
         "state": run.state.value,
-        "dry_run": bool(args.dry_run),
+        "dry_run": False,
     }
+
+
+def _start_dry_run(project: Any, services: CliServices) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "ok": False,
+        "dry_run": True,
+        "status": "blocked",
+        "project_id": project.project_id,
+        "repo_path": str(project.repo_path),
+        "remote": project.remote,
+        "base_branch": project.base_branch,
+        "base_sha": None,
+        "test_branch": project.test_branch,
+        "test_sha": None,
+        "version_endpoint": project.version_endpoint,
+        "version_sha_field": project.version_sha_field,
+        "version_probe": {
+            "status": "blocked",
+            "reason": "read-only discovery did not complete",
+            "deployed_sha": None,
+        },
+    }
+    if project.production_enabled:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": "production-enabled project discovery is forbidden",
+            "deployed_sha": None,
+        }
+        return report
+    factory = services.discovery_factory
+    if factory is None:
+        report["version_probe"]["reason"] = "discovery adapter is unavailable"
+        return report
+    try:
+        adapter = factory(project)
+        discovery = adapter.discover(dry_run=True)
+        base_ref = f"{discovery.remote}/{discovery.base_branch}"
+        test_ref = f"{discovery.remote}/{discovery.test_branch}"
+        base_sha = discovery.remote_shas[base_ref]
+        test_sha = discovery.remote_shas[test_ref]
+        report.update(
+            {
+                "repo_path": str(discovery.repo_path),
+                "remote": discovery.remote,
+                "base_branch": discovery.base_branch,
+                "base_sha": base_sha,
+                "test_branch": discovery.test_branch,
+                "test_sha": test_sha,
+            }
+        )
+        deployed_sha = adapter.deployed_sha()
+    except Exception as error:
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": redact_text(str(error) or type(error).__name__, {}),
+            "deployed_sha": None,
+        }
+        return report
+    expected_ref = f"{report['remote']}/{report['test_branch']}"
+    if not hmac.compare_digest(deployed_sha, test_sha):
+        report["version_probe"] = {
+            "status": "blocked",
+            "reason": f"deployed SHA does not match {expected_ref}",
+            "deployed_sha": deployed_sha,
+        }
+        return report
+    report.update(
+        {
+            "ok": True,
+            "status": "passed",
+            "version_probe": {
+                "status": "passed",
+                "reason": f"deployed SHA matches {expected_ref}",
+                "deployed_sha": deployed_sha,
+            },
+        }
+    )
+    return report
+
 
 def _register(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
     with _candidate_lease(
@@ -877,6 +979,9 @@ def main(
             "error_type": type(error).__name__,
         }
         errors.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        return 2
+    if result.get("ok") is False:
+        errors.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
         return 2
     output.write(json.dumps(result, ensure_ascii=False, sort_keys=True) + "\n")
     return 0
