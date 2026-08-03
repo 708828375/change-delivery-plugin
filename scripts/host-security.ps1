@@ -4,7 +4,7 @@ Set-StrictMode -Version Latest
 $script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
 $script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = '3dacdf818e475c4a939917fd16d2fcf9447d1dfa06378d23e4df01026a669c96'
+$script:TrustedModuleManifestSha256 = 'e71d3e4eb667f6e3f4c74636ca57b5b25d02f92fe24e10a2eb71d24be5c4d677'
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
     Add-Type -TypeDefinition @'
