@@ -19,7 +19,11 @@ from change_delivery.approval import (
     load_approval,
     verify_approval,
 )
-from change_delivery.adapters.github import PullRequestRef, ReviewThread
+from change_delivery.adapters.github import (
+    PullRequestRef,
+    RequestedReviewFact,
+    ReviewThread,
+)
 from change_delivery.domain import (
     ProjectConfig,
     RunRecord,
@@ -31,6 +35,9 @@ from change_delivery.evidence import sha256_payload
 from change_delivery.repository import RunRepository
 from change_delivery.process import ProcessTimeoutError
 from change_delivery.state_machine import READY_TO_MERGE_EVIDENCE
+
+
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 class GitPort(Protocol):
@@ -1427,6 +1434,9 @@ class Orchestrator:
             or type(payload["untrusted_data"]) is not dict
             or payload["head_sha"] == run.head_sha
             or type(payload["head_sha"]) is not str
+            or _SHA.fullmatch(payload["head_sha"]) is None
+            or type(payload["pr_number"]) is not int
+            or payload["pr_number"] <= 0
             or payload["pr_number"] != run.pr_number
             or run.head_sha is None
             or run.pr_number is None
@@ -1444,6 +1454,36 @@ class Orchestrator:
             or type(untrusted_data["threads"]) is not list
         ):
             raise ValueError("review fix untrusted data is invalid")
+        for review in untrusted_data["requested_reviews"]:
+            if type(review) is not dict or set(review) != {
+                "review_id",
+                "author",
+                "body",
+            }:
+                raise ValueError("requested review evidence is invalid")
+            try:
+                RequestedReviewFact(**review)
+            except (TypeError, ValueError):
+                raise ValueError("requested review evidence is invalid") from None
+        for thread in untrusted_data["threads"]:
+            if (
+                type(thread) is not dict
+                or set(thread) != {"thread_id", "path", "line", "comments"}
+                or type(thread["comments"]) is not list
+                or any(type(comment) is not str for comment in thread["comments"])
+            ):
+                raise ValueError("review thread evidence is invalid")
+            try:
+                ReviewThread(
+                    thread_id=thread["thread_id"],
+                    resolved=False,
+                    outdated=False,
+                    path=thread["path"],
+                    line=thread["line"],
+                    comments=tuple(thread["comments"]),
+                )
+            except (TypeError, ValueError):
+                raise ValueError("review thread evidence is invalid") from None
         feedback_fingerprint = hashlib.sha256(
             json.dumps(
                 untrusted_data,

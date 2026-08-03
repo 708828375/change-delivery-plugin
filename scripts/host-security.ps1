@@ -3,8 +3,9 @@ Set-StrictMode -Version Latest
 
 $script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
 $script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
+$script:FixedGitHubCliPath = 'C:\Program Files\GitHub CLI\gh.exe'
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = 'f3dc29d003b1a1d6a8af1124d5b416bea5ab1b1f25c0771ec33122a8c98e22f7'
+$script:TrustedModuleManifestSha256 = '40911c94ed63eac01b3948490460130c7f7a005f508d918666c79dde4c8bcc50'
 $script:StableManifestReadProbe = $null
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
@@ -363,13 +364,7 @@ function Resolve-TrustedPythonIdentity() {
 }
 
 function Resolve-InstalledGitHubCliIdentity() {
-    $commands = @(
-        Get-Command 'gh.exe' -CommandType Application -ErrorAction Stop
-    )
-    if ($commands.Count -lt 1) {
-        throw 'GitHub CLI native executable is unavailable.'
-    }
-    $path = Resolve-RegularFile ([string] $commands[0].Source) 'gh.exe'
+    $path = Resolve-RegularFile $script:FixedGitHubCliPath 'gh.exe'
     $versionOutput = @(& $path --version)
     if (
         $LASTEXITCODE -ne 0 -or
@@ -822,9 +817,12 @@ function Assert-StrictRuntimeHost([object] $Config, [string] $SourceRoot) {
             throw "Runtime Codex package identity field $($pair.Key) differs."
         }
     }
+    $gh = Resolve-InstalledGitHubCliIdentity
     $ghPath = Resolve-RegularFile ([string] $Config.gh_path) 'gh.exe'
     if (
         $Config.gh_path -cne $ghPath -or
+        $Config.gh_path -cne $gh.path -or
+        $Config.gh_sha256 -cne $gh.sha256 -or
         $Config.gh_sha256 -cne (Get-FileSha256 $ghPath)
     ) {
         throw 'Runtime GitHub CLI identity differs from its installed trust anchor.'

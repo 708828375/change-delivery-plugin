@@ -44,11 +44,16 @@ def test_fixed_codex_and_python_anchors_do_not_use_path_or_overrides() -> None:
 
     assert "C:\\softs\\nodejs\\node_global\\node_modules\\@openai\\codex" in contract
     assert "C:\\softs\\python-3.12.10\\python.exe" in contract
+    assert "C:\\Program Files\\GitHub CLI\\gh.exe" in contract
     assert "Get-Command npm" not in contract
     assert "Get-Command python" not in contract
+    assert "Get-Command 'gh.exe'" not in contract
     assert "npm root" not in contract
     assert "NpmGlobalRoot" not in scheduled
     assert "PythonPath" not in scheduled
+    assert "$gh = Resolve-InstalledGitHubCliIdentity" in contract
+    assert "$Config.gh_path -cne $gh.path" in contract
+    assert "$Config.gh_sha256 -cne $gh.sha256" in contract
 
 
 @pytest.mark.skipif(not hasattr(os, "link"), reason="hard links unavailable")

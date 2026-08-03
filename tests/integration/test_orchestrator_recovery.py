@@ -32,6 +32,7 @@ from change_delivery.domain import (
     RunState,
     StageResult,
 )
+from change_delivery.evidence import sha256_payload
 from change_delivery.notifications import NotificationService
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessResult
@@ -3043,6 +3044,49 @@ def test_review_fix_push_rejects_tampered_request_before_thread_reply(
         connection.execute(
             "UPDATE evidence SET payload_json = ? WHERE evidence_id = ?",
             ('{"tampered":true}', evidence_id),
+        )
+        connection.execute(
+            "UPDATE runs SET state = ?, head_sha = ? WHERE run_id = ?",
+            (RunState.PUSHING_FEATURE.value, NEW_SHA, run_id),
+        )
+    fixture.git.remote_feature_sha = NEW_SHA
+
+    outcome = fixture.orchestrator().step(run_id)
+
+    assert outcome.state is RunState.PUSHING_FEATURE
+    assert outcome.action == "review_fix_cycle_blocked"
+    assert fixture.github.reply_calls == 0
+
+
+def test_review_fix_push_rejects_digest_valid_malformed_nested_feedback(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    thread = ReviewThread(
+        thread_id="PRRT_malformed_nested",
+        resolved=False,
+        outdated=False,
+        path="src/app.py",
+        line=12,
+        comments=("Please handle empty input.",),
+    )
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?", (run_id,)
+        )
+    fixture.github.snapshot_result = Snapshot(
+        SHA, unresolved_thread_ids=(thread.thread_id,)
+    )
+    fixture.github.actionable_reviews = (thread,)
+    requested = fixture.orchestrator().step(run_id)
+    evidence = fixture.repository.get_evidence(requested.evidence_ids[0])
+    payload = json.loads(evidence.payload_json)
+    payload["untrusted_data"]["requested_reviews"] = [{}]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE evidence SET payload_json = ?, sha256 = ? WHERE evidence_id = ?",
+            (encoded, sha256_payload(payload), evidence.evidence_id),
         )
         connection.execute(
             "UPDATE runs SET state = ?, head_sha = ? WHERE run_id = ?",
