@@ -29,7 +29,7 @@ try {{ Get-ModuleTreeManifest '{module}' | Out-Null }} catch {{ $rejected = $tru
 if (-not $rejected) {{ exit 70 }}
 """
     result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
         capture_output=True,
         text=True,
         check=False,

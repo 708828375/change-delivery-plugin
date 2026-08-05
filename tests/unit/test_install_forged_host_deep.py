@@ -34,7 +34,7 @@ try {{ Assert-StrictRuntimeHost $config '{ROOT}' | Out-Null }} catch {{ $codexRe
 if (-not $codexRejected) {{ exit 81 }}
 """
     result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
         capture_output=True,
         text=True,
         check=False,

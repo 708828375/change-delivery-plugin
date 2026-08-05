@@ -32,7 +32,7 @@ $heterogeneous = New-ScheduledTask -Action $otherAction -Trigger @($logon,$timer
 if (Test-StrictTaskDefinition @($heterogeneous) $expected 'Codex Change Delivery Tick' $user) {{ exit 52 }}
 """
     result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
         capture_output=True,
         text=True,
         check=False,

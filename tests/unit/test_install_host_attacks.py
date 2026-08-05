@@ -11,7 +11,7 @@ SCHEDULED = ROOT / "scripts" / "install-scheduled-task.ps1"
 
 def run_ps(script: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True,
         text=True,
         check=False,
