@@ -1,10 +1,14 @@
 [CmdletBinding()]
 param(
-    [string] $SourceRoot = (Split-Path -Parent $PSScriptRoot)
+    [string] $SourceRoot
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    $SourceRoot = Split-Path -Parent $PSScriptRoot
+}
 
 function Resolve-CanonicalPath([string] $Path) {
     return (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath

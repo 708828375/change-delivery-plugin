@@ -47,6 +47,14 @@ def test_personal_installer_is_fail_closed_and_uses_codex_marketplace_api() -> N
     assert "Remove-Item" not in script
 
 
+def test_personal_installer_resolves_default_source_after_parameter_binding() -> None:
+    script = _text(PERSONAL)
+
+    assert "[string] $SourceRoot = (Split-Path -Parent $PSScriptRoot)" not in script
+    assert "if ([string]::IsNullOrWhiteSpace($SourceRoot))" in script
+    assert "$SourceRoot = Split-Path -Parent $PSScriptRoot" in script
+
+
 def test_scheduler_installer_pins_native_codex_auth_and_runtime_host() -> None:
     script = _text(SCHEDULED) + _text(SECURITY)
 
