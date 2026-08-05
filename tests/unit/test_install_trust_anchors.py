@@ -38,16 +38,18 @@ if (Test-Path -LiteralPath '{marker}') {{ exit 93 }}
     assert not marker.exists()
 
 
-def test_fixed_codex_and_python_anchors_do_not_use_path_or_overrides() -> None:
+def test_discovered_tools_and_private_python_are_pinned_without_overrides() -> None:
     contract = SECURITY.read_text(encoding="utf-8")
     scheduled = SCHEDULED.read_text(encoding="utf-8")
 
-    assert "C:\\softs\\nodejs\\node_global\\node_modules\\@openai\\codex" in contract
-    assert "C:\\softs\\python-3.12.10\\python.exe" in contract
-    assert "C:\\Program Files\\GitHub CLI\\gh.exe" in contract
+    assert "C:\\softs\\nodejs\\node_global\\node_modules\\@openai\\codex" not in contract
+    assert "C:\\softs\\python-3.12.10\\python.exe" not in contract
+    assert "Join-Path $layout.venv_root 'Scripts\\python.exe'" in contract
+    assert "C:\\Program Files\\GitHub CLI\\gh.exe" not in contract
     assert "Get-Command npm" not in contract
     assert "Get-Command python" not in contract
-    assert "Get-Command 'gh.exe'" not in contract
+    assert "Get-Command codex.cmd" in contract
+    assert "Get-Command gh.exe" in contract
     assert "npm root" not in contract
     assert "NpmGlobalRoot" not in scheduled
     assert "PythonPath" not in scheduled
@@ -116,6 +118,18 @@ try {{ Assert-ModuleTreeManifest '{module}' $expected }} catch {{ $missingReject
 if (-not $missingRejected) {{ exit 64 }}
 """
     result = run_ps(command)
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_checked_in_module_manifest_matches_the_runtime_source_tree() -> None:
+    command = rf"""
+. '{SECURITY}'
+$expected = @(Read-TrustedModuleManifest)
+Assert-ModuleTreeManifest '{ROOT / "src" / "change_delivery"}' $expected
+"""
+
+    result = run_ps(command)
+
     assert result.returncode == 0, result.stderr + result.stdout
 
 

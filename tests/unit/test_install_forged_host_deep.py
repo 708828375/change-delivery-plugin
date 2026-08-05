@@ -11,6 +11,10 @@ SECURITY = ROOT / "scripts" / "host-security.ps1"
 def test_self_consistent_host_cannot_replace_fixed_python_or_codex() -> None:
     command = rf"""
 . '{SECURITY}'
+function Resolve-TrustedPythonIdentity {{
+  $path='C:\softs\python-3.12.10\python.exe'
+  [PSCustomObject]@{{ path=$path; sha256=(Get-FileSha256 $path) }}
+}}
 $moduleRoot = (Resolve-Path '{ROOT / 'src'}').ProviderPath
 $manifest = @(Read-TrustedModuleManifest)
 $python = Resolve-TrustedPythonIdentity

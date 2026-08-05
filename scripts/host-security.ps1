@@ -1,11 +1,8 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:FixedCodexPackageRoot = 'C:\softs\nodejs\node_global\node_modules\@openai\codex'
-$script:FixedPythonPath = 'C:\softs\python-3.12.10\python.exe'
-$script:FixedGitHubCliPath = 'C:\Program Files\GitHub CLI\gh.exe'
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = '40911c94ed63eac01b3948490460130c7f7a005f508d918666c79dde4c8bcc50'
+$script:TrustedModuleManifestSha256 = '9efc7a847430b1a622bed6c945b09761575b0e1d30024466ef4859254cbfacd9'
 $script:StableManifestReadProbe = $null
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {
@@ -234,19 +231,8 @@ function Get-PlatformContract() {
 
 function Resolve-CodexIdentityAtRoot([string] $GlobalRoot) {
     $root = (Resolve-Path -LiteralPath $GlobalRoot -ErrorAction Stop).ProviderPath
-    $fixedRoot = Split-Path -Parent (Split-Path -Parent $script:FixedCodexPackageRoot)
-    if (-not [string]::Equals(
-        $root.TrimEnd('\'),
-        $fixedRoot.TrimEnd('\'),
-        [StringComparison]::OrdinalIgnoreCase
-    )) {
-        throw 'Codex package root is not the fixed personal trust anchor.'
-    }
     Assert-NoReparseChain $root
     $packageRoot = Join-Path $root '@openai\codex'
-    if ((Resolve-Path $packageRoot).ProviderPath -cne $script:FixedCodexPackageRoot) {
-        throw 'Codex parent package differs from the fixed personal trust anchor.'
-    }
     Assert-NoReparseChain $packageRoot
     $parentManifest = Read-StrictJsonObject (
         Join-Path $packageRoot 'package.json'
@@ -335,12 +321,53 @@ function Resolve-CodexIdentityAtRoot([string] $GlobalRoot) {
 }
 
 function Resolve-OfficialCodexIdentity() {
-    $globalRoot = Split-Path -Parent (Split-Path -Parent $script:FixedCodexPackageRoot)
+    $commands = @(Get-Command codex.cmd -CommandType Application -All `
+        -ErrorAction Stop)
+    if ($commands.Count -ne 1) {
+        throw 'PATH 中必须恰好存在一个 Codex CLI cmd 入口。'
+    }
+    $shim = Resolve-RegularFile ([string] $commands[0].Source) 'codex.cmd'
+    $globalRoot = Join-Path (Split-Path -Parent $shim) 'node_modules'
     return Resolve-CodexIdentityAtRoot $globalRoot
 }
 
+function Get-HostSecurityLayout() {
+    $layoutCommand = Get-Command Get-SharedInstallLayout `
+        -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -ne $layoutCommand) {
+        return Get-SharedInstallLayout
+    }
+    $knownProfile = [Environment]::GetFolderPath(
+        [Environment+SpecialFolder]::UserProfile
+    )
+    if (
+        [string]::IsNullOrWhiteSpace($knownProfile) -or
+        [string]::IsNullOrWhiteSpace($env:USERPROFILE)
+    ) {
+        throw 'Windows 用户目录不可用。'
+    }
+    $known = [IO.Path]::GetFullPath($knownProfile).TrimEnd('\')
+    $environment = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+    if (-not [string]::Equals(
+        $known,
+        $environment,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw 'USERPROFILE 与 Windows Known Folder 不一致。'
+    }
+    $dataRoot = Join-Path $known '.codex\change-delivery'
+    return [PSCustomObject]@{
+        data_root = $dataRoot
+        host_root = Join-Path $dataRoot 'host'
+        venv_root = Join-Path $dataRoot 'runtime\venv'
+    }
+}
+
 function Resolve-TrustedPythonIdentity() {
-    $path = Resolve-RegularFile $script:FixedPythonPath 'python.exe'
+    $layout = Get-HostSecurityLayout
+    $path = Resolve-RegularFile (
+        Join-Path $layout.venv_root 'Scripts\python.exe'
+    ) 'python.exe'
     $contractText = & $path -I -c (
         'import json,sys;print(json.dumps(dict(executable=sys.executable,' +
         'major=sys.version_info.major,minor=sys.version_info.minor),' +
@@ -353,9 +380,9 @@ function Resolve-TrustedPythonIdentity() {
     if (
         $contract.executable -cne $path -or
         $contract.major -ne 3 -or
-        $contract.minor -ne 12
+        $contract.minor -lt 12
     ) {
-        throw 'Fixed Python identity or version differs from the trust anchor.'
+        throw '专用 Python 的身份或版本与信任锚不一致。'
     }
     return [PSCustomObject]@{
         path = $path
@@ -364,7 +391,12 @@ function Resolve-TrustedPythonIdentity() {
 }
 
 function Resolve-InstalledGitHubCliIdentity() {
-    $path = Resolve-RegularFile $script:FixedGitHubCliPath 'gh.exe'
+    $commands = @(Get-Command gh.exe -CommandType Application -All `
+        -ErrorAction Stop)
+    if ($commands.Count -ne 1) {
+        throw 'PATH 中必须恰好存在一个 GitHub CLI 原生入口。'
+    }
+    $path = Resolve-RegularFile ([string] $commands[0].Source) 'gh.exe'
     $versionOutput = @(& $path --version)
     if (
         $LASTEXITCODE -ne 0 -or
@@ -641,16 +673,15 @@ function Resolve-Authentication([string] $Mode, [string] $Source) {
 }
 
 function Assert-FixedSourceRoot([string] $Path) {
-    $fixed = (
-        Resolve-Path -LiteralPath 'C:\Users\ExampleUser\change-delivery-plugin'
-    ).ProviderPath
+    $layout = Get-HostSecurityLayout
+    $fixed = (Resolve-Path -LiteralPath $layout.host_root).ProviderPath
     $actual = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
     if (-not [string]::Equals(
         $actual.TrimEnd('\'),
         $fixed.TrimEnd('\'),
         [StringComparison]::OrdinalIgnoreCase
     )) {
-        throw 'SourceRoot must be the fixed Change Delivery repository.'
+        throw 'SourceRoot 必须是已安装的 Change Delivery host。'
     }
     Assert-NoReparseChain $actual
     return $actual
@@ -860,11 +891,41 @@ function ConvertTo-CanonicalRuntimeHostJson([object] $Config) {
     return (ConvertTo-Json $ordered -Compress) + [Environment]::NewLine
 }
 
-function Write-RuntimeHost(
-    [string] $RuntimeRoot,
-    [object] $Configuration,
-    [string] $SourceRoot
-) {
+function Install-AtomicRuntimeHostFile {
+    param(
+        [string] $Temporary,
+        [string] $Destination,
+        [switch] $Replace
+    )
+    if (-not $Replace) {
+        [IO.File]::Move($Temporary, $Destination)
+        return
+    }
+    $backup = $Destination + '.backup-' + [Guid]::NewGuid().ToString('N')
+    try {
+        [IO.File]::Replace($Temporary, $Destination, $backup, $true)
+    }
+    catch {
+        if (
+            (Test-Path -LiteralPath $backup) -and
+            -not (Test-Path -LiteralPath $Destination)
+        ) {
+            [IO.File]::Move($backup, $Destination)
+        }
+        throw
+    }
+    if (Test-Path -LiteralPath $backup) {
+        [IO.File]::Delete($backup)
+    }
+}
+
+function Write-RuntimeHost {
+    param(
+        [string] $RuntimeRoot,
+        [object] $Configuration,
+        [string] $SourceRoot,
+        [switch] $AllowManagedReplacement
+    )
     # Validate an in-memory JSON round trip before creating any directory or file.
     $candidate = ConvertFrom-Json (
         ConvertTo-Json $Configuration -Depth 100 -Compress
@@ -884,17 +945,31 @@ function Write-RuntimeHost(
     }
 
     $destination = Join-Path $RuntimeRoot 'runtime-host.json'
+    $replaceExisting = $false
     if (Test-Path -LiteralPath $destination) {
         $existing = Read-StrictJsonObject $destination 16KB
-        Assert-StrictRuntimeHost $existing $SourceRoot | Out-Null
         $current = [IO.File]::ReadAllText(
             (Resolve-RegularFile $destination 'runtime-host.json'),
             [Text.UTF8Encoding]::new($false, $true)
         )
-        if ($current -cne $json) {
+        if ($current -ceq $json) {
+            Assert-StrictRuntimeHost $existing $SourceRoot | Out-Null
+            return
+        }
+        if (-not $AllowManagedReplacement) {
             throw 'Existing runtime-host.json differs; refusing to overwrite it.'
         }
-        return
+        Assert-ExactJsonProperties $existing $script:RuntimeHostFields
+        if (
+            $existing.schema_version -ne 1 -or
+            [string] $existing.module_root -cne [string] $candidate.module_root -or
+            [string] $existing.auth_mode -cne [string] $candidate.auth_mode -or
+            [string] $existing.auth_source -cne [string] $candidate.auth_source -or
+            (ConvertTo-CanonicalRuntimeHostJson $existing) -cne $current
+        ) {
+            throw 'Existing runtime-host.json is not a replaceable managed configuration.'
+        }
+        $replaceExisting = $true
     }
 
     $temporary = Join-Path $RuntimeRoot (
@@ -920,7 +995,10 @@ function Write-RuntimeHost(
         if ((ConvertTo-CanonicalRuntimeHostJson $roundTrip) -cne $json) {
             throw 'Runtime host JSON round trip is not canonical.'
         }
-        [IO.File]::Move($temporary, $destination)
+        Install-AtomicRuntimeHostFile `
+            -Temporary $temporary `
+            -Destination $destination `
+            -Replace:$replaceExisting
     }
     finally {
         if (Test-Path -LiteralPath $temporary) {

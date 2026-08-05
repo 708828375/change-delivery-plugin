@@ -1,14 +1,9 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$fixedSourceRoot = (
-    Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')
-).ProviderPath
-if ($fixedSourceRoot -cne 'C:\Users\ExampleUser\change-delivery-plugin') {
-    throw 'Tick entrypoint is not running from the fixed source root.'
-}
-$TrustedHostSecuritySha256 = '39c10bc18ab28754637f3277d30ad9ac4ce6f1a5722b2365974f02283029d325'
-function Open-StableTrustedHelper([string] $Path) {
+$TrustedHostSecuritySha256 = '6e1e0e6cfd1d112371aed4fa43bd85ea37b3a93894a30b903a199412c4f19e77'
+$TrustedSharedLayoutSha256 = '4e0dc6e7febe6650c9dde5c636b3959a2388f00bcf372411f1ea7fd305f8aff1'
+function Open-StableTrustedHelper([string] $Path, [string] $ExpectedHash) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
     while ($null -ne $cursor) {
@@ -27,15 +22,26 @@ function Open-StableTrustedHelper([string] $Path) {
         $algorithm = [Security.Cryptography.SHA256]::Create()
         try { $hash = [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
         finally { $algorithm.Dispose() }
-        if ($hash -cne $TrustedHostSecuritySha256) { throw 'Trusted helper hash differs from the embedded anchor.' }
+        if ($hash -cne $ExpectedHash) { throw 'Trusted helper hash differs from the embedded anchor.' }
         $stream.Position = 0
         return $stream
     }
     catch { $stream.Dispose(); throw }
 }
+$layoutPath = Join-Path $PSScriptRoot 'shared-layout.ps1'
+$layoutStream = Open-StableTrustedHelper $layoutPath $TrustedSharedLayoutSha256
+. $layoutPath
+$layout = Get-SharedInstallLayout
 $helperPath = Join-Path $PSScriptRoot 'host-security.ps1'
-$helperStream = Open-StableTrustedHelper $helperPath
+$helperStream = Open-StableTrustedHelper $helperPath $TrustedHostSecuritySha256
 . $helperPath
+$entryRoot = (
+    Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')
+).ProviderPath
+$fixedSourceRoot = Assert-FixedSourceRoot $entryRoot
+if ($fixedSourceRoot -cne $layout.host_root) {
+    throw 'Tick 入口不属于当前用户的已安装 host。'
+}
 $fixedModuleRoot = (
     Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\src')
 ).ProviderPath
@@ -66,9 +72,7 @@ function Open-ModuleTreeHandles([string] $ModuleRoot, [object[]] $Expected) {
     }
     catch { foreach ($handle in $handles) { $handle.Dispose() }; throw }
 }
-$runtimeRoot = Join-Path (
-    [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
-) '.codex\change-delivery'
+$runtimeRoot = $layout.data_root
 $hostConfigPath = Join-Path $runtimeRoot 'runtime-host.json'
 $configStream = Open-StableFile $hostConfigPath
 $pythonStream = $null
@@ -199,4 +203,5 @@ finally {
     }
     $configStream.Dispose()
     $helperStream.Dispose()
+    $layoutStream.Dispose()
 }

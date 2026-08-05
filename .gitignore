@@ -5,6 +5,7 @@ __pycache__/
 /.review-*/
 /.security-*/
 /.test-tmp/
+/.tmp-codex-home/
 .coverage
 htmlcov/
 dist/

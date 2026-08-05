@@ -1,17 +1,18 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('auth_file', 'api_key')]
     [string] $AuthMode,
     [string] $AuthSource,
     [switch] $Doctor,
-    [string] $SourceRoot = 'C:\Users\ExampleUser\change-delivery-plugin'
+    [string] $SourceRoot
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = '39c10bc18ab28754637f3277d30ad9ac4ce6f1a5722b2365974f02283029d325'
-function Open-StableTrustedHelper([string] $Path) {
+$TrustedHostSecuritySha256 = '6e1e0e6cfd1d112371aed4fa43bd85ea37b3a93894a30b903a199412c4f19e77'
+$TrustedSharedLayoutSha256 = '4e0dc6e7febe6650c9dde5c636b3959a2388f00bcf372411f1ea7fd305f8aff1'
+function Open-StableTrustedHelper([string] $Path, [string] $ExpectedHash) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
     while ($null -ne $cursor) {
@@ -30,17 +31,24 @@ function Open-StableTrustedHelper([string] $Path) {
         $algorithm = [Security.Cryptography.SHA256]::Create()
         try { $hash = [BitConverter]::ToString($algorithm.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
         finally { $algorithm.Dispose() }
-        if ($hash -cne $TrustedHostSecuritySha256) { throw 'Trusted helper hash differs from the embedded anchor.' }
+        if ($hash -cne $ExpectedHash) { throw 'Trusted helper hash differs from the embedded anchor.' }
         $stream.Position = 0
         return $stream
     }
     catch { $stream.Dispose(); throw }
 }
+$layoutPath = Join-Path $PSScriptRoot 'shared-layout.ps1'
+$layoutStream = Open-StableTrustedHelper $layoutPath $TrustedSharedLayoutSha256
+. $layoutPath
+$layout = Get-SharedInstallLayout
 $helperPath = Join-Path $PSScriptRoot 'host-security.ps1'
-$helperStream = Open-StableTrustedHelper $helperPath
+$helperStream = Open-StableTrustedHelper $helperPath $TrustedHostSecuritySha256
 . $helperPath
 
 $taskName = 'Codex Change Delivery Tick'
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    $SourceRoot = $layout.host_root
+}
 $fixedRoot = Assert-FixedSourceRoot $SourceRoot
 $tickPath = Resolve-RegularFile (
     Join-Path $fixedRoot 'scripts\run-tick.ps1'
@@ -59,6 +67,12 @@ Assert-NoPythonBytecode (Join-Path $moduleRoot 'change_delivery')
 Assert-ClosedPythonModuleRoot $moduleRoot $moduleManifest
 
 $python = Resolve-TrustedPythonIdentity
+$expectedPython = Resolve-RegularFile (
+    Join-Path $layout.venv_root 'Scripts\python.exe'
+) 'python.exe'
+if ($python.path -cne $expectedPython) {
+    throw '专用 Python 不属于当前用户的共享安装布局。'
+}
 $codex = Resolve-OfficialCodexIdentity
 $gh = Resolve-InstalledGitHubCliIdentity
 $auth = Resolve-Authentication $AuthMode $AuthSource
@@ -75,11 +89,11 @@ if ($Doctor) {
     return
 }
 
-$userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
-$runtimeRoot = Join-Path $userProfile '.codex\change-delivery'
+$runtimeRoot = $layout.data_root
+$escapedTickPath = $tickPath.Replace('"', '""')
 $arguments = (
     '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass ' +
-    '-File "C:\Users\ExampleUser\change-delivery-plugin\scripts\run-tick.ps1"'
+    '-File "' + $escapedTickPath + '"'
 )
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $results = @(
@@ -148,7 +162,8 @@ $configuration = [ordered]@{
     auth_mode = $AuthMode
     auth_source = $auth
 }
-Write-RuntimeHost $runtimeRoot $configuration $fixedRoot
+Write-RuntimeHost $runtimeRoot $configuration $fixedRoot `
+    -AllowManagedReplacement:($results.Count -eq 1)
 
 if ($results.Count -eq 1) {
     Write-Output 'Scheduled task already has the complete fixed definition.'

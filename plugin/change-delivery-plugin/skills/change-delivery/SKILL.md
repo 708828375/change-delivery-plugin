@@ -9,25 +9,36 @@ Treat the host CLI and its state machine as the only authority for delivery
 state and side effects. A user's urgency or broad authorization never removes
 these gates.
 
+Before running any orchestrator command, resolve the shared launcher:
+
+```powershell
+$deliveryLauncher = Join-Path (
+  [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+) '.codex\change-delivery\bin\change-delivery.ps1'
+```
+
+If it is not an ordinary file, stop and ask the user to 重新安装 the plugin.
+Never fall back to a clone path, `PATH` Python, or a direct module invocation.
+
 ## Required workflow
 
-1. Run `python -m change_delivery doctor --json`. Stop on a failed check.
+1. Run `& $deliveryLauncher doctor --json`. Stop on a failed check.
 2. Identify the project in the global registry. If it is not registered, do
    not edit the project or register it implicitly; produce only a dry-run
    onboarding report and request explicit registration.
 3. Write the requirement to an absolute file, then start with
-   `python -m change_delivery start --project <project-id> --requirement-file <absolute-path> --json`.
-   Advance design with `python -m change_delivery resume <run-id> --json`.
+   `& $deliveryLauncher start --project <project-id> --requirement-file <absolute-path> --json`.
+   Advance design with `& $deliveryLauncher resume <run-id> --json`.
 4. At `AWAITING_DESIGN_APPROVAL`, run
-   `python -m change_delivery prepare-approval <run-id> --json`. Present the
+   `& $deliveryLauncher prepare-approval <run-id> --json`. Present the
    returned exact approval file, artifact scope, and `approval_sha256`. Pause
    until the user explicitly confirms that hash.
 5. Only after confirmation, run
-   `python -m change_delivery approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json`.
+   `& $deliveryLauncher approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json`.
    A changed file or hash requires a new confirmation.
-6. Advance with `python -m change_delivery resume <run-id> --json`; inspect
-   with `python -m change_delivery status --run-id <run-id> --json` and allow
-   scheduled reconciliation only through `python -m change_delivery tick --json`.
+6. Advance with `& $deliveryLauncher resume <run-id> --json`; inspect
+   with `& $deliveryLauncher status --run-id <run-id> --json` and allow
+   scheduled reconciliation only through `& $deliveryLauncher tick --json`.
    Never
    emulate a transition, skip a state, or treat prose as state evidence.
 7. For an implementation stage, explicitly use `$delivery-implement`. For an

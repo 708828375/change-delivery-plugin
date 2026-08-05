@@ -1,7 +1,7 @@
 {
   "name": "change-delivery-plugin",
-  "version": "0.1.0",
-  "description": "面向 Codex CLI 的个人全局研发交付编排 Plugin",
+  "version": "0.2.0",
+  "description": "面向 Codex CLI 的团队共享研发交付编排 Plugin",
   "author": {
     "name": "JoySun"
   },
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Change Delivery",
     "shortDescription": "将已批准需求自动推进到可合并 PR",
-    "longDescription": "使用可恢复状态机、隔离 worktree、测试环境验收和 Review 修复循环推进个人研发交付流程。",
+    "longDescription": "使用可恢复状态机、隔离 worktree、测试环境验收和 Review 修复循环推进团队研发交付流程。",
     "developerName": "JoySun",
     "category": "Productivity",
     "capabilities": [

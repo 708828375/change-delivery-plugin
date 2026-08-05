@@ -94,7 +94,8 @@ def test_runtime_host_rejects_extra_fields_and_mutable_execution_roots() -> None
 
     assert "Assert-StrictRuntimeHost" in tick
     assert "Assert-FixedSourceRoot" in scheduled
-    assert "C:\\Users\\JoySun\\change-delivery-plugin" in scheduled
+    assert "C:\\Users\\JoySun\\change-delivery-plugin" not in scheduled
+    assert "$layout.host_root" in scheduled
     assert "$PSScriptRoot\\..\\src" in tick
     contract = SECURITY.read_text(encoding="utf-8")
     assert "python_sha256" in scheduled and "python_sha256" in contract

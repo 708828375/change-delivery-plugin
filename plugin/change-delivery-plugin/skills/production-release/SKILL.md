@@ -8,10 +8,21 @@ description: Use when the user explicitly invokes $production-release to inspect
 Version 1 is a read-only preflight. It contains no production-write path and
 must always refuse one.
 
+Resolve the shared launcher from the current Windows Known Folder:
+
+```powershell
+$deliveryLauncher = Join-Path (
+  [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+) '.codex\change-delivery\bin\change-delivery.ps1'
+```
+
+If it is not an ordinary file, stop and ask the user to 重新安装 the plugin.
+Never fall back to a clone path or system Python.
+
 ## Preflight
 
 1. Require an explicit run ID and explicit invocation of this Skill.
-2. Run `python -m change_delivery release <run-id> --json`.
+2. Run `& $deliveryLauncher release <run-id> --json`.
 3. Report the returned merge identity, test-acceptance SHA relationship,
    configuration gate, missing prerequisites, and sanitized evidence.
 4. If preflight passes, report only that the run is eligible for a future

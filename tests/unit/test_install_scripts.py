@@ -6,7 +6,11 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 PERSONAL = ROOT / "scripts" / "install-personal-plugin.ps1"
+SHARED = ROOT / "scripts" / "install-shared-plugin.ps1"
 PUBLISHER = ROOT / "scripts" / "plugin-publisher.ps1"
+LAYOUT = ROOT / "scripts" / "shared-layout.ps1"
+RUNTIME_PUBLISHER = ROOT / "scripts" / "runtime-publisher.ps1"
+UNINSTALLER = ROOT / "scripts" / "uninstall-shared-plugin.ps1"
 SCHEDULED = ROOT / "scripts" / "install-scheduled-task.ps1"
 TICK = ROOT / "scripts" / "run-tick.ps1"
 SECURITY = ROOT / "scripts" / "host-security.ps1"
@@ -18,7 +22,18 @@ def _text(path: Path) -> str:
 
 def test_install_scripts_parse_as_powershell() -> None:
     paths = ", ".join(
-        f"'{path}'" for path in (PERSONAL, PUBLISHER, SCHEDULED, TICK, SECURITY)
+        f"'{path}'"
+        for path in (
+            PERSONAL,
+            SHARED,
+            PUBLISHER,
+            LAYOUT,
+            RUNTIME_PUBLISHER,
+            UNINSTALLER,
+            SCHEDULED,
+            TICK,
+            SECURITY,
+        )
     )
     command = (
         f"$files=@({paths}); foreach($file in $files){{"
@@ -35,11 +50,15 @@ def test_install_scripts_parse_as_powershell() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_personal_installer_is_fail_closed_and_uses_codex_marketplace_api() -> None:
-    script = _text(PERSONAL)
+def test_compatibility_installer_delegates_to_fail_closed_shared_installer() -> None:
+    compatibility = _text(PERSONAL)
+    script = _text(SHARED)
     publisher = _text(PUBLISHER)
 
-    assert "Resolve-Path" in script
+    assert "install-shared-plugin.ps1" in compatibility
+    assert "@PSBoundParameters" in compatibility
+    assert "New-CleanPluginStage" not in compatibility
+    assert "Resolve-CanonicalOrdinaryDirectory" in script
     assert "plugin-publisher.ps1" in script
     assert "New-CleanPluginStage" in script
     assert "Install-CleanPluginStage" in script
@@ -49,12 +68,15 @@ def test_personal_installer_is_fail_closed_and_uses_codex_marketplace_api() -> N
     assert "plugin marketplace list --json" in script
     assert "plugin add" in script
     assert "change-delivery-plugin@" in script
-    assert "marketplace.json" not in script
+    assert "marketplace.json" in script
+    assert "708828375/change-delivery-plugin" in script
+    assert "--ref $releaseTag" in script
+    assert "C:\\Users\\JoySun" not in script
     assert "Remove-Item" not in script
 
 
 def test_personal_installer_resolves_default_source_after_parameter_binding() -> None:
-    script = _text(PERSONAL)
+    script = _text(SHARED)
 
     assert "[string] $SourceRoot = (Split-Path -Parent $PSScriptRoot)" not in script
     assert "if ([string]::IsNullOrWhiteSpace($SourceRoot))" in script
@@ -67,8 +89,8 @@ def test_scheduler_installer_pins_native_codex_auth_and_runtime_host() -> None:
     assert "@openai\\codex" in script
     assert "vendor" in script
     assert "codex.exe" in script
-    assert "Get-Command codex" not in script
-    assert "codex.cmd" not in script
+    assert "Get-Command codex.cmd" in script
+    assert "Get-Command gh.exe" in script
     assert "codex.ps1" not in script
     assert "ReparsePoint" in script
     assert "--version" in script

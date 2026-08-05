@@ -6,10 +6,12 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PLUGIN_ROOT = ROOT / "plugin" / "change-delivery-plugin"
+LAUNCHER_FRAGMENT = ".codex\\change-delivery\\bin\\change-delivery.ps1"
 
 
 def _skill(name: str) -> tuple[str, dict[str, object]]:
-    skill_root = ROOT / "skills" / name
+    skill_root = PLUGIN_ROOT / "skills" / name
     body = (skill_root / "SKILL.md").read_text(encoding="utf-8")
     metadata = yaml.safe_load(
         (skill_root / "agents" / "openai.yaml").read_text(encoding="utf-8")
@@ -40,6 +42,9 @@ def test_change_delivery_is_explicit_and_enforces_public_entry_gates() -> None:
         "BLOCKED",
     ):
         assert required in body
+    assert LAUNCHER_FRAGMENT in body
+    assert "重新安装" in body
+    assert "python -m change_delivery" not in body
 
 
 def test_delivery_planning_is_internal_and_design_only() -> None:
@@ -106,8 +111,8 @@ def test_delivery_review_is_read_only_and_returns_stage_result() -> None:
 def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:
     body, metadata = _skill("project-test-acceptance")
     checklist = (
-        ROOT
-        / "skills"
+            PLUGIN_ROOT
+            / "skills"
         / "project-test-acceptance"
         / "references"
         / "checklist.md"
@@ -159,3 +164,12 @@ def test_production_release_is_preflight_only_and_refuses_writes() -> None:
         "written authorization",
     ):
         assert required in body
+    assert LAUNCHER_FRAGMENT in body
+    assert "重新安装" in body
+    assert "python -m change_delivery" not in body
+
+
+def test_no_skill_bypasses_the_stable_launcher() -> None:
+    for skill_file in (PLUGIN_ROOT / "skills").glob("*/SKILL.md"):
+        body = skill_file.read_text(encoding="utf-8")
+        assert "python -m change_delivery" not in body, skill_file
