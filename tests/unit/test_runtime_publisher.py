@@ -34,6 +34,18 @@ def make_runtime_source(root: Path, value: str = "new") -> Path:
     (source / "src" / "change_delivery").mkdir(parents=True)
     (source / "schemas").mkdir()
     (source / "scripts").mkdir()
+    for skill in (
+        "delivery-planning",
+        "delivery-implement",
+        "delivery-review",
+        "project-test-acceptance",
+    ):
+        skill_root = source / "plugin" / "change-delivery-plugin" / "skills" / skill
+        skill_root.mkdir(parents=True)
+        (skill_root / "SKILL.md").write_text(
+            f"---\nname: {skill}\n---\n",
+            encoding="utf-8",
+        )
     (source / "src" / "change_delivery" / "__init__.py").write_text(
         f"VALUE = {value!r}\n", encoding="utf-8"
     )
@@ -63,7 +75,8 @@ $ErrorActionPreference='Stop'
 . '{ps_literal(PUBLISHER)}'
 $stage = New-CleanRuntimeHostStage '{ps_literal(source)}' '{ps_literal(data_root)}'
 $names = @((Get-ChildItem -LiteralPath $stage -Force).Name | Sort-Object)
-if (($names -join ',') -cne 'pyproject.toml,schemas,scripts,src') {{ exit 51 }}
+if (($names -join ',') -cne 'pyproject.toml,schemas,scripts,skills,src') {{ exit 51 }}
+if (-not (Test-Path -LiteralPath (Join-Path $stage 'skills\delivery-review\SKILL.md') -PathType Leaf)) {{ exit 56 }}
 Assert-ClosedRuntimeHostTree $stage
 """
     )

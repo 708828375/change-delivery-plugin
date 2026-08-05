@@ -60,17 +60,21 @@ repository can reach `READY_TO_MERGE`.
   side-effect scope. Block and request a new approval snapshot instead.
 - Do not write the state database directly. Use the CLI and state machine.
 - Do not bypass a blocked transition or manufacture evidence.
-- Do not run an unconditional force push. The shared test branch may be
-  updated only by the adapter's exact
-  `--force-with-lease=<test-branch>:<expected-sha>` operation.
+- The test push policy must come from the registered `test_push_strategy`.
+  `force-with-lease` uses the adapter's exact
+  `--force-with-lease=<test-branch>:<expected-sha>` operation. `force` may use
+  an unconditional force push only through the host adapter, only for the
+  registered test branch, and only with post-push SHA verification.
+- Never run a manual `git push -f` or `git push --force`; the configured host
+  adapter is the only authority for either test push strategy.
 - Never force-push a feature branch.
 - Do not merge a PR or perform any production write. Do not invoke a
   production release from this workflow.
 
 ## Red flags
 
-Stop if the proposed shortcut includes direct SQL, `git push -f`,
-`git push --force`, a feature-branch force push, manual state changes,
+Stop if the proposed shortcut includes direct SQL, a manual `git push -f`,
+a manual `git push --force`, a feature-branch force push, manual state changes,
 unapproved edits, `gh pr merge`, a deployment command, or a claim that
 `READY_TO_MERGE` means merged.
 

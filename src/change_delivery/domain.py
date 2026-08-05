@@ -603,6 +603,9 @@ class ProjectConfig(FrozenModel):
         pattern=BRANCH_PATTERN,
         json_schema_extra=BRANCH_SCHEMA_EXTRA,
     )
+    test_push_strategy: Literal["force", "force-with-lease"] = (
+        "force-with-lease"
+    )
     github_repository: str = Field(pattern=GITHUB_REPOSITORY_PATTERN)
     version_endpoint: str = Field(
         pattern=HTTPS_URL_PATTERN,

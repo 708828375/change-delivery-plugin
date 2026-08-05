@@ -710,6 +710,73 @@ class GitAdapter:
         return expected
 
     @_project_write
+    def push_test(
+        self,
+        remote: str,
+        test_branch: str,
+        source_sha: str,
+        observed_sha: str,
+        *,
+        strategy: str,
+    ) -> str:
+        self._require_bound_remote(remote)
+        self._validate_branch(test_branch)
+        if test_branch != self.test_branch:
+            raise ValueError("test branch must equal the bound test branch")
+        if strategy not in {"force", "force-with-lease"}:
+            raise ValueError("test push strategy is invalid")
+        source = self._normalize_sha(source_sha)
+        observed = self._normalize_sha(observed_sha)
+        self._assert_remote_identity()
+        force_argument = (
+            "--force"
+            if strategy == "force"
+            else f"--force-with-lease=refs/heads/{test_branch}:{observed}"
+        )
+        args = self._push_scoped(
+            (
+                "push",
+                self._push_url,
+                f"{source}:refs/heads/{test_branch}",
+                force_argument,
+            )
+        )
+        result = self._execute(
+            args,
+            workdir=self.repo_path,
+            operation="push_test",
+        )
+        if result.exit_code != 0:
+            combined = f"{result.stdout}\n{result.stderr}".casefold()
+            if (
+                strategy == "force-with-lease"
+                and (
+                    "stale info" in combined
+                    or "fetch first" in combined
+                    or "[rejected]" in combined
+                )
+            ):
+                raise LeaseConflict(
+                    "push_test",
+                    exit_code=result.exit_code,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                    reason="lease rejected",
+                )
+            self._raise_result("push_test", result)
+        verified = self._remote_head_sha(remote, test_branch)
+        if verified != source:
+            if strategy == "force-with-lease":
+                raise LeaseConflict(
+                    "push_test",
+                    reason="remote SHA changed during verification",
+                )
+            raise GitError(
+                "push_test",
+                reason="remote SHA changed during verification",
+            )
+        return source
+
     def push_test_with_lease(
         self,
         remote: str,
@@ -717,48 +784,13 @@ class GitAdapter:
         source_sha: str,
         observed_sha: str,
     ) -> str:
-        self._require_bound_remote(remote)
-        self._validate_branch(test_branch)
-        if test_branch != self.test_branch:
-            raise ValueError("test branch must equal the bound test branch")
-        source = self._normalize_sha(source_sha)
-        observed = self._normalize_sha(observed_sha)
-        self._assert_remote_identity()
-        args = self._push_scoped(
-            (
-                "push",
-                self._push_url,
-                f"{source}:refs/heads/{test_branch}",
-                f"--force-with-lease=refs/heads/{test_branch}:{observed}",
-            )
+        return self.push_test(
+            remote,
+            test_branch,
+            source_sha,
+            observed_sha,
+            strategy="force-with-lease",
         )
-        result = self._execute(
-            args,
-            workdir=self.repo_path,
-            operation="push_test_with_lease",
-        )
-        if result.exit_code != 0:
-            combined = f"{result.stdout}\n{result.stderr}".casefold()
-            if (
-                "stale info" in combined
-                or "fetch first" in combined
-                or "[rejected]" in combined
-            ):
-                raise LeaseConflict(
-                    "push_test_with_lease",
-                    exit_code=result.exit_code,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    reason="lease rejected",
-                )
-            self._raise_result("push_test_with_lease", result)
-        verified = self._remote_head_sha(remote, test_branch)
-        if verified != source:
-            raise LeaseConflict(
-                "push_test_with_lease",
-                reason="remote SHA changed during verification",
-            )
-        return source
 
     @_project_write
     def remove_clean_worktree(self, path: Path) -> None:

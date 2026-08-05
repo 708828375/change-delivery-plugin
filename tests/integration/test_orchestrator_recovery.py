@@ -817,13 +817,14 @@ def test_default_cli_wires_git_and_github_adapters(
 
 def test_default_runtime_skills_are_bundled_with_plugin() -> None:
     source_root = Path(cli_module.__file__).resolve().parents[2]
+    skills_root = source_root / "plugin" / "change-delivery-plugin" / "skills"
     for name in (
         "delivery-planning",
         "delivery-implement",
         "delivery-review",
         "project-test-acceptance",
     ):
-        assert (source_root / "skills" / name / "SKILL.md").is_file()
+        assert (skills_root / name / "SKILL.md").is_file()
 
     globally_existing_names = {
         "writing-plans",
@@ -834,7 +835,7 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
     }
     bundled_names = {
         path.name
-        for path in (source_root / "skills").iterdir()
+        for path in skills_root.iterdir()
         if path.is_dir() and (path / "SKILL.md").is_file()
     }
     assert bundled_names == {
@@ -1031,7 +1032,11 @@ def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
     source_root = Path(cli_module.__file__).resolve().parents[2]
     registry = executor._skill_registry(source_root)
     assert registry[expected_skill] == (
-        source_root / "skills" / expected_skill
+        source_root
+        / "plugin"
+        / "change-delivery-plugin"
+        / "skills"
+        / expected_skill
     ).resolve()
 
 
@@ -1089,6 +1094,91 @@ def test_runtime_acceptance_port_preserves_blocked_stage_as_nonpassing_fact(
     assert result["passed"] is False
     assert result["stage_status"] == "blocked"
     assert port.query(run, configured) is None
+
+
+def test_runtime_test_environment_uses_configured_force_strategy_and_records_it(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DEPLOYING_TEST)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET project_id = ? WHERE run_id = ?",
+            ("example-backend", run_id),
+        )
+    calls: list[tuple[object, ...]] = []
+
+    class ForceGit:
+        current = OTHER_SHA
+
+        def fetch(self, remote: str) -> None:
+            calls.append(("fetch", remote))
+
+        def remote_sha(self, remote: str, branch: str) -> str:
+            calls.append(("remote_sha", remote, branch))
+            return self.current
+
+        def push_test(
+            self,
+            remote: str,
+            branch: str,
+            source_sha: str,
+            observed_sha: str,
+            *,
+            strategy: str,
+        ) -> str:
+            calls.append(
+                (
+                    "push_test",
+                    remote,
+                    branch,
+                    source_sha,
+                    observed_sha,
+                    strategy,
+                )
+            )
+            self.current = source_sha
+            return source_sha
+
+    force_git = ForceGit()
+
+    class VersionHttp:
+        def get_json(self, url: str) -> object:
+            return {"sha": force_git.current}
+
+    configured = config(fixture.root).model_copy(
+        update={
+            "project_id": "example-backend",
+            "version_endpoint": "https://api.test.example.invalid/health",
+            "test_push_strategy": "force",
+            "acceptance_check": CommandSpec(
+                executable=sys.executable,
+                args=("-c", "host-owned-acceptance"),
+                workdir=fixture.root,
+            ),
+        }
+    )
+    port = RuntimeTestEnvironmentPort(
+        fixture.repository,
+        git_factory=lambda project: force_git,
+        http_factory=lambda project: VersionHttp(),
+    )
+
+    result = port.execute(fixture.repository.get_run(run_id), configured)
+
+    assert result["passed"] is True
+    assert (
+        "push_test",
+        "origin",
+        "test",
+        SHA,
+        OTHER_SHA,
+        "force",
+    ) in calls
+    evidence = fixture.repository.get_evidence(
+        f"test-branch-pushed:{run_id}:{SHA}"
+    )
+    payload = json.loads(evidence.payload_json)
+    assert payload["push_strategy"] == "force"
 
 
 def test_default_runtime_ports_deploy_with_exact_lease_then_require_host_acceptance(

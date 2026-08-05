@@ -5,6 +5,7 @@ remote_fetch_url: C:/fixtures/remotes/example-origin.git
 remote_push_url: C:/fixtures/remotes/example-origin.git
 base_branch: develop
 test_branch: test
+test_push_strategy: force
 github_repository: example-org/example_backend
 version_endpoint: https://api.test.example.invalid/health
 version_sha_field: git_sha

@@ -180,6 +180,15 @@
       "title": "Test Branch",
       "type": "string"
     },
+    "test_push_strategy": {
+      "default": "force-with-lease",
+      "enum": [
+        "force",
+        "force-with-lease"
+      ],
+      "title": "Test Push Strategy",
+      "type": "string"
+    },
     "github_repository": {
       "pattern": "^[^\\s/\\x00-\\x1f\\x7f]+/[^\\s/\\x00-\\x1f\\x7f]+$",
       "title": "Github Repository",

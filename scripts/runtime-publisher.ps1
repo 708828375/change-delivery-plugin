@@ -42,12 +42,12 @@ function Assert-ManagedVirtualEnvironment([string] $Path) {
 
 function Assert-ClosedRuntimeHostTree([string] $Path) {
     Assert-OrdinaryRuntimeDirectory $Path '运行主机根目录'
-    $allowed = @('pyproject.toml', 'schemas', 'scripts', 'src')
+    $allowed = @('pyproject.toml', 'schemas', 'scripts', 'skills', 'src')
     $entries = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
     if (@($entries | Where-Object { $_.Name -cnotin $allowed }).Count -ne 0) {
         throw '运行主机包含非预期的顶层内容。'
     }
-    foreach ($required in @('schemas', 'scripts', 'src')) {
+    foreach ($required in @('schemas', 'scripts', 'skills', 'src')) {
         Assert-OrdinaryRuntimeDirectory `
             (Join-Path $Path $required) `
             "运行主机目录 $required"
@@ -95,6 +95,10 @@ function New-CleanRuntimeHostStage {
             (Join-Path $SourceRoot $required) `
             "源码目录 $required"
     }
+    $skillsSource = Join-Path $SourceRoot (
+        'plugin\change-delivery-plugin\skills'
+    )
+    Assert-OrdinaryRuntimeDirectory $skillsSource 'Plugin 技能源码目录'
     $stage = Join-Path $DataRoot (
         '.host.installing-' + [Guid]::NewGuid().ToString('N')
     )
@@ -104,6 +108,9 @@ function New-CleanRuntimeHostStage {
             Copy-Item -LiteralPath (Join-Path $SourceRoot $directory) `
                 -Destination $stage -Recurse -ErrorAction Stop
         }
+        Copy-Item -LiteralPath $skillsSource `
+            -Destination (Join-Path $stage 'skills') `
+            -Recurse -ErrorAction Stop
         Copy-Item -LiteralPath (Join-Path $SourceRoot 'pyproject.toml') `
             -Destination $stage -ErrorAction Stop
         Assert-ClosedRuntimeHostTree $stage

@@ -321,9 +321,17 @@ class RuntimeStageExecutor:
         return self._codex_adapter
 
     def _skill_registry(self, source_root: Path) -> dict[str, Path]:
+        candidates = (
+            source_root / "skills",
+            source_root / "plugin" / "change-delivery-plugin" / "skills",
+        )
+        skills_root = next(
+            (candidate for candidate in candidates if candidate.is_dir()),
+            candidates[0],
+        )
         registry: dict[str, Path] = {}
         for name in set(_STAGE_SKILLS.values()):
-            source = source_root / "skills" / name
+            source = skills_root / name
             if not (source / "SKILL.md").is_file():
                 raise RuntimeError(f"approved Codex skill is unavailable: {name}")
             registry[name] = source.resolve()
@@ -862,12 +870,21 @@ class RuntimeTestEnvironmentPort:
             config.remote,
             config.test_branch,
         )
-        pushed = git.push_test_with_lease(  # type: ignore[attr-defined]
-            config.remote,
-            config.test_branch,
-            run.head_sha,
-            observed,
-        )
+        if config.test_push_strategy == "force":
+            pushed = git.push_test(  # type: ignore[attr-defined]
+                config.remote,
+                config.test_branch,
+                run.head_sha,
+                observed,
+                strategy="force",
+            )
+        else:
+            pushed = git.push_test_with_lease(  # type: ignore[attr-defined]
+                config.remote,
+                config.test_branch,
+                run.head_sha,
+                observed,
+            )
         self._repository.register_evidence(
             run.run_id,
             f"test-branch-pushed:{run.run_id}:{run.head_sha}",
@@ -876,6 +893,7 @@ class RuntimeTestEnvironmentPort:
                 "sha": run.head_sha,
                 "observed_sha": observed,
                 "pushed_sha": pushed,
+                "push_strategy": config.test_push_strategy,
                 "test_branch": config.test_branch,
             },
         )

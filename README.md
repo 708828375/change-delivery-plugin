@@ -57,6 +57,19 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 & "$env:USERPROFILE\.codex\change-delivery\bin\change-delivery.ps1" doctor --json
 ```
 
+项目配置可选择共享测试分支的推送策略：
+
+```yaml
+# 默认值；远端分支发生变化时拒绝覆盖
+test_push_strategy: force-with-lease
+
+# ExampleProject 当前测试环境流程；只允许用于登记的 test_branch
+test_push_strategy: force
+```
+
+`force` 由运行主机使用冻结的提交 SHA 执行，并在推送后重新核对远端
+测试分支 SHA；它不会放宽功能分支、基线分支或其他分支的强推限制。
+
 如需启用自动 tick，请从已安装 host 执行计划任务安装脚本。推荐使用当前用户的
 Codex 认证文件，因为 Task Scheduler 启动的独立进程不会继承安装 PowerShell 的
 临时 `OPENAI_API_KEY`：

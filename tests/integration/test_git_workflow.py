@@ -817,6 +817,65 @@ def test_test_push_uses_exact_lease_and_returns_verified_sha(
     assert "--force" not in git_operation_args(push_spec.args)
 
 
+def test_test_push_force_overwrites_registered_test_branch_and_verifies_sha(
+    local_remote: tuple[Path, Path, Path, str],
+    tmp_path: Path,
+) -> None:
+    remote, seed, repo, base_sha = local_remote
+    git(seed, "push", "origin", f"{base_sha}:refs/heads/test")
+    runner = RecordingRunner()
+    adapter = adapter_for(repo, runner=runner)
+    adapter.fetch("origin")
+    worktree = tmp_path / "force-feature"
+    adapter.create_worktree("origin/develop", "feature/force-deploy", worktree)
+    source_sha = commit_file(worktree, "deploy.txt", "candidate\n", "candidate")
+    observed_sha = adapter.remote_sha("origin", "test")
+    competing_sha = commit_file(seed, "competing.txt", "theirs\n", "theirs")
+    git(seed, "push", "origin", "HEAD:refs/heads/test")
+
+    result = adapter.push_test(
+        "origin",
+        "test",
+        source_sha,
+        observed_sha,
+        strategy="force",
+    )
+
+    assert competing_sha != observed_sha
+    assert result == source_sha
+    assert git(repo, "ls-remote", "origin", "refs/heads/test").stdout.split()[0] == source_sha
+    push_spec = [
+        spec
+        for spec in runner.specs
+        if git_operation_args(spec.args)[:1] == ("push",)
+    ][-1]
+    assert git_operation_args(push_spec.args) == (
+        "push",
+        str(remote),
+        f"{source_sha}:refs/heads/test",
+        "--force",
+    )
+    assert not any(
+        "force-with-lease" in arg for arg in git_operation_args(push_spec.args)
+    )
+
+
+def test_test_push_force_rejects_branch_outside_registered_test_branch(
+    local_remote: tuple[Path, Path, Path, str],
+) -> None:
+    _, _, repo, _ = local_remote
+    adapter = adapter_for(repo)
+
+    with pytest.raises(ValueError, match="bound test"):
+        adapter.push_test(
+            "origin",
+            "main",
+            "a" * 40,
+            "b" * 40,
+            strategy="force",
+        )
+
+
 def test_stale_test_lease_never_overwrites_remote_or_retries(
     local_remote: tuple[Path, Path, Path, str],
     tmp_path: Path,

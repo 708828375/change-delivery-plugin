@@ -131,6 +131,10 @@ def fixture_config():
     return load_project_config(fixture).config
 
 
+def test_project_fixture_uses_current_force_push_policy(fixture_config) -> None:
+    assert fixture_config.test_push_strategy == "force"
+
+
 def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
     fake_http = FakeHttp({"git_sha": TEST_SHA})
     fake_git = FakeGit(fixture_config)

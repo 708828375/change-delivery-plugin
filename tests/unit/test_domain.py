@@ -284,6 +284,24 @@ def test_project_schema_exposes_branch_and_absolute_path_patterns() -> None:
     assert command_properties["workdir"]["pattern"]
 
 
+def test_project_config_accepts_force_test_push_strategy() -> None:
+    data = valid_project_data()
+    data["test_push_strategy"] = "force"
+
+    config = ProjectConfig.model_validate(data)
+
+    assert config.test_push_strategy == "force"
+    project_schema_validator().validate(config.model_dump(mode="json"))
+
+
+def test_project_config_rejects_unknown_test_push_strategy() -> None:
+    data = valid_project_data()
+    data["test_push_strategy"] = "force-if-convenient"
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
+
+
 @pytest.mark.parametrize(
     "endpoint",
     [
