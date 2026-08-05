@@ -67,3 +67,100 @@ function New-CleanPluginStage([string] $SourceRoot, [string] $PluginsRoot) {
         throw
     }
 }
+
+function Assert-ManagedPluginRelease([string] $Path) {
+    Assert-ClosedPluginReleaseTree $Path
+    $manifestPath = Join-Path $Path '.codex-plugin\plugin.json'
+    $manifestText = [IO.File]::ReadAllText(
+        $manifestPath,
+        [Text.UTF8Encoding]::new($false, $true)
+    )
+    $manifest = ConvertFrom-Json $manifestText
+    if (
+        $manifest -isnot [PSCustomObject] -or
+        $null -eq $manifest.name -or
+        [string] $manifest.name -cne 'change-delivery-plugin'
+    ) {
+        throw 'Managed plugin release has an unexpected identity.'
+    }
+}
+
+function Install-CleanPluginStage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string] $StageRoot,
+        [Parameter(Mandatory)] [string] $TargetRoot,
+        [Parameter(Mandatory)] [string] $ExpectedLegacySource
+    )
+
+    Assert-ManagedPluginRelease $StageRoot
+    $stageItem = Get-Item -LiteralPath $StageRoot -Force -ErrorAction Stop
+    $targetFullPath = [IO.Path]::GetFullPath($TargetRoot).TrimEnd('\')
+    $parent = Split-Path -Parent $targetFullPath
+    Assert-OrdinaryDirectory $parent 'Plugins root'
+    if (
+        $stageItem.Parent.FullName.TrimEnd('\') -cne $parent -or
+        [IO.Path]::GetFileName($targetFullPath) -cne 'change-delivery-plugin' -or
+        -not $stageItem.Name.StartsWith(
+            '.change-delivery-plugin.installing-',
+            [StringComparison]::Ordinal
+        )
+    ) {
+        throw 'Plugin release paths do not match the fixed publishing layout.'
+    }
+
+    $backup = Join-Path $parent (
+        '.change-delivery-plugin.backup-' + [guid]::NewGuid().ToString('N')
+    )
+    $legacyTarget = $null
+
+    if (Test-Path -LiteralPath $targetFullPath) {
+        $current = Get-Item -LiteralPath $targetFullPath -Force -ErrorAction Stop
+        if ($current.LinkType -eq 'Junction') {
+            $targets = @($current.Target)
+            if ($targets.Count -ne 1) {
+                throw 'Legacy plugin junction target is ambiguous.'
+            }
+            $legacyTarget = (
+                Resolve-Path -LiteralPath ([string] $targets[0]) -ErrorAction Stop
+            ).ProviderPath
+            $expected = (
+                Resolve-Path -LiteralPath $ExpectedLegacySource -ErrorAction Stop
+            ).ProviderPath
+            if (-not [string]::Equals(
+                $legacyTarget.TrimEnd('\'),
+                $expected.TrimEnd('\'),
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw 'Legacy plugin junction points to an unexpected source.'
+            }
+            $current.Delete($false)
+        }
+        else {
+            Assert-ManagedPluginRelease $targetFullPath
+            Move-Item -LiteralPath $targetFullPath -Destination $backup -ErrorAction Stop
+        }
+    }
+
+    try {
+        Move-Item -LiteralPath $StageRoot -Destination $targetFullPath -ErrorAction Stop
+    }
+    catch {
+        if (Test-Path -LiteralPath $backup) {
+            Move-Item -LiteralPath $backup -Destination $targetFullPath -ErrorAction Stop
+        }
+        elseif (
+            $null -ne $legacyTarget -and
+            -not (Test-Path -LiteralPath $targetFullPath)
+        ) {
+            New-Item -ItemType Junction -Path $targetFullPath `
+                -Target $legacyTarget -ErrorAction Stop | Out-Null
+        }
+        throw
+    }
+
+    if (Test-Path -LiteralPath $backup) {
+        Assert-ManagedPluginRelease $backup
+        [IO.Directory]::Delete($backup, $true)
+    }
+}
