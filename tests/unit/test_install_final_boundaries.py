@@ -158,3 +158,15 @@ def test_security_checks_precede_plugin_validation_and_registration() -> None:
     assert scheduled.index("Write-RuntimeHost $runtimeRoot $configuration") < (
         scheduled.index("Register-ScheduledTask")
     )
+
+
+def test_clean_release_is_validated_before_activation_and_registration() -> None:
+    personal = PERSONAL.read_text(encoding="utf-8")
+
+    assert personal.index("New-CleanPluginStage") < personal.index(
+        "& python $validator $stage"
+    )
+    assert personal.index("& python $validator $stage") < personal.index(
+        "Install-CleanPluginStage"
+    )
+    assert personal.index("Install-CleanPluginStage") < personal.index("plugin add")

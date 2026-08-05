@@ -6,6 +6,7 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 PERSONAL = ROOT / "scripts" / "install-personal-plugin.ps1"
+PUBLISHER = ROOT / "scripts" / "plugin-publisher.ps1"
 SCHEDULED = ROOT / "scripts" / "install-scheduled-task.ps1"
 TICK = ROOT / "scripts" / "run-tick.ps1"
 SECURITY = ROOT / "scripts" / "host-security.ps1"
@@ -16,7 +17,9 @@ def _text(path: Path) -> str:
 
 
 def test_install_scripts_parse_as_powershell() -> None:
-    paths = ", ".join(f"'{path}'" for path in (PERSONAL, SCHEDULED, TICK, SECURITY))
+    paths = ", ".join(
+        f"'{path}'" for path in (PERSONAL, PUBLISHER, SCHEDULED, TICK, SECURITY)
+    )
     command = (
         f"$files=@({paths}); foreach($file in $files){{"
         "[void][scriptblock]::Create("
@@ -34,11 +37,14 @@ def test_install_scripts_parse_as_powershell() -> None:
 
 def test_personal_installer_is_fail_closed_and_uses_codex_marketplace_api() -> None:
     script = _text(PERSONAL)
+    publisher = _text(PUBLISHER)
 
     assert "Resolve-Path" in script
-    assert "New-Item -ItemType Junction" in script
-    assert "LinkType -ne 'Junction'" in script
-    assert ".Target" in script
+    assert "plugin-publisher.ps1" in script
+    assert "New-CleanPluginStage" in script
+    assert "Install-CleanPluginStage" in script
+    assert "New-Item -ItemType Junction -Path $target" not in script
+    assert "$allowed = @('.codex-plugin', 'skills')" in publisher
     assert "validate_plugin.py" in script
     assert "plugin marketplace list --json" in script
     assert "plugin add" in script

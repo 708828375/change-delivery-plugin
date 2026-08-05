@@ -10,6 +10,12 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
     $SourceRoot = Split-Path -Parent $PSScriptRoot
 }
 
+$publisherPath = Join-Path $PSScriptRoot 'plugin-publisher.ps1'
+if (-not (Test-Path -LiteralPath $publisherPath -PathType Leaf)) {
+    throw 'The plugin publisher is unavailable.'
+}
+. $publisherPath
+
 function Resolve-CanonicalPath([string] $Path) {
     return (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath
 }
@@ -96,10 +102,6 @@ $validator = Join-Path $userProfile (
 if (-not (Test-Path -LiteralPath $validator -PathType Leaf)) {
     throw 'The official Plugin validator is unavailable.'
 }
-& python $validator $source
-if ($LASTEXITCODE -ne 0) {
-    throw 'Plugin validation failed.'
-}
 
 $marketplaceJson = & codex plugin marketplace list --json
 if ($LASTEXITCODE -ne 0) {
@@ -137,26 +139,23 @@ if (-not (Test-Path -LiteralPath $plugins)) {
     $plugins = Assert-SafePluginsRoot $fixedPluginsRoot $fixedPluginsRoot
 }
 $target = Join-Path $plugins 'change-delivery-plugin'
-if (Test-Path -LiteralPath $target) {
-    $targetItem = Get-Item -LiteralPath $target -Force
-    if ($targetItem.LinkType -ne 'Junction') {
-        throw 'Plugin target exists and is not a junction.'
+$stage = New-CleanPluginStage -SourceRoot $source -PluginsRoot $plugins
+try {
+    & python $validator $stage
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Plugin validation failed.'
     }
-    $targets = @($targetItem.Target)
-    if ($targets.Count -ne 1) {
-        throw 'Plugin junction has an ambiguous target.'
-    }
-    if (-not [IO.Path]::IsPathRooted([string] $targets[0])) {
-        throw 'Plugin junction target must be absolute.'
-    }
-    $resolvedTarget = Resolve-CanonicalPath ([string] $targets[0])
-    if ($resolvedTarget.TrimEnd('\') -ne $source.TrimEnd('\')) {
-        throw 'Plugin junction points to a different source.'
-    }
+    Install-CleanPluginStage `
+        -StageRoot $stage `
+        -TargetRoot $target `
+        -ExpectedLegacySource $source
+    $stage = $null
 }
-else {
-    New-Item -ItemType Junction -Path $target -Target $source -ErrorAction Stop |
-        Out-Null
+finally {
+    if ($null -ne $stage -and (Test-Path -LiteralPath $stage)) {
+        Assert-ClosedPluginReleaseTree $stage
+        [IO.Directory]::Delete($stage, $true)
+    }
 }
 
 $pluginReference = "change-delivery-plugin@$marketplaceName"
