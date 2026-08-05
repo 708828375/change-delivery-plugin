@@ -1,0 +1,3 @@
+scripts/*.ps1 text eol=lf
+scripts/trusted-module-manifest.json text eol=lf
+src/**/*.py text eol=lf

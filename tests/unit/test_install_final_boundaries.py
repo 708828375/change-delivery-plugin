@@ -89,8 +89,8 @@ function Register-ScheduledTask {{
 }}
 '@
 $script = $script.Replace(
-  ". `$helperPath`r`n",
-  ". `$helperPath`r`n" + $injected + "`r`n"
+  ". `$helperPath`n",
+  ". `$helperPath`n" + $injected + "`n"
 )
 $script = $script.Replace(
   '$runtimeRoot = Join-Path $userProfile ''.codex\change-delivery''',

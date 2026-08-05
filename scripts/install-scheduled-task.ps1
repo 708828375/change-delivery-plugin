@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = '29782be99d7caad9cd21b1530d7b756ab1cfd22f951accb1eb8b0221a5808305'
+$TrustedHostSecuritySha256 = '39c10bc18ab28754637f3277d30ad9ac4ce6f1a5722b2365974f02283029d325'
 function Open-StableTrustedHelper([string] $Path) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     $cursor = $item
