@@ -2,7 +2,7 @@
 Set-StrictMode -Version Latest
 
 $script:HostSecurityRoot = $PSScriptRoot
-$script:TrustedModuleManifestSha256 = '1f366746c942a86dca68d319d533190f2809ddef6d502d406b9893cdfa626e72'
+$script:TrustedModuleManifestSha256 = '521932f4aa8bdccf7bbca2e7afb97b9df7875819d2406cd4462c5ef3eeef03ae'
 $script:StableManifestReadProbe = $null
 
 if ($null -eq ('ChangeDelivery.NativeFileIdentity' -as [type])) {

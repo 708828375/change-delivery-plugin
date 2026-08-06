@@ -91,7 +91,7 @@ $manifest = Join-Path $pluginSource '.codex-plugin\plugin.json'
 if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
     throw '插件源码根目录不包含 manifest。'
 }
-$releaseTag = 'v0.2.0'
+$releaseTag = 'v0.2.1'
 $releaseVersion = $releaseTag.Substring(1)
 $sourceManifest = ConvertFrom-Json ([IO.File]::ReadAllText(
     $manifest,

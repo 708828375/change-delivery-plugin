@@ -1,7 +1,7 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$TrustedHostSecuritySha256 = 'fbaeb713cb1a04125771d976f0c3134f36f1ee088cbefeaa1cd2ce4d46ffaf24'
+$TrustedHostSecuritySha256 = '245813ed951a35ba357371de69d3566fa9bd698f6c99e20ff853869b9c051601'
 $TrustedSharedLayoutSha256 = '4e0dc6e7febe6650c9dde5c636b3959a2388f00bcf372411f1ea7fd305f8aff1'
 function Open-StableTrustedHelper([string] $Path, [string] $ExpectedHash) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
@@ -156,7 +156,7 @@ try {
     $env:CHANGE_DELIVERY_GH_SHA256 = [string] $hostConfig.gh_sha256
     $env:PYTHONPATH = $null
     $env:PYTHONHOME = $null
-    $env:PYTHONUTF8 = '1'
+    $env:PYTHONUTF8$1245813ed951a35ba357371de69d3566fa9bd698f6c99e20ff853869b9c051601'
     $env:PYTHONDONTWRITEBYTECODE = '1'
     $bootstrap = (
         "import runpy,sys;" +
