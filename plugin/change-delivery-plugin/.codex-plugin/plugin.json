@@ -1,6 +1,6 @@
 {
   "name": "change-delivery-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "面向 Codex CLI 的团队共享研发交付编排 Plugin",
   "author": {
     "name": "JoySun"

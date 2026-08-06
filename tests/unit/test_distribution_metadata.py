@@ -37,7 +37,7 @@ def test_marketplace_is_a_versioned_git_catalog() -> None:
     )
     assert "708828375/change-delivery-plugin" in installer
     assert "--ref $releaseTag" in installer
-    assert "$releaseTag = 'v0.2.1'" in installer
+    assert "$releaseTag = 'v0.2.2'" in installer
 
 
 def test_distribution_versions_are_consistent() -> None:
@@ -49,8 +49,8 @@ def test_distribution_versions_are_consistent() -> None:
     with (ROOT / "pyproject.toml").open("rb") as stream:
         project = tomllib.load(stream)["project"]
 
-    assert manifest["version"] == "0.2.1"
-    assert project["version"] == "0.2.1"
+    assert manifest["version"] == "0.2.2"
+    assert project["version"] == "0.2.2"
     module = ast.parse(
         (ROOT / "src/change_delivery/__init__.py").read_text(encoding="utf-8")
     )
@@ -64,7 +64,7 @@ def test_distribution_versions_are_consistent() -> None:
         )
     )
     assert isinstance(version_assignment.value, ast.Constant)
-    assert version_assignment.value.value == "0.2.1"
+    assert version_assignment.value.value == "0.2.2"
     assert manifest["license"] == "UNLICENSED"
 
 
@@ -81,7 +81,7 @@ def test_readme_documents_the_shared_lifecycle() -> None:
         "新建 Codex CLI 会话",
         "仅限获授权团队成员",
         "gh auth login",
-        "v0.2.1",
+        "v0.2.2",
     ):
         assert required in readme
     assert re.search(r"install-shared-plugin\.ps1", readme)

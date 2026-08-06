@@ -18,10 +18,10 @@ gh auth status
 
 ## 安装
 
-当前稳定发布为 `v0.2.1`。克隆固定 tag 后执行共享安装器：
+当前稳定发布为 `v0.2.2`。克隆固定 tag 后执行共享安装器：
 
 ```powershell
-git clone --branch v0.2.1 --depth 1 `
+git clone --branch v0.2.2 --depth 1 `
   https://github.com/708828375/change-delivery-plugin.git
 Set-Location .\change-delivery-plugin
 powershell -NoProfile -ExecutionPolicy Bypass `
@@ -132,7 +132,7 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 
 获取新的已审核 tag，在新 clone 中重新执行 `install-shared-plugin.ps1`。安装器会先在 staging 中验证新运行时，再替换 host、专用虚拟环境和技能副本；项目与运行数据保持在用户数据目录中。
 
-Marketplace 固定在 `v0.2.1`。发布新版本时必须同步更新 Marketplace ref、插件版本、Python 包版本与 README，再重新安装并新建 Codex CLI 会话。
+Marketplace 固定在 `v0.2.2`。发布新版本时必须同步更新 Marketplace ref、插件版本、Python 包版本与 README，再重新安装并新建 Codex CLI 会话。
 
 ## 卸载
 
