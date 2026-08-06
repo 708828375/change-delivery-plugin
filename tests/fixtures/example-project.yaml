@@ -1,5 +1,5 @@
 project_id: example-backend
-repo_path: C:/workspace/example-project
+repo_path: C:/path/to/example-project
 remote: origin
 remote_fetch_url: C:/fixtures/remotes/example-origin.git
 remote_push_url: C:/fixtures/remotes/example-origin.git
@@ -13,7 +13,7 @@ version_sha_field: git_sha
 required_pre_pr_checks:
   - executable: python
     args: ["-m", "pytest", "test/api"]
-    workdir: C:/workspace/example-project
+    workdir: C:/path/to/example-project
     timeout_seconds: 1800
 credentials: []
 production_enabled: false

@@ -149,7 +149,7 @@ def test_project_dry_run_uses_only_read_adapters(fixture_config) -> None:
 
     report = adapter.discover(dry_run=True)
 
-    assert report.repo_path == Path("C:/workspace/example-project")
+    assert report.repo_path == Path("C:/path/to/example-project")
     assert report.remote == "origin"
     assert report.base_branch == "develop"
     assert report.test_branch == "test"
@@ -216,7 +216,7 @@ def test_cli_start_dry_run_returns_remote_and_version_report_without_writes(
         "dry_run": True,
         "status": "passed",
         "project_id": "example-backend",
-        "repo_path": "C:\\Huamei\\projects\\code\\example_backend",
+        "repo_path": "C:\\path\\to\\example-project",
         "remote": "origin",
         "base_branch": "develop",
         "base_sha": DEVELOP_SHA,

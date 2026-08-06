@@ -11,7 +11,7 @@ from change_delivery.errors import ConfigurationError
 def valid_config_data() -> dict[str, object]:
     return {
         "project_id": "example-backend",
-        "repo_path": "C:/workspace/example-project",
+        "repo_path": "C:/path/to/example-project",
         "remote": "origin",
         "remote_fetch_url": "https://github.com/example-org/example_backend.git",
         "remote_push_url": "git@github.com:example-org/example_backend.git",
@@ -24,7 +24,7 @@ def valid_config_data() -> dict[str, object]:
             {
                 "executable": "python",
                 "args": ["-m", "pytest", "test/api"],
-                "workdir": "C:/workspace/example-project",
+                "workdir": "C:/path/to/example-project",
                 "timeout_seconds": 900,
             }
         ],
@@ -49,7 +49,7 @@ def test_load_project_config_returns_expected_model(tmp_path: Path) -> None:
     assert loaded.config_hash == loaded_again.config_hash
     assert loaded.config.project_id == "example-backend"
     assert loaded.config.repo_path == Path(
-        "C:/workspace/example-project"
+        "C:/path/to/example-project"
     )
     assert loaded.config.remote == "origin"
     assert loaded.config.remote_fetch_url == (
@@ -67,7 +67,7 @@ def test_load_project_config_returns_expected_model(tmp_path: Path) -> None:
     assert loaded.config.version_sha_field == "git_sha"
     assert check.executable == "python"
     assert check.args == ("-m", "pytest", "test/api")
-    assert check.workdir == Path("C:/workspace/example-project")
+    assert check.workdir == Path("C:/path/to/example-project")
     assert check.timeout_seconds == 900
     assert loaded.config.credentials == ()
     assert loaded.config.production_enabled is False
