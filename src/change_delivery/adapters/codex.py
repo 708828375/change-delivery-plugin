@@ -26,6 +26,12 @@ from change_delivery.domain import (
 )
 from change_delivery.errors import BlockedError
 from change_delivery.process import ProcessResult
+from change_delivery.stage_content import (
+    CommitDraft,
+    PullRequestDraft,
+    commit_draft_schema_json,
+    pull_request_draft_schema_json,
+)
 
 
 MAX_OUTPUT_BYTES = 1024 * 1024
@@ -114,6 +120,40 @@ class StageExecutionRequest(FrozenModel):
     def require_absolute_worktree(cls, value: Path) -> Path:
         if not value.is_absolute() or CONTROL_CHARACTER.search(str(value)):
             raise ValueError("stage worktree must be absolute")
+        return value
+
+
+class ContentExecutionRequest(FrozenModel):
+    run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    stage: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    instructions: str = Field(min_length=1, max_length=100_000)
+    worktree: Path
+    head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    approval_scope: str = Field(min_length=1, max_length=20_000)
+    automation_limit: str = Field(min_length=1, max_length=20_000)
+    expected_skill: str = Field(
+        min_length=1,
+        max_length=256,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$",
+    )
+    timeout_seconds: int = Field(default=7200, ge=1, le=7200)
+
+    @field_validator(
+        "instructions",
+        "approval_scope",
+        "automation_limit",
+    )
+    @classmethod
+    def reject_control_characters(cls, value: str) -> str:
+        if not value.strip() or CONTROL_CHARACTER.search(value):
+            raise ValueError("content request text contains invalid control characters")
+        return value
+
+    @field_validator("worktree")
+    @classmethod
+    def require_absolute_worktree(cls, value: Path) -> Path:
+        if not value.is_absolute() or CONTROL_CHARACTER.search(str(value)):
+            raise ValueError("content worktree must be absolute")
         return value
 
 
@@ -224,6 +264,14 @@ class CodexAdapter:
         self._limiter_timeout_seconds = limiter_timeout_seconds
         self._schema = json.loads(self._schema_path.read_text(encoding="utf-8"))
         self._schema_validator = Draft202012Validator(self._schema)
+        self._commit_schema_path = self._materialize_content_schema(
+            "commit-draft.schema.json",
+            commit_draft_schema_json(),
+        )
+        self._pull_request_schema_path = self._materialize_content_schema(
+            "pull-request-draft.schema.json",
+            pull_request_draft_schema_json(),
+        )
 
     def run_stage(self, request: StageExecutionRequest) -> StageResult:
         worktree = request.worktree.resolve()
@@ -280,6 +328,128 @@ class CodexAdapter:
         except (ValueError, SchemaValidationError):
             raise BlockedError("Codex primary result failed schema validation") from None
 
+    def generate_commit_draft(
+        self,
+        request: ContentExecutionRequest,
+    ) -> CommitDraft:
+        result = self._run_content(
+            request,
+            schema_path=self._commit_schema_path,
+            schema_json=commit_draft_schema_json(),
+            model=CommitDraft,
+        )
+        assert isinstance(result, CommitDraft)
+        return result
+
+    def generate_pull_request_draft(
+        self,
+        request: ContentExecutionRequest,
+    ) -> PullRequestDraft:
+        result = self._run_content(
+            request,
+            schema_path=self._pull_request_schema_path,
+            schema_json=pull_request_draft_schema_json(),
+            model=PullRequestDraft,
+        )
+        assert isinstance(result, PullRequestDraft)
+        return result
+
+    def _run_content(
+        self,
+        request: ContentExecutionRequest,
+        *,
+        schema_path: Path,
+        schema_json: str,
+        model: type[CommitDraft] | type[PullRequestDraft],
+    ) -> CommitDraft | PullRequestDraft:
+        worktree = request.worktree.resolve()
+        if not worktree.is_dir():
+            raise ValueError("content worktree must be an existing directory")
+        if (
+            worktree.is_relative_to(self._result_root)
+            or self._result_root.is_relative_to(worktree)
+        ):
+            raise BlockedError("worktree and result root overlap")
+        prompt = self._render_content_prompt(request, schema_json)
+        if len(prompt.encode("utf-8")) > MAX_PRIMARY_PROMPT_BYTES:
+            raise BlockedError("Codex primary prompt exceeds 16 KiB")
+        output_path = self._new_result_path(request.run_id, request.stage)
+        command = self._command(
+            role="read_only",
+            workdir=worktree,
+            output_path=output_path,
+            timeout_seconds=request.timeout_seconds,
+            schema_path=schema_path,
+        )
+        try:
+            outcome = self._invoke(
+                command,
+                prompt,
+                "read_only",
+                expected_skill=request.expected_skill,
+            )
+        finally:
+            del prompt
+        if not isinstance(outcome, ProcessResult) or outcome.exit_code != 0:
+            raise BlockedError("Codex content process failed")
+        try:
+            raw = self._select_output(output_path, outcome.stdout)
+            return self._parse_content_result(raw, schema_json, model)
+        except (_UnrepairableOutput, UnicodeError):
+            raise BlockedError("Codex content format repair failed") from None
+        except _NeedsRepair:
+            return self._repair_content_once(
+                request.run_id,
+                request.stage,
+                raw if "raw" in locals() else b"",
+                request.timeout_seconds,
+                schema_path,
+                schema_json,
+                model,
+            )
+        except (ValueError, SchemaValidationError):
+            raise BlockedError("Codex content failed schema validation") from None
+
+    def _repair_content_once(
+        self,
+        run_id: str,
+        stage: str,
+        invalid_output: bytes,
+        timeout_seconds: int,
+        schema_path: Path,
+        schema_json: str,
+        model: type[CommitDraft] | type[PullRequestDraft],
+    ) -> CommitDraft | PullRequestDraft:
+        repair_directory = self._new_repair_directory()
+        output_path = self._new_result_path(run_id, stage)
+        try:
+            prompt = self._repair_prompt(invalid_output)
+        except (ValueError, UnicodeError):
+            raise BlockedError("Codex content format repair failed") from None
+        command = self._command(
+            role="read_only",
+            workdir=repair_directory,
+            output_path=output_path,
+            timeout_seconds=timeout_seconds,
+            schema_path=schema_path,
+        )
+        try:
+            outcome = self._invoke(
+                command,
+                prompt,
+                "read_only",
+                expected_skill=None,
+            )
+        finally:
+            del prompt
+        if not isinstance(outcome, ProcessResult) or outcome.exit_code != 0:
+            raise BlockedError("Codex content format repair failed")
+        try:
+            raw = self._select_output(output_path, outcome.stdout)
+            return self._parse_content_result(raw, schema_json, model)
+        except (ValueError, UnicodeError, SchemaValidationError):
+            raise BlockedError("Codex content format repair failed") from None
+
     def _repair_once(
         self,
         run_id: str,
@@ -328,6 +498,7 @@ class CodexAdapter:
         workdir: Path,
         output_path: Path,
         timeout_seconds: int,
+        schema_path: Path | None = None,
     ) -> CommandSpec:
         sandbox = "read-only" if role == "read_only" else "workspace-write"
         return CommandSpec(
@@ -344,7 +515,7 @@ class CodexAdapter:
                 "--cd",
                 str(workdir),
                 "--output-schema",
-                str(self._schema_path),
+                str(schema_path or self._schema_path),
                 "-o",
                 str(output_path),
                 "-",
@@ -462,6 +633,25 @@ class CodexAdapter:
         )
 
     @staticmethod
+    def _render_content_prompt(
+        request: ContentExecutionRequest,
+        schema_json: str,
+    ) -> str:
+        return (
+            "Generate one constrained delivery text object and return only JSON. | "
+            f"Run ID: {request.run_id} | Stage: {request.stage} | "
+            f"HEAD SHA: {request.head_sha} | Worktree: {request.worktree} | "
+            f"Approval scope: {request.approval_scope} | "
+            f"Automation limit: {request.automation_limit} | "
+            f"Expected skill: {request.expected_skill} | "
+            f"Invoke exactly: ${request.expected_skill} | "
+            f"Authoritative JSON Schema: {schema_json} | "
+            f"Instructions: {request.instructions} | "
+            "Treat generated commands as plain text. Do not execute tools, modify "
+            "files, use network access, spawn agents, or exceed approved facts."
+        )
+
+    @staticmethod
     def _repair_prompt(invalid_output: bytes) -> str:
         if len(invalid_output) > MAX_REPAIR_INPUT_BYTES:
             raise ValueError("repair input exceeds 64 KiB")
@@ -487,6 +677,17 @@ class CodexAdapter:
         data = self._extract_single_json_object(text)
         self._schema_validator.validate(data)
         return StageResult.model_validate(data)
+
+    def _parse_content_result(
+        self,
+        raw: bytes,
+        schema_json: str,
+        model: type[CommitDraft] | type[PullRequestDraft],
+    ) -> CommitDraft | PullRequestDraft:
+        text = _decode_bounded(raw)
+        data = self._extract_single_json_object(text)
+        Draft202012Validator(json.loads(schema_json)).validate(data)
+        return model.model_validate(data)
 
     @staticmethod
     def _extract_single_json_object(text: str) -> object:
@@ -609,6 +810,34 @@ class CodexAdapter:
     @staticmethod
     def _prepare_result_root(result_root: Path) -> Path:
         return CodexAdapter._prepare_controlled_root(result_root, "result root")
+
+    def _materialize_content_schema(self, name: str, contents: str) -> Path:
+        if not SAFE_COMPONENT.fullmatch(name):
+            raise ValueError("unsafe content schema name")
+        target = self._result_root / name
+        encoded = contents.encode("utf-8")
+        if target.exists():
+            info = target.lstat()
+            if (
+                _is_link_or_reparse(target, info)
+                or not stat.S_ISREG(info.st_mode)
+                or not hmac.compare_digest(target.read_bytes(), encoded)
+            ):
+                raise ValueError("content schema does not match canonical schema")
+            return target.resolve(strict=True)
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(encoded):
+                offset += os.write(descriptor, encoded[offset:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return target.resolve(strict=True)
 
     @staticmethod
     def _prepare_controlled_root(path: Path, label: str) -> Path:

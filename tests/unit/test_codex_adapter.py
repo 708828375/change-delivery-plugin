@@ -13,6 +13,7 @@ import pytest
 
 from change_delivery.adapters.codex import (
     CodexAdapter,
+    ContentExecutionRequest,
     StageExecutionRequest,
     assert_fix_attempt_allowed,
 )
@@ -23,6 +24,12 @@ from change_delivery.domain import (
 )
 from change_delivery.errors import BlockedError
 from change_delivery.process import ProcessResult
+from change_delivery.stage_content import (
+    CommitDraft,
+    PullRequestDraft,
+    commit_draft_schema_json,
+    pull_request_draft_schema_json,
+)
 
 
 SHA = "a" * 40
@@ -148,6 +155,25 @@ def request(tmp_path: Path, **overrides: object) -> StageExecutionRequest:
     return StageExecutionRequest.model_validate(data)
 
 
+def content_request(
+    tmp_path: Path,
+    **overrides: object,
+) -> ContentExecutionRequest:
+    data: dict[str, object] = {
+        "run_id": "run-123",
+        "stage": "commit-content",
+        "instructions": "根据批准内容生成文本，不执行任何命令。",
+        "worktree": tmp_path,
+        "head_sha": SHA,
+        "approval_scope": "已批准需求和当前验证事实。",
+        "automation_limit": "只返回内容，不得写文件或调用网络。",
+        "expected_skill": "requesting-code-review",
+        "timeout_seconds": 300,
+    }
+    data.update(overrides)
+    return ContentExecutionRequest.model_validate(data)
+
+
 def adapter(
     tmp_path: Path,
     runner: object,
@@ -251,6 +277,64 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
         "skills/requesting-code-review",
         "skills/requesting-code-review/SKILL.md",
     )
+
+
+def test_commit_content_uses_canonical_schema_and_does_not_execute_text(
+    tmp_path: Path,
+) -> None:
+    dangerous_text = "feat: 保留文本\n\ngit push origin HEAD:test -f"
+    runner = FakeRunner(json.dumps({"message": dangerous_text}, ensure_ascii=False))
+    codex = adapter(tmp_path, runner)
+
+    result = codex.generate_commit_draft(content_request(tmp_path))
+
+    assert result == CommitDraft(message=dangerous_text)
+    command = runner.commands[0]
+    schema_path = Path(command.args[command.args.index("--output-schema") + 1])
+    assert schema_path.read_text(encoding="utf-8") == commit_draft_schema_json()
+    assert command.args[command.args.index("--sandbox") + 1] == "read-only"
+    assert "--ignore-user-config" in command.args
+    assert "--ignore-rules" in command.args
+    assert "agents.enabled=false" in command.args
+    assert "sandbox_workspace_write.network_access=false" in command.args
+    assert len([item for item in runner.home_snapshots[0] if item.endswith("SKILL.md")]) == 1
+    assert all(spec.executable.endswith("codex.exe") for spec in runner.commands)
+
+
+def test_pull_request_content_uses_only_pull_request_contract(
+    tmp_path: Path,
+) -> None:
+    raw = json.dumps(
+        {"title": "自定义 PR", "body": "## 测试\n\n已通过"},
+        ensure_ascii=False,
+    )
+    runner = FakeRunner(raw)
+    codex = adapter(tmp_path, runner)
+
+    result = codex.generate_pull_request_draft(
+        content_request(tmp_path, stage="pr-content")
+    )
+
+    assert result == PullRequestDraft(title="自定义 PR", body="## 测试\n\n已通过")
+    command = runner.commands[0]
+    schema_path = Path(command.args[command.args.index("--output-schema") + 1])
+    assert schema_path.read_text(encoding="utf-8") == pull_request_draft_schema_json()
+
+
+def test_content_output_gets_one_format_repair_without_authority(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner(
+        "message: 自定义提交",
+        json.dumps({"message": "fix: 自定义提交"}, ensure_ascii=False),
+    )
+    codex = adapter(tmp_path, runner)
+
+    result = codex.generate_commit_draft(content_request(tmp_path))
+
+    assert result.message == "fix: 自定义提交"
+    assert len(runner.commands) == 2
+    assert runner.home_snapshots[1] == ()
 
 
 def test_primary_prompt_treats_review_comment_injection_as_untrusted_data(
