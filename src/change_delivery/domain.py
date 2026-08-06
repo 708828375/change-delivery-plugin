@@ -250,6 +250,7 @@ class RunState(StrEnum):
     IMPLEMENTING = "IMPLEMENTING"
     LOCAL_VALIDATION = "LOCAL_VALIDATION"
     INTERNAL_REVIEW = "INTERNAL_REVIEW"
+    FIXING_INTERNAL_REVIEW = "FIXING_INTERNAL_REVIEW"
     COMMITTING = "COMMITTING"
     PUSHING_FEATURE = "PUSHING_FEATURE"
     PR_DRAFT = "PR_DRAFT"
@@ -605,6 +606,12 @@ class ProjectConfig(FrozenModel):
     )
     test_push_strategy: Literal["force", "force-with-lease"] = (
         "force-with-lease"
+    )
+    max_internal_review_fix_attempts: int = Field(
+        default=3,
+        ge=1,
+        le=3,
+        strict=True,
     )
     github_repository: str = Field(pattern=GITHUB_REPOSITORY_PATTERN)
     version_endpoint: str = Field(

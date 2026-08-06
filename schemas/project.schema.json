@@ -189,6 +189,13 @@
       "title": "Test Push Strategy",
       "type": "string"
     },
+    "max_internal_review_fix_attempts": {
+      "default": 3,
+      "maximum": 3,
+      "minimum": 1,
+      "title": "Max Internal Review Fix Attempts",
+      "type": "integer"
+    },
     "github_repository": {
       "pattern": "^[^\\s/\\x00-\\x1f\\x7f]+/[^\\s/\\x00-\\x1f\\x7f]+$",
       "title": "Github Repository",

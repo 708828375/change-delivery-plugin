@@ -61,6 +61,7 @@ def test_load_project_config_returns_expected_model(tmp_path: Path) -> None:
     assert loaded.config.base_branch == "develop"
     assert loaded.config.test_branch == "test"
     assert loaded.config.test_push_strategy == "force-with-lease"
+    assert loaded.config.max_internal_review_fix_attempts == 3
     assert loaded.config.github_repository == "example-org/example_backend"
     assert loaded.config.version_endpoint == "https://example.test/version"
     assert loaded.config.version_sha_field == "git_sha"
@@ -106,6 +107,7 @@ def test_hash_treats_explicit_and_omitted_defaults_as_equal(tmp_path: Path) -> N
     explicit["credentials"] = []
     explicit["production_enabled"] = False
     explicit["test_push_strategy"] = "force-with-lease"
+    explicit["max_internal_review_fix_attempts"] = 3
     write_yaml(omitted_file, omitted)
     write_yaml(explicit_file, explicit)
 
@@ -136,6 +138,23 @@ def test_hash_changes_when_test_push_strategy_changes(tmp_path: Path) -> None:
     first = valid_config_data()
     second = valid_config_data()
     second["test_push_strategy"] = "force"
+    write_yaml(first_file, first)
+    write_yaml(second_file, second)
+
+    assert (
+        load_project_config(first_file).config_hash
+        != load_project_config(second_file).config_hash
+    )
+
+
+def test_hash_changes_when_internal_review_fix_limit_changes(
+    tmp_path: Path,
+) -> None:
+    first_file = tmp_path / "first.yaml"
+    second_file = tmp_path / "second.yaml"
+    first = valid_config_data()
+    second = valid_config_data()
+    second["max_internal_review_fix_attempts"] = 2
     write_yaml(first_file, first)
     write_yaml(second_file, second)
 

@@ -80,11 +80,27 @@ def test_complete_happy_path_is_allowed_without_stage_skips() -> None:
         assert_transition(RunState.PR_DRAFT, RunState.READY_TO_MERGE, ())
 
 
+def test_internal_review_fix_uses_dedicated_bounded_loop() -> None:
+    assert RunState.FIXING_INTERNAL_REVIEW in ALLOWED_TRANSITIONS[
+        RunState.INTERNAL_REVIEW
+    ]
+    assert RunState.LOCAL_VALIDATION in ALLOWED_TRANSITIONS[
+        RunState.FIXING_INTERNAL_REVIEW
+    ]
+    assert RunState.IMPLEMENTING not in ALLOWED_TRANSITIONS[
+        RunState.INTERNAL_REVIEW
+    ]
+    assert RunState.COMMITTING not in ALLOWED_TRANSITIONS[
+        RunState.FIXING_INTERNAL_REVIEW
+    ]
+
+
 @pytest.mark.parametrize(
     ("current", "target"),
     [
         (RunState.LOCAL_VALIDATION, RunState.IMPLEMENTING),
-        (RunState.INTERNAL_REVIEW, RunState.IMPLEMENTING),
+        (RunState.INTERNAL_REVIEW, RunState.FIXING_INTERNAL_REVIEW),
+        (RunState.FIXING_INTERNAL_REVIEW, RunState.LOCAL_VALIDATION),
         (RunState.MONITORING_CI_REVIEW, RunState.FIXING_CI_REVIEW),
         (RunState.FIXING_CI_REVIEW, RunState.LOCAL_VALIDATION),
         (RunState.DEPLOYING_TEST, RunState.ENVIRONMENT_PREEMPTED),

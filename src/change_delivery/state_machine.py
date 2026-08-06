@@ -79,7 +79,12 @@ def _build_transitions() -> Mapping[RunState, frozenset[RunState]]:
         transitions[current].add(target)
 
     transitions[RunState.LOCAL_VALIDATION].add(RunState.IMPLEMENTING)
-    transitions[RunState.INTERNAL_REVIEW].add(RunState.IMPLEMENTING)
+    transitions[RunState.INTERNAL_REVIEW].add(
+        RunState.FIXING_INTERNAL_REVIEW
+    )
+    transitions[RunState.FIXING_INTERNAL_REVIEW].add(
+        RunState.LOCAL_VALIDATION
+    )
     transitions[RunState.MONITORING_CI_REVIEW].add(
         RunState.FIXING_CI_REVIEW
     )

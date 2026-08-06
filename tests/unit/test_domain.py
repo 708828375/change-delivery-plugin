@@ -294,6 +294,29 @@ def test_project_config_accepts_force_test_push_strategy() -> None:
     project_schema_validator().validate(config.model_dump(mode="json"))
 
 
+def test_project_config_defaults_internal_review_fix_limit_to_three() -> None:
+    project = ProjectConfig.model_validate(valid_project_data())
+
+    assert project.max_internal_review_fix_attempts == 3
+    project_schema_validator().validate(project.model_dump(mode="json"))
+
+
+@pytest.mark.parametrize("value", [0, 4, True])
+def test_project_config_rejects_unsafe_internal_review_fix_limit(
+    value: object,
+) -> None:
+    data = valid_project_data()
+    data["max_internal_review_fix_attempts"] = value
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(data)
+
+    schema_data = valid_project_json_data()
+    schema_data["max_internal_review_fix_attempts"] = value
+    with pytest.raises(JSONSchemaValidationError):
+        project_schema_validator().validate(schema_data)
+
+
 def test_project_config_rejects_unknown_test_push_strategy() -> None:
     data = valid_project_data()
     data["test_push_strategy"] = "force-if-convenient"

@@ -65,6 +65,9 @@ test_push_strategy: force-with-lease
 
 # ExampleProject 当前测试环境流程；只允许用于登记的 test_branch
 test_push_strategy: force
+
+# 内部 Review 发现问题后，最多自动修复、重新测试并再次 Review 3 轮
+max_internal_review_fix_attempts: 3
 ```
 
 `force` 由运行主机使用冻结的提交 SHA 执行，并在推送后重新核对远端
