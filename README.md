@@ -73,6 +73,40 @@ max_internal_review_fix_attempts: 3
 `force` 由运行主机使用冻结的提交 SHA 执行，并在推送后重新核对远端
 测试分支 SHA；它不会放宽功能分支、基线分支或其他分支的强推限制。
 
+### 连续推进
+
+设计方案获得明确批准后，使用 `run` 让固定状态机连续推进，无需人工逐段调用 `resume`：
+
+```powershell
+& "$env:USERPROFILE\.codex\change-delivery\bin\change-delivery.ps1" `
+  run <run-id> --json
+```
+
+一次 `run` 最多处理 32 步，并在以下情况自动暂停：等待设计批准、需要人工决策、依赖或阶段阻塞、等待外部 CI/Review、状态未变化、到达终态或 `READY_TO_MERGE`。返回结果包含 `steps_processed` 和 `step_actions`，便于确认本轮实际推进了哪些阶段。`resume` 仍保留用于单步诊断。
+
+内部 Review 发现可执行问题时，会进入固定闭环：修复 → 本地验证 → 重新 Review。默认最多自动修复 3 轮，达到上限后转为人工决策。PR 标题和正文通过契约校验后，由运行主机自动创建 Draft PR。当前 MVP 始终停在 `READY_TO_MERGE`，不会自动合并或上线生产环境。
+
+### 阶段 Skill 定制
+
+业务阶段与内置 Skill 的对应关系如下：
+
+| 阶段 | Skill | 可定制内容 |
+| --- | --- | --- |
+| 需求方案与计划 | `delivery-planning` | 设计和实施计划要求 |
+| 开发实现 | `delivery-implement` | TDD、编码和项目约束 |
+| 本地验证补充检查 | `delivery-local-validation` | 权威命令通过后的项目补充要求 |
+| 内部 Review | `delivery-review` | Review 重点和严重级别 |
+| Review 修复 | `delivery-review-fix` | 本轮可执行问题的修复要求 |
+| Commit 内容 | `delivery-commit` | commit message 格式、中文标题和正文 |
+| PR 内容 | `delivery-pr` | PR 标题、正文、章节和检查清单 |
+| 测试部署预检 | `delivery-test-deploy` | 测试分支推送前的只读项目检查 |
+| 测试环境验收 | `project-test-acceptance` | 测试场景、资源和清理要求 |
+| 合并前检查 | `delivery-ready-check` | 合并门禁汇总和补充风险检查 |
+
+可以直接修改仓库中对应 Skill 的中文提示词来保留个人或团队习惯。Skill 只能定制阶段内容或收紧检查，不能改变固定状态、remote、分支、push 策略、主机权限和副作用边界，也不能直接执行 commit、push、创建 PR 或 merge。
+
+修改 Skill 后需要重新运行 `install-shared-plugin.ps1`，并新建 Codex CLI 会话；旧会话和未重新安装的发布副本不会自动获得修改。
+
 如需启用自动 tick，请从已安装 host 执行计划任务安装脚本。推荐使用当前用户的
 Codex 认证文件，因为 Task Scheduler 启动的独立进程不会继承安装 PowerShell 的
 临时 `OPENAI_API_KEY`：

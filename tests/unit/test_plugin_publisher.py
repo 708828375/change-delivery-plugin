@@ -6,6 +6,20 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 PUBLISHER = ROOT / "scripts" / "plugin-publisher.ps1"
+EXPECTED_SKILLS = (
+    "change-delivery",
+    "delivery-commit",
+    "delivery-implement",
+    "delivery-local-validation",
+    "delivery-planning",
+    "delivery-pr",
+    "delivery-ready-check",
+    "delivery-review",
+    "delivery-review-fix",
+    "delivery-test-deploy",
+    "project-test-acceptance",
+    "production-release",
+)
 
 
 def run_ps(script: str) -> subprocess.CompletedProcess[str]:
@@ -28,13 +42,15 @@ def run_ps(script: str) -> subprocess.CompletedProcess[str]:
 def make_plugin_source(root: Path, skill_text: str = "new skill") -> Path:
     source = root / "source"
     (source / ".codex-plugin").mkdir(parents=True)
-    (source / "skills" / "change-delivery").mkdir(parents=True)
+    for skill in EXPECTED_SKILLS:
+        (source / "skills" / skill).mkdir(parents=True)
     (source / ".codex-plugin" / "plugin.json").write_text(
         '{"name":"change-delivery-plugin"}', encoding="utf-8"
     )
-    (source / "skills" / "change-delivery" / "SKILL.md").write_text(
-        skill_text, encoding="utf-8"
-    )
+    for skill in EXPECTED_SKILLS:
+        (source / "skills" / skill / "SKILL.md").write_text(
+            skill_text, encoding="utf-8"
+        )
     return source
 
 
@@ -81,6 +97,13 @@ Install-CleanPluginStage $stage '{target}' '{source}'
         ".codex-plugin",
         "skills",
     ]
+    assert {
+        path.name
+        for path in (target / "skills").iterdir()
+        if (path / "SKILL.md").is_file()
+    } == set(EXPECTED_SKILLS)
+    assert not list(target.rglob("__pycache__"))
+    assert not list(target.rglob("*.pyc"))
 
 
 def test_regular_update_replaces_the_managed_plugin_tree(tmp_path: Path) -> None:

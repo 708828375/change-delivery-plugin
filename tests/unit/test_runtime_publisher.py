@@ -6,6 +6,20 @@ import subprocess
 
 ROOT = Path(__file__).parents[2]
 PUBLISHER = ROOT / "scripts" / "runtime-publisher.ps1"
+EXPECTED_SKILLS = (
+    "change-delivery",
+    "delivery-commit",
+    "delivery-implement",
+    "delivery-local-validation",
+    "delivery-planning",
+    "delivery-pr",
+    "delivery-ready-check",
+    "delivery-review",
+    "delivery-review-fix",
+    "delivery-test-deploy",
+    "project-test-acceptance",
+    "production-release",
+)
 
 
 def run_ps(script: str) -> subprocess.CompletedProcess[str]:
@@ -34,12 +48,7 @@ def make_runtime_source(root: Path, value: str = "new") -> Path:
     (source / "src" / "change_delivery").mkdir(parents=True)
     (source / "schemas").mkdir()
     (source / "scripts").mkdir()
-    for skill in (
-        "delivery-planning",
-        "delivery-implement",
-        "delivery-review",
-        "project-test-acceptance",
-    ):
+    for skill in EXPECTED_SKILLS:
         skill_root = source / "plugin" / "change-delivery-plugin" / "skills" / skill
         skill_root.mkdir(parents=True)
         (skill_root / "SKILL.md").write_text(
@@ -83,7 +92,6 @@ Assert-ClosedRuntimeHostTree $stage
 
     assert result.returncode == 0, result.stderr + result.stdout
 
-
 def test_runtime_publish_atomically_replaces_a_managed_host(tmp_path: Path) -> None:
     source = make_runtime_source(tmp_path, "new")
     data_root = tmp_path / "data"
@@ -117,6 +125,13 @@ Install-CleanRuntimeHostStage $stage '{ps_literal(host)}'
         encoding="utf-8"
     )
     assert not list(data_root.glob(".host.backup-*"))
+    assert {
+        path.name
+        for path in (host / "skills").iterdir()
+        if (path / "SKILL.md").is_file()
+    } == set(EXPECTED_SKILLS)
+    assert not list(host.rglob("__pycache__"))
+    assert not list(host.rglob("*.pyc"))
 
 
 def test_unmanaged_host_is_preserved(tmp_path: Path) -> None:
