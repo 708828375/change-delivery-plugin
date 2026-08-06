@@ -20,7 +20,7 @@ from change_delivery.adapters.codex import (
     StageExecutionRequest,
     assert_fix_attempt_allowed,
 )
-from change_delivery.stage_content import CommitDraft
+from change_delivery.stage_content import CommitDraft, PullRequestDraft
 from change_delivery.adapters.git import GitAdapter
 from change_delivery.adapters.http import ReadOnlyHttpClient
 from change_delivery.adapters.project import (
@@ -48,7 +48,7 @@ _STAGE_SKILLS = {
     "review_fix": "delivery-review-fix",
     "acceptance": "project-test-acceptance",
 }
-_CONTENT_SKILLS = {"delivery-commit"}
+_CONTENT_SKILLS = {"delivery-commit", "delivery-pr"}
 
 
 def environment_secrets(names: tuple[str, ...]) -> dict[str, str]:
@@ -69,12 +69,25 @@ class RuntimeStageExecutor:
         *,
         runner: ProcessRunner | None = None,
         codex_factory: object | None = None,
+        git_factory: Callable[[ProjectConfig], object] | None = None,
     ) -> None:
         self._repository = repository
         self._plugin_root = plugin_root.resolve()
         self._runner = runner or ProcessRunner(environment_secrets)
         self._codex_factory = codex_factory
         self._codex_adapter: CodexAdapter | None = None
+        self._git_factory = git_factory or self._default_git
+
+    @staticmethod
+    def _default_git(config: ProjectConfig) -> GitAdapter:
+        return GitAdapter(
+            config.repo_path,
+            remote=config.remote,
+            base_branch=config.base_branch,
+            test_branch=config.test_branch,
+            expected_fetch_url=config.remote_fetch_url,
+            expected_push_url=config.remote_push_url,
+        )
 
     def execute(
         self,
@@ -301,6 +314,76 @@ class RuntimeStageExecutor:
             )
         )
         return draft, self._skill_sha256("delivery-commit")
+
+    def generate_pull_request_draft(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> tuple[PullRequestDraft, str, str]:
+        if run.head_sha is None:
+            raise ValueError("PR content requires the current head SHA")
+        artifacts = {
+            name: contents.decode("utf-8")
+            for name, contents in self._repository.get_approved_artifacts(
+                run.run_id
+            ).items()
+        }
+        facts = []
+        for evidence in self._repository.list_evidence(run.run_id):
+            if evidence.kind not in {
+                "local_validation_passed",
+                "internal_review_passed",
+                "head_sha_verified",
+            }:
+                continue
+            payload = json.loads(evidence.payload_json)
+            if type(payload) is dict and payload.get("sha") == run.head_sha:
+                facts.append(
+                    {
+                        "evidence_id": evidence.evidence_id,
+                        "kind": evidence.kind,
+                        "payload": payload,
+                        "sha256": evidence.sha256,
+                    }
+                )
+        git = self._git_factory(config)
+        diff_summary = git.commit_diff_summary(  # type: ignore[attr-defined]
+            self._worktree(run.run_id),
+            run.head_sha,
+        )
+        scope_data = {
+            "approved_artifacts": artifacts,
+            "diff_summary": diff_summary,
+            "head_sha": run.head_sha,
+            "test_and_review_facts": facts,
+        }
+        scope = json.dumps(
+            scope_data,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        draft = self._codex().generate_pull_request_draft(
+            ContentExecutionRequest(
+                run_id=run.run_id,
+                stage="pr-content",
+                instructions=(
+                    "根据已批准产物、准确 head SHA、diff 摘要以及测试和 Review "
+                    "事实生成 Draft PR 标题与正文；只返回契约 JSON。"
+                ),
+                worktree=self._worktree(run.run_id),
+                head_sha=run.head_sha,
+                approval_scope=scope,
+                automation_limit="只生成 PR 内容，不得调用 gh 或创建 PR。",
+                expected_skill="delivery-pr",
+                timeout_seconds=config.codex_timeout_seconds,
+            )
+        )
+        return (
+            draft,
+            self._skill_sha256("delivery-pr"),
+            sha256_payload(scope_data),
+        )
 
     def _codex(self) -> CodexAdapter:
         if self._codex_adapter is not None:

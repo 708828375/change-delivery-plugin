@@ -32,7 +32,8 @@ from change_delivery.domain import (
     StageResult,
     StepOutcome,
 )
-from change_delivery.stage_content import CommitDraft
+from change_delivery.redaction import redact_text
+from change_delivery.stage_content import CommitDraft, PullRequestDraft
 from change_delivery.evidence import sha256_payload
 from change_delivery.repository import RunRepository
 from change_delivery.process import ProcessTimeoutError
@@ -1308,7 +1309,7 @@ class Orchestrator:
                 or not message.endswith(f"Change-Delivery-Run: {run.run_id}")
             ):
                 raise ValueError("commit message evidence is invalid")
-            candidates.append((message, evidence))
+            candidates.append((message, evidence.reference))
         if len(candidates) > 1:
             raise ValueError("commit message evidence is ambiguous")
         if candidates:
@@ -1842,6 +1843,7 @@ class Orchestrator:
                 blocked_reason="run head SHA is missing",
             )
         branch = self._feature_branch(run)
+        title, body, content_reference = self._pr_content_for_head(run, config)
         identity = f"{config.github_repository}:{branch}:{run.head_sha}"
         key = f"draft_pr:{run.run_id}:{identity}"
         try:
@@ -1874,8 +1876,8 @@ class Orchestrator:
                 created = github.ensure_draft_pr(
                     branch,
                     config.base_branch,
-                    f"chore: delivery {run.run_id}",
-                    f"Automated delivery run: {run.run_id}",
+                    title,
+                    body,
                 )
                 number = self._validate_pr_fact(
                     created, branch, config.base_branch, run.head_sha
@@ -1901,14 +1903,118 @@ class Orchestrator:
             RunState.PR_DRAFT,
             RunState.DEPLOYING_TEST,
             "DRAFT_PR_RECONCILED",
-            (reference,),
+            (content_reference, reference),
             run_updates={"pr_number": number},
         )
         return StepOutcome(
             state=RunState.DEPLOYING_TEST,
             action="draft_pr_reconciled",
-            evidence_ids=(reference.evidence_id,),
+            evidence_ids=(content_reference.evidence_id, reference.evidence_id),
         )
+
+    def _pr_content_for_head(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+    ) -> tuple[str, str, object]:
+        assert run.head_sha is not None
+        marker = f"<!-- change-delivery-run:{run.run_id}:{run.head_sha} -->"
+        candidates = []
+        for evidence in self.repository.list_evidence(run.run_id):
+            if evidence.kind != "pr_content_generated":
+                continue
+            payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(evidence.sha256, sha256_payload(payload)):
+                raise ValueError("PR content evidence digest mismatch")
+            if type(payload) is not dict or payload.get("head_sha") != run.head_sha:
+                continue
+            if set(payload) != {
+                "body",
+                "body_sha256",
+                "head_sha",
+                "input_facts_sha256",
+                "skill_sha256",
+                "title",
+                "title_sha256",
+            }:
+                raise ValueError("PR content evidence is invalid")
+            title = payload["title"]
+            body = payload["body"]
+            if (
+                not isinstance(title, str)
+                or not isinstance(body, str)
+                or not hmac.compare_digest(
+                    str(payload["title_sha256"]),
+                    hashlib.sha256(title.encode("utf-8")).hexdigest(),
+                )
+                or not hmac.compare_digest(
+                    str(payload["body_sha256"]),
+                    hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                )
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(payload["skill_sha256"])
+                )
+                is None
+                or re.fullmatch(
+                    r"[0-9a-f]{64}", str(payload["input_facts_sha256"])
+                )
+                is None
+                or not body.endswith(marker)
+            ):
+                raise ValueError("PR content evidence is invalid")
+            PullRequestDraft(title=title, body=body)
+            candidates.append((title, body, evidence.reference))
+        if len(candidates) > 1:
+            raise ValueError("PR content evidence is ambiguous")
+        if candidates:
+            return candidates[0]
+        generator = self.content_generator
+        if generator is None:
+            raise DependencyUnavailable("PR content generator unavailable")
+        generated = generator.generate_pull_request_draft(  # type: ignore[attr-defined]
+            run,
+            config,
+        )
+        if (
+            type(generated) is not tuple
+            or len(generated) != 3
+            or not isinstance(generated[0], PullRequestDraft)
+            or re.fullmatch(r"[0-9a-f]{64}", str(generated[1])) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(generated[2])) is None
+        ):
+            raise ValueError("PR content generator returned an invalid result")
+        draft, skill_sha256, input_facts_sha256 = generated
+        if "<!-- change-delivery-run:" in draft.body:
+            raise ValueError("PR draft may not provide the host idempotence marker")
+        body = f"{draft.body.rstrip()}\n\n{marker}"
+        final = PullRequestDraft(title=draft.title, body=body)
+        if (
+            redact_text(final.title, {}) != final.title
+            or redact_text(final.body, {}) != final.body
+        ):
+            raise ValueError("PR content contains credential-shaped text")
+        binding = hashlib.sha256(
+            f"{run.run_id}:{run.head_sha}".encode("utf-8")
+        ).hexdigest()
+        reference = self.repository.register_evidence(
+            run.run_id,
+            f"pr-content:{binding}",
+            "pr_content_generated",
+            {
+                "body": final.body,
+                "body_sha256": hashlib.sha256(
+                    final.body.encode("utf-8")
+                ).hexdigest(),
+                "head_sha": run.head_sha,
+                "input_facts_sha256": input_facts_sha256,
+                "skill_sha256": skill_sha256,
+                "title": final.title,
+                "title_sha256": hashlib.sha256(
+                    final.title.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        return final.title, final.body, reference
 
     @staticmethod
     def _validate_pr_fact(

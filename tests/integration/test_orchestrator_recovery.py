@@ -45,7 +45,7 @@ from change_delivery.runtime import (
     RuntimeStageExecutor,
     RuntimeTestEnvironmentPort,
 )
-from change_delivery.stage_content import CommitDraft
+from change_delivery.stage_content import CommitDraft, PullRequestDraft
 
 
 SHA = "a" * 40
@@ -140,6 +140,9 @@ class FakeGit:
         self.remote_feature_sha = expected_sha
         return expected_sha
 
+    def commit_diff_summary(self, worktree: Path, head_sha: str) -> str:
+        return f"commit {head_sha}\n 2 files changed"
+
 
 @dataclass
 class FakeGitHub:
@@ -157,11 +160,13 @@ class FakeGitHub:
     reply_calls: int = 0
     replied_comments: dict[str, list[str]] = field(default_factory=dict)
     hide_reply_once: bool = False
+    created_contents: list[tuple[str, str]] = field(default_factory=list)
 
     def ensure_draft_pr(
         self, branch: str, base: str, title: str, body: str
     ) -> PullRequestRef:
         self.ensure_calls += 1
+        self.created_contents.append((title, body))
         return self._pr(branch, base)
 
     def find_pr(self, branch: str, base: str) -> PullRequestRef | None:
@@ -264,6 +269,7 @@ class FakeStageExecutor:
         self.findings = findings
         self.calls: list[str] = []
         self.commit_draft_calls = 0
+        self.pull_request_draft_calls = 0
 
     def generate_commit_draft(
         self,
@@ -274,6 +280,21 @@ class FakeStageExecutor:
     ) -> tuple[CommitDraft, str]:
         self.commit_draft_calls += 1
         return CommitDraft(message="feat(delivery): 使用阶段 Skill"), "f" * 64
+
+    def generate_pull_request_draft(
+        self,
+        run: object,
+        project: object,
+    ) -> tuple[PullRequestDraft, str, str]:
+        self.pull_request_draft_calls += 1
+        return (
+            PullRequestDraft(
+                title="自定义交付 PR",
+                body="## 变更\n\n- 已完成批准范围内的实现",
+            ),
+            "d" * 64,
+            "e" * 64,
+        )
 
     def execute(
         self,
@@ -427,6 +448,7 @@ class Fixture:
         return run_id
 
     def orchestrator(self) -> Orchestrator:
+        content_generator = FakeStageExecutor(self.repository)
         return Orchestrator(
             repository=self.repository,
             plugin_root=self.root,
@@ -435,6 +457,7 @@ class Fixture:
             github_factory=lambda _: self.github,
             clock=lambda: datetime(2026, 7, 29, tzinfo=UTC),
             approval_validator=lambda run, project, root: True,
+            content_generator=content_generator,
         )
 
 
@@ -659,6 +682,112 @@ def test_pr_step_is_separate_side_effect(fixture: Fixture) -> None:
     assert fixture.repository.get_run(run_id).pr_number == 42
 
 
+def test_pr_content_is_generated_bound_and_passed_to_github(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.PR_DRAFT)
+    generator = FakeStageExecutor(fixture.repository)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        content_generator=generator,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.DEPLOYING_TEST
+    marker = f"<!-- change-delivery-run:{run_id}:{SHA} -->"
+    assert fixture.github.created_contents == [
+        (
+            "自定义交付 PR",
+            "## 变更\n\n- 已完成批准范围内的实现\n\n" + marker,
+        )
+    ]
+    assert generator.pull_request_draft_calls == 1
+    generated = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "pr_content_generated"
+    ]
+    assert len(generated) == 1
+    payload = json.loads(generated[0].payload_json)
+    assert payload["head_sha"] == SHA
+    assert payload["title"] == "自定义交付 PR"
+    assert payload["body"].endswith(marker)
+    assert payload["skill_sha256"] == "d" * 64
+    assert payload["input_facts_sha256"] == "e" * 64
+
+
+def test_pr_content_is_reused_when_create_result_is_uncertain(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.PR_DRAFT)
+    generator = FakeStageExecutor(fixture.repository)
+    original_ensure = fixture.github.ensure_draft_pr
+
+    def uncertain_create(
+        branch: str,
+        base: str,
+        title: str,
+        body: str,
+    ) -> PullRequestRef:
+        original_ensure(branch, base, title, body)
+        raise TimeoutError("uncertain")
+
+    fixture.github.ensure_draft_pr = uncertain_create  # type: ignore[method-assign]
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        content_generator=generator,
+    )
+    assert orchestrator.step(run_id).action == "pr_reconciliation_pending"
+    fixture.github.ensure_draft_pr = original_ensure  # type: ignore[method-assign]
+
+    assert orchestrator.step(run_id).state is RunState.DEPLOYING_TEST
+    assert generator.pull_request_draft_calls == 1
+    assert fixture.github.ensure_calls == 1
+
+
+def test_pr_content_with_credentials_never_reaches_github(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.PR_DRAFT)
+
+    class UnsafeGenerator(FakeStageExecutor):
+        def generate_pull_request_draft(
+            self,
+            run: object,
+            project: object,
+        ) -> tuple[PullRequestDraft, str, str]:
+            return (
+                PullRequestDraft(title="PR", body="token=secret-value"),
+                "d" * 64,
+                "e" * 64,
+            )
+
+    outcome = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        content_generator=UnsafeGenerator(fixture.repository),
+    ).step(run_id)
+
+    assert outcome.state is RunState.PR_DRAFT
+    assert fixture.github.ensure_calls == 0
+    assert "ValueError" in (outcome.blocked_reason or "")
+
+
 def test_pending_pr_only_queries_and_never_replays_create(fixture: Fixture) -> None:
     run_id = fixture.create(RunState.PR_DRAFT)
     branch = f"feature/{run_id}"
@@ -852,6 +981,7 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
             "delivery-planning",
             "delivery-implement",
             "delivery-commit",
+            "delivery-pr",
             "delivery-review",
             "delivery-review-fix",
             "project-test-acceptance",
@@ -875,6 +1005,7 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
             "delivery-planning",
             "delivery-implement",
             "delivery-commit",
+            "delivery-pr",
             "delivery-review",
             "delivery-review-fix",
             "project-test-acceptance",
@@ -2287,6 +2418,58 @@ def test_runtime_commit_message_generator_binds_skill_and_tree(
         "requirement.md",
     }
     assert re.fullmatch(r"[0-9a-f]{64}", skill_sha256)
+
+
+def test_runtime_pr_content_receives_diff_and_current_verification_facts(
+    fixture: Fixture,
+) -> None:
+    run_id, _ = approve_fixture_run(fixture)
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+    for kind in ("local_validation_passed", "internal_review_passed"):
+        fixture.repository.register_evidence(
+            run_id,
+            f"current-{kind}",
+            kind,
+            {"sha": SHA, "passed": True},
+        )
+    captured: list[object] = []
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            raise AssertionError("stage execution is not expected")
+
+        def generate_pull_request_draft(
+            self,
+            request: object,
+        ) -> PullRequestDraft:
+            captured.append(request)
+            return PullRequestDraft(title="自定义 PR", body="正文")
+
+    runtime = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        codex_factory=lambda: FakeCodex(),
+        git_factory=lambda project: fixture.git,
+    )
+
+    draft, skill_sha256, facts_sha256 = runtime.generate_pull_request_draft(
+        fixture.repository.get_run(run_id),
+        config(fixture.root),
+    )
+
+    assert draft.title == "自定义 PR"
+    request = captured[0]
+    assert request.expected_skill == "delivery-pr"  # type: ignore[attr-defined]
+    scope = json.loads(request.approval_scope)  # type: ignore[attr-defined]
+    assert scope["head_sha"] == SHA
+    assert "2 files changed" in scope["diff_summary"]
+    assert {item["kind"] for item in scope["test_and_review_facts"]} == {
+        "local_validation_passed",
+        "internal_review_passed",
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", skill_sha256)
+    assert facts_sha256 == sha256_payload(scope)
 
 
 def test_commit_message_is_reused_after_uncertain_execution(

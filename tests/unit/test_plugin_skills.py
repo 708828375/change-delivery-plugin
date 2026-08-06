@@ -153,6 +153,25 @@ def test_delivery_commit_only_generates_custom_message_json() -> None:
         assert required in body
 
 
+def test_delivery_pr_only_generates_custom_title_and_body_json() -> None:
+    body, metadata = _skill("delivery-pr")
+
+    assert metadata["policy"]["allow_implicit_invocation"] is False
+    assert "$delivery-pr" in metadata["interface"]["default_prompt"]
+    for required in (
+        '"title"',
+        '"body"',
+        "自定义",
+        "准确 head SHA",
+        "测试和 Review 事实",
+        "不得调用 gh",
+        "不得创建 PR",
+        "不得声称",
+        "凭据",
+    ):
+        assert required in body
+
+
 def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:
     body, metadata = _skill("project-test-acceptance")
     checklist = (

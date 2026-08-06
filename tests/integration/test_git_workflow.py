@@ -733,6 +733,9 @@ def test_worktree_facts_and_commit_tree_cas_return_exact_commit_fact(
         "commit_tree_sha": expected_tree,
         "message": "feat: exact commit\n\nChange-Delivery-Run: run-exact",
     }
+    summary = adapter.commit_diff_summary(worktree, new_sha)
+    assert "exact.txt" in summary
+    assert "Change-Delivery-Run: run-exact" in summary
     assert git(worktree, "status", "--short").stdout == ""
 
 

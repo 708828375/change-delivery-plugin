@@ -1,0 +1,7 @@
+interface:
+  display_name: "生成交付 PR 内容"
+  short_description: "按项目模板生成已验证变更的 Draft PR 标题与正文"
+  default_prompt: "使用 $delivery-pr 为当前已推送且已验证的交付变更生成 Draft PR 内容。"
+
+policy:
+  allow_implicit_invocation: false

@@ -580,6 +580,28 @@ class GitAdapter:
         self._validate_branch(branch)
         return branch
 
+    def commit_diff_summary(self, workdir: Path, head_sha: str) -> str:
+        resolved = self._require_secondary_worktree(workdir)
+        head = self._normalize_sha(head_sha)
+        if self._head_sha(resolved) != head:
+            raise GitError("diff_summary", reason="worktree head changed")
+        summary = self._run(
+            "diff_summary",
+            (
+                "show",
+                "--stat",
+                "--format=medium",
+                "--no-renames",
+                head,
+            ),
+            workdir=resolved,
+        ).stdout
+        if len(summary.encode("utf-8")) > 20_000:
+            raise GitError("diff_summary", reason="summary exceeds 20 KiB")
+        if not summary.strip():
+            raise GitError("diff_summary", reason="summary is empty")
+        return summary
+
     @_project_write
     def staged_tree(self, workdir: Path, *, stage_all: bool) -> str:
         resolved = self._require_secondary_worktree(workdir)
