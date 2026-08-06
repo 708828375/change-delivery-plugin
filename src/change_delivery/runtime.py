@@ -16,9 +16,11 @@ from uuid import uuid4
 
 from change_delivery.adapters.codex import (
     CodexAdapter,
+    ContentExecutionRequest,
     StageExecutionRequest,
     assert_fix_attempt_allowed,
 )
+from change_delivery.stage_content import CommitDraft
 from change_delivery.adapters.git import GitAdapter
 from change_delivery.adapters.http import ReadOnlyHttpClient
 from change_delivery.adapters.project import (
@@ -46,6 +48,7 @@ _STAGE_SKILLS = {
     "review_fix": "delivery-review-fix",
     "acceptance": "project-test-acceptance",
 }
+_CONTENT_SKILLS = {"delivery-commit"}
 
 
 def environment_secrets(names: tuple[str, ...]) -> dict[str, str]:
@@ -258,6 +261,47 @@ class RuntimeStageExecutor:
             next_action="continue" if passed else "fix",
         )
 
+    def generate_commit_draft(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        reviewed_tree_sha: str,
+        expected_parent_sha: str,
+    ) -> tuple[CommitDraft, str]:
+        artifacts = {
+            name: contents.decode("utf-8")
+            for name, contents in self._repository.get_approved_artifacts(
+                run.run_id
+            ).items()
+        }
+        scope = json.dumps(
+            {
+                "approved_artifacts": artifacts,
+                "expected_parent_sha": expected_parent_sha,
+                "reviewed_tree_sha": reviewed_tree_sha,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        draft = self._codex().generate_commit_draft(
+            ContentExecutionRequest(
+                run_id=run.run_id,
+                stage="commit-content",
+                instructions=(
+                    "根据已批准产物和已 Review 的准确树生成 commit message；"
+                    "只返回契约 JSON，不得执行 Git。"
+                ),
+                worktree=self._worktree(run.run_id),
+                head_sha=expected_parent_sha,
+                approval_scope=scope,
+                automation_limit="只生成 commit message，不得修改文件或执行副作用。",
+                expected_skill="delivery-commit",
+                timeout_seconds=config.codex_timeout_seconds,
+            )
+        )
+        return draft, self._skill_sha256("delivery-commit")
+
     def _codex(self) -> CodexAdapter:
         if self._codex_adapter is not None:
             return self._codex_adapter
@@ -333,12 +377,23 @@ class RuntimeStageExecutor:
             candidates[0],
         )
         registry: dict[str, Path] = {}
-        for name in set(_STAGE_SKILLS.values()):
+        for name in set(_STAGE_SKILLS.values()) | _CONTENT_SKILLS:
             source = skills_root / name
             if not (source / "SKILL.md").is_file():
                 raise RuntimeError(f"approved Codex skill is unavailable: {name}")
             registry[name] = source.resolve()
         return registry
+
+    def _skill_sha256(self, name: str) -> str:
+        source_root = Path(__file__).resolve().parents[2]
+        skill = self._skill_registry(source_root)[name]
+        digest = hashlib.sha256()
+        for path in sorted(item for item in skill.rglob("*") if item.is_file()):
+            digest.update(path.relative_to(skill).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
 
     def _worktree(self, run_id: str) -> Path:
         path = self._checked_worktree_path(run_id)
@@ -1065,6 +1120,7 @@ class RuntimeGitWorkspacePort:
         self,
         run: RunRecord,
         config: ProjectConfig,
+        message: str,
     ) -> dict[str, object] | None:
         if run.head_sha is None:
             return None
@@ -1075,7 +1131,7 @@ class RuntimeGitWorkspacePort:
         fact = adapter.head_commit_fact(path)
         if (
             fact["parent_sha"] != run.head_sha
-            or fact["message"] != self._commit_message(run.run_id)
+            or fact["message"] != message
         ):
             return None
         return {
@@ -1088,6 +1144,7 @@ class RuntimeGitWorkspacePort:
         self,
         run: RunRecord,
         config: ProjectConfig,
+        message: str,
     ) -> dict[str, object]:
         if run.head_sha is None:
             raise ValueError("run head SHA is missing")
@@ -1096,7 +1153,7 @@ class RuntimeGitWorkspacePort:
         expected_tree = self._reviewed_tree(run.run_id)
         new_sha = adapter.commit_tree_cas(
             path,
-            self._commit_message(run.run_id),
+            message,
             expected_parent=run.head_sha,
             expected_tree=expected_tree,
         )
@@ -1171,11 +1228,6 @@ class RuntimeGitWorkspacePort:
         path.relative_to(self._plugin_root)
         return path
 
-    @staticmethod
-    def _commit_message(run_id: str) -> str:
-        return f"chore(delivery): {run_id}"
-
-
 class RuntimeCommitPort:
     def __init__(self, workspace: RuntimeGitWorkspacePort) -> None:
         self._workspace = workspace
@@ -1194,11 +1246,21 @@ class RuntimeCommitPort:
     ) -> str:
         return self._workspace.review_tree(run, config)
 
-    def query(self, run: RunRecord, config: ProjectConfig) -> object:
-        return self._workspace.query_commit(run, config)
+    def query(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        message: str,
+    ) -> object:
+        return self._workspace.query_commit(run, config, message)
 
-    def execute(self, run: RunRecord, config: ProjectConfig) -> object:
-        return self._workspace.execute_commit(run, config)
+    def execute(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        message: str,
+    ) -> object:
+        return self._workspace.execute_commit(run, config, message)
 
 
 class RuntimeCleanupPort:

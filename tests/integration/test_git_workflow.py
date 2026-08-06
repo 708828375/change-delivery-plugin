@@ -100,9 +100,14 @@ class RecordingRunner:
             }
         )
 
-    def run(self, spec: CommandSpec) -> ProcessResult:
+    def run(
+        self,
+        spec: CommandSpec,
+        *,
+        stdin_text: str | None = None,
+    ) -> ProcessResult:
         self.specs.append(spec)
-        return self.delegate.run(spec)
+        return self.delegate.run(spec, stdin_text=stdin_text)
 
 
 def git_operation_args(args: tuple[str, ...]) -> tuple[str, ...]:
@@ -122,7 +127,12 @@ class HookedRunner(RecordingRunner):
         self._hook_command = command
         self._hook = hook
 
-    def run(self, spec: CommandSpec) -> ProcessResult:
+    def run(
+        self,
+        spec: CommandSpec,
+        *,
+        stdin_text: str | None = None,
+    ) -> ProcessResult:
         operation = git_operation_args(spec.args)
         if operation and operation[0] == self._hook_command:
             hook = self._hook
@@ -130,7 +140,7 @@ class HookedRunner(RecordingRunner):
             self._hook = None
             assert hook is not None
             hook()
-        return super().run(spec)
+        return super().run(spec, stdin_text=stdin_text)
 
 
 def adapter_for(
@@ -686,7 +696,7 @@ def test_commit_all_rejects_empty_commit_and_unsafe_message(
 
     with pytest.raises(GitError, match="no changes"):
         adapter.commit_all(worktree, "feat: nothing")
-    for message in ("", " \t", "subject\nbody", "subject\x00body"):
+    for message in ("", " \t", "subject\rbody", "subject\x00body"):
         with pytest.raises(ValueError):
             adapter.commit_all(worktree, message)
 
@@ -709,7 +719,7 @@ def test_worktree_facts_and_commit_tree_cas_return_exact_commit_fact(
     expected_tree = adapter.staged_tree(worktree, stage_all=True)
     new_sha = adapter.commit_tree_cas(
         worktree,
-        "feat: exact commit",
+        "feat: exact commit\n\nChange-Delivery-Run: run-exact",
         expected_parent=base_sha,
         expected_tree=expected_tree,
     )
@@ -721,7 +731,7 @@ def test_worktree_facts_and_commit_tree_cas_return_exact_commit_fact(
         "new_head_sha": new_sha,
         "parent_sha": base_sha,
         "commit_tree_sha": expected_tree,
-        "message": "feat: exact commit",
+        "message": "feat: exact commit\n\nChange-Delivery-Run: run-exact",
     }
     assert git(worktree, "status", "--short").stdout == ""
 

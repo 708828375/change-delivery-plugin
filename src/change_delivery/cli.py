@@ -384,6 +384,7 @@ class CliServices:
                 worktree_port=workspace,
                 commit_port=RuntimeCommitPort(workspace),
                 cleanup_port=RuntimeCleanupPort(workspace),
+                content_generator=stage_executor,
             )
         return self.orchestrator
 

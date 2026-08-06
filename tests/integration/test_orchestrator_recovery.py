@@ -8,6 +8,7 @@ from io import StringIO
 import hashlib
 import json
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -44,6 +45,7 @@ from change_delivery.runtime import (
     RuntimeStageExecutor,
     RuntimeTestEnvironmentPort,
 )
+from change_delivery.stage_content import CommitDraft
 
 
 SHA = "a" * 40
@@ -261,6 +263,17 @@ class FakeStageExecutor:
         self.status = status
         self.findings = findings
         self.calls: list[str] = []
+        self.commit_draft_calls = 0
+
+    def generate_commit_draft(
+        self,
+        run: object,
+        project: object,
+        reviewed_tree_sha: str,
+        expected_parent_sha: str,
+    ) -> tuple[CommitDraft, str]:
+        self.commit_draft_calls += 1
+        return CommitDraft(message="feat(delivery): 使用阶段 Skill"), "f" * 64
 
     def execute(
         self,
@@ -355,6 +368,7 @@ class FakeCommitPort:
         self.execute_calls = 0
         self.review_tree_calls = 0
         self.validation_tree_calls = 0
+        self.messages: list[str] = []
 
     def validation_tree(self, run: object, project: object) -> str:
         self.validation_tree_calls += 1
@@ -364,12 +378,24 @@ class FakeCommitPort:
         self.review_tree_calls += 1
         return self.tree_sha
 
-    def query(self, run: object, project: object) -> dict[str, object] | None:
+    def query(
+        self,
+        run: object,
+        project: object,
+        message: str,
+    ) -> dict[str, object] | None:
         self.query_calls += 1
+        self.messages.append(message)
         return self.observed
 
-    def execute(self, run: object, project: object) -> dict[str, object]:
+    def execute(
+        self,
+        run: object,
+        project: object,
+        message: str,
+    ) -> dict[str, object]:
         self.execute_calls += 1
+        self.messages.append(message)
         self.observed = {
             "new_head_sha": NEW_SHA,
             "commit_tree_sha": self.commit_tree_sha,
@@ -825,6 +851,7 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
     for name in (
             "delivery-planning",
             "delivery-implement",
+            "delivery-commit",
             "delivery-review",
             "delivery-review-fix",
             "project-test-acceptance",
@@ -847,6 +874,7 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
         "change-delivery",
             "delivery-planning",
             "delivery-implement",
+            "delivery-commit",
             "delivery-review",
             "delivery-review-fix",
             "project-test-acceptance",
@@ -2173,6 +2201,139 @@ def test_commit_derives_review_evidence_for_new_head(
     assert payload["passed"] is True
 
 
+def test_commit_message_is_generated_bound_and_passed_to_commit_port(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+
+    assert orchestrator.step(run_id).state is RunState.PUSHING_FEATURE
+
+    expected_message = (
+        "feat(delivery): 使用阶段 Skill\n\n"
+        f"Change-Delivery-Run: {run_id}"
+    )
+    assert commit.messages == [expected_message, expected_message]
+    assert executor.commit_draft_calls == 1
+    generated = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "commit_message_generated"
+    ]
+    assert len(generated) == 1
+    payload = json.loads(generated[0].payload_json)
+    assert payload == {
+        "expected_parent_sha": SHA,
+        "message": expected_message,
+        "message_sha256": hashlib.sha256(
+            expected_message.encode("utf-8")
+        ).hexdigest(),
+        "reviewed_tree_sha": TREE_SHA,
+        "skill_sha256": "f" * 64,
+    }
+
+
+def test_runtime_commit_message_generator_binds_skill_and_tree(
+    fixture: Fixture,
+) -> None:
+    run_id, _ = approve_fixture_run(fixture)
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+    captured: list[object] = []
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            raise AssertionError("stage execution is not expected")
+
+        def generate_commit_draft(self, request: object) -> CommitDraft:
+            captured.append(request)
+            return CommitDraft(message="feat: 自定义提交")
+
+    runtime = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        codex_factory=lambda: FakeCodex(),
+    )
+
+    draft, skill_sha256 = runtime.generate_commit_draft(
+        fixture.repository.get_run(run_id),
+        config(fixture.root),
+        TREE_SHA,
+        SHA,
+    )
+
+    assert draft.message == "feat: 自定义提交"
+    request = captured[0]
+    assert request.expected_skill == "delivery-commit"  # type: ignore[attr-defined]
+    scope = json.loads(request.approval_scope)  # type: ignore[attr-defined]
+    assert scope["reviewed_tree_sha"] == TREE_SHA
+    assert scope["expected_parent_sha"] == SHA
+    assert set(scope["approved_artifacts"]) == {
+        "design.md",
+        "implementation-plan.md",
+        "requirement.md",
+    }
+    assert re.fullmatch(r"[0-9a-f]{64}", skill_sha256)
+
+
+def test_commit_message_is_reused_after_uncertain_execution(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    executor = FakeStageExecutor(fixture.repository)
+
+    class UncertainCommit(FakeCommitPort):
+        def execute(
+            self,
+            run: object,
+            project: object,
+            message: str,
+        ) -> dict[str, object]:
+            self.messages.append(message)
+            raise RuntimeError("uncertain")
+
+    commit = UncertainCommit()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+    assert orchestrator.step(run_id).action == "commit_reconciliation_pending"
+
+    restarted = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert restarted.step(run_id).action == "commit_reconciliation_pending"
+    assert executor.commit_draft_calls == 1
+
+
 def test_commit_rejects_validation_attestation_without_validation_event(
     fixture: Fixture,
 ) -> None:
@@ -2235,16 +2396,22 @@ def test_commit_tree_mismatch_never_derives_review_pass(
     assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
     assert orchestrator.step(run_id).state is RunState.COMMITTING
     if pending:
+        message = (
+            "feat(delivery): 使用阶段 Skill\n\n"
+            f"Change-Delivery-Run: {run_id}"
+        )
         commit.observed = commit.execute(
             fixture.repository.get_run(run_id),
             config(fixture.root),
+            message,
         )
         commit.execute_calls = 0
+        message_sha256 = hashlib.sha256(message.encode("utf-8")).hexdigest()
         fixture.repository.begin_remote_operation(
-            f"commit:{run_id}:{TREE_SHA}:{SHA}",
+            f"commit:{run_id}:{TREE_SHA}:{SHA}:{message_sha256}",
             run_id,
             "commit",
-            f"test-project:{TREE_SHA}:{SHA}",
+            f"test-project:{TREE_SHA}:{SHA}:{message_sha256}",
         )
 
     outcome = orchestrator.step(run_id)

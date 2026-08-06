@@ -1,0 +1,7 @@
+interface:
+  display_name: "生成交付 Commit Message"
+  short_description: "按项目约定生成已批准变更的提交说明"
+  default_prompt: "使用 $delivery-commit 为当前已验证且已 Review 的交付变更生成 commit message。"
+
+policy:
+  allow_implicit_invocation: false

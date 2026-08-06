@@ -32,6 +32,7 @@ from change_delivery.domain import (
     StageResult,
     StepOutcome,
 )
+from change_delivery.stage_content import CommitDraft
 from change_delivery.evidence import sha256_payload
 from change_delivery.repository import RunRepository
 from change_delivery.process import ProcessTimeoutError
@@ -113,6 +114,7 @@ class Orchestrator:
         worktree_port: object | None = None,
         commit_port: object | None = None,
         cleanup_port: object | None = None,
+        content_generator: object | None = None,
         artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.repository = repository
@@ -128,6 +130,7 @@ class Orchestrator:
         self.worktree_port = worktree_port
         self.commit_port = commit_port
         self.cleanup_port = cleanup_port
+        self.content_generator = content_generator or stage_executor
         self.artifact_store = artifact_store or ArtifactStore(self.plugin_root)
 
     def _run_root(self, run_id: str) -> Path:
@@ -1174,15 +1177,22 @@ class Orchestrator:
                 action="commit_review_blocked",
                 blocked_reason="review attestation parent no longer matches run head",
             )
+        message, message_reference = self._commit_message_for_tree(
+            run,
+            config,
+            reviewed_tree_sha,
+            expected_parent_sha,
+        )
+        message_sha256 = hashlib.sha256(message.encode("utf-8")).hexdigest()
         key = (
             f"commit:{run.run_id}:{reviewed_tree_sha}:"
-            f"{expected_parent_sha or 'unborn'}"
+            f"{expected_parent_sha or 'unborn'}:{message_sha256}"
         )
         try:
             operation = self.repository.get_remote_operation(key)
         except KeyError:
             operation = None
-        observed = port.query(run, config)  # type: ignore[attr-defined]
+        observed = port.query(run, config, message)  # type: ignore[attr-defined]
         if observed is None and operation is not None:
             return StepOutcome(
                 state=run.state,
@@ -1196,11 +1206,15 @@ class Orchestrator:
                 "commit",
                 (
                     f"{run.project_id}:{reviewed_tree_sha}:"
-                    f"{expected_parent_sha or 'unborn'}"
+                    f"{expected_parent_sha or 'unborn'}:{message_sha256}"
                 ),
             )
             try:
-                observed = port.execute(run, config)  # type: ignore[attr-defined]
+                observed = port.execute(  # type: ignore[attr-defined]
+                    run,
+                    config,
+                    message,
+                )
             except Exception as error:
                 return StepOutcome(
                     state=run.state,
@@ -1249,8 +1263,99 @@ class Orchestrator:
         return StepOutcome(
             state=RunState.PUSHING_FEATURE,
             action="commit_reconciled",
-            evidence_ids=tuple(reference.evidence_id for reference in derived),
+            evidence_ids=(
+                message_reference.evidence_id,
+                *(reference.evidence_id for reference in derived),
+            ),
         )
+
+    def _commit_message_for_tree(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        reviewed_tree_sha: str,
+        expected_parent_sha: str,
+    ) -> tuple[str, object]:
+        candidates = []
+        for evidence in self.repository.list_evidence(run.run_id):
+            if evidence.kind != "commit_message_generated":
+                continue
+            payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(evidence.sha256, sha256_payload(payload)):
+                raise ValueError("commit message evidence digest mismatch")
+            if (
+                type(payload) is not dict
+                or set(payload) != {
+                    "expected_parent_sha",
+                    "message",
+                    "message_sha256",
+                    "reviewed_tree_sha",
+                    "skill_sha256",
+                }
+                or payload["expected_parent_sha"] != expected_parent_sha
+                or payload["reviewed_tree_sha"] != reviewed_tree_sha
+            ):
+                continue
+            message = payload["message"]
+            if (
+                not isinstance(message, str)
+                or not hmac.compare_digest(
+                    str(payload["message_sha256"]),
+                    hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                )
+                or re.fullmatch(r"[0-9a-f]{64}", str(payload["skill_sha256"]))
+                is None
+                or not message.endswith(f"Change-Delivery-Run: {run.run_id}")
+            ):
+                raise ValueError("commit message evidence is invalid")
+            candidates.append((message, evidence))
+        if len(candidates) > 1:
+            raise ValueError("commit message evidence is ambiguous")
+        if candidates:
+            return candidates[0]
+        generator = self.content_generator
+        if generator is None:
+            raise DependencyUnavailable("commit content generator unavailable")
+        generated = generator.generate_commit_draft(  # type: ignore[attr-defined]
+            run,
+            config,
+            reviewed_tree_sha,
+            expected_parent_sha,
+        )
+        if (
+            type(generated) is not tuple
+            or len(generated) != 2
+            or not isinstance(generated[0], CommitDraft)
+            or re.fullmatch(r"[0-9a-f]{64}", str(generated[1])) is None
+        ):
+            raise ValueError("commit content generator returned an invalid result")
+        draft, skill_sha256 = generated
+        if re.search(r"(?m)^Change-Delivery-Run\s*:", draft.message):
+            raise ValueError("commit draft may not provide the host run trailer")
+        message = (
+            f"{draft.message.rstrip()}\n\n"
+            f"Change-Delivery-Run: {run.run_id}"
+        )
+        binding = hashlib.sha256(
+            (
+                f"{run.run_id}:{reviewed_tree_sha}:{expected_parent_sha}"
+            ).encode("utf-8")
+        ).hexdigest()
+        reference = self.repository.register_evidence(
+            run.run_id,
+            f"commit-message:{binding}",
+            "commit_message_generated",
+            {
+                "expected_parent_sha": expected_parent_sha,
+                "message": message,
+                "message_sha256": hashlib.sha256(
+                    message.encode("utf-8")
+                ).hexdigest(),
+                "reviewed_tree_sha": reviewed_tree_sha,
+                "skill_sha256": skill_sha256,
+            },
+        )
+        return message, reference
 
     def _review_attestation(
         self,

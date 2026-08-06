@@ -135,6 +135,24 @@ def test_delivery_review_fix_is_scoped_and_requires_revalidation() -> None:
         assert required in body
 
 
+def test_delivery_commit_only_generates_custom_message_json() -> None:
+    body, metadata = _skill("delivery-commit")
+
+    assert metadata["policy"]["allow_implicit_invocation"] is False
+    assert "$delivery-commit" in metadata["interface"]["default_prompt"]
+    for required in (
+        '"message"',
+        "Conventional Commits",
+        "中文标题",
+        "Change-Delivery-Run",
+        "不得执行 Git",
+        "不得 commit",
+        "不得修改文件",
+        "不得扩大",
+    ):
+        assert required in body
+
+
 def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:
     body, metadata = _skill("project-test-acceptance")
     checklist = (

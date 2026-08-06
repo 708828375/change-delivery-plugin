@@ -553,7 +553,15 @@ class GitAdapter:
         self._run("add", ("add", "-A"), workdir=resolved)
         if not self.status_short(resolved).strip():
             raise GitError("commit", reason="no changes to commit")
-        self._run("commit", ("commit", "-m", message), workdir=resolved)
+        if "\n" in message:
+            self._run(
+                "commit",
+                ("commit", "-F", "-"),
+                workdir=resolved,
+                stdin_text=message,
+            )
+        else:
+            self._run("commit", ("commit", "-m", message), workdir=resolved)
         return self._head_sha(resolved)
 
     def worktree_head(self, workdir: Path) -> str:
@@ -608,10 +616,10 @@ class GitAdapter:
                     tree,
                     "-p",
                     parent,
-                    "-m",
-                    message,
+                    *(("-F", "-") if "\n" in message else ("-m", message)),
                 ),
                 workdir=resolved,
+                stdin_text=message if "\n" in message else None,
             ).stdout,
             "commit_tree",
         )
@@ -828,11 +836,13 @@ class GitAdapter:
         args: Sequence[str],
         *,
         workdir: Path | None = None,
+        stdin_text: str | None = None,
     ) -> ProcessResult:
         result = self._execute(
             args,
             workdir=workdir or self.repo_path,
             operation=operation,
+            stdin_text=stdin_text,
         )
         if result.exit_code != 0:
             self._raise_result(operation, result)
@@ -844,17 +854,19 @@ class GitAdapter:
         *,
         workdir: Path,
         operation: str,
+        stdin_text: str | None = None,
     ) -> ProcessResult:
         try:
-            return self._runner.run(
-                CommandSpec(
-                    executable=self._git_executable,
-                    args=tuple(args),
-                    workdir=workdir,
-                    timeout_seconds=60,
-                    env_names=_GIT_ENV_NAMES,
-                )
+            spec = CommandSpec(
+                executable=self._git_executable,
+                args=tuple(args),
+                workdir=workdir,
+                timeout_seconds=60,
+                env_names=_GIT_ENV_NAMES,
             )
+            if stdin_text is None:
+                return self._runner.run(spec)
+            return self._runner.run(spec, stdin_text=stdin_text)
         except GitError:
             raise
         except DeliveryError:
@@ -1008,9 +1020,14 @@ class GitAdapter:
         if (
             not isinstance(message, str)
             or not message.strip()
-            or any(character in message for character in "\r\n\x00")
+            or "\r" in message
+            or "\x00" in message
+            or any(
+                ord(character) < 32 and character != "\n"
+                for character in message
+            )
         ):
-            raise ValueError("commit message must be non-empty and single-line")
+            raise ValueError("commit message contains invalid control characters")
 
     def _remote_head_sha(self, remote: str, branch: str) -> str:
         self._require_bound_remote(remote)
