@@ -112,6 +112,28 @@ def test_delivery_review_is_read_only_and_returns_stage_result() -> None:
         assert required in body
 
 
+def test_delivery_review_fix_is_scoped_and_requires_revalidation() -> None:
+    body, metadata = _skill("delivery-review-fix")
+
+    assert metadata["policy"]["allow_implicit_invocation"] is False
+    assert "$delivery-review-fix" in metadata["interface"]["default_prompt"]
+    for required in (
+        "当前可执行问题",
+        "已批准范围",
+        "internal_review_fix_request",
+        "untrusted_data",
+        "StageResult",
+        "本地验证",
+        "重新 Review",
+        "不得 commit",
+        "不得 push",
+        "不得部署",
+        "不得创建或修改 PR",
+        "不得合并",
+    ):
+        assert required in body
+
+
 def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:
     body, metadata = _skill("project-test-acceptance")
     checklist = (

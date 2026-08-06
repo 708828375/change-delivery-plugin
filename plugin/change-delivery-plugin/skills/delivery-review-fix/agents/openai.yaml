@@ -1,0 +1,7 @@
+interface:
+  display_name: "交付 Review 修复"
+  short_description: "在批准范围内处理本轮 Review 可执行问题"
+  default_prompt: "使用 $delivery-review-fix 修复当前交付阶段绑定的 Review 问题。"
+
+policy:
+  allow_implicit_invocation: false

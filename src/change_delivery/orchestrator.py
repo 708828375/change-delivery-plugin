@@ -297,6 +297,13 @@ class Orchestrator:
                 return self._run_stage(
                     run, config, "internal_review", RunState.COMMITTING
                 )
+            if run.state is RunState.FIXING_INTERNAL_REVIEW:
+                return self._run_stage(
+                    run,
+                    config,
+                    "internal_review_fix",
+                    RunState.LOCAL_VALIDATION,
+                )
             if run.state is RunState.COMMITTING:
                 return self._commit(run, config)
             if run.state is RunState.DEPLOYING_TEST:
@@ -519,11 +526,15 @@ class Orchestrator:
                     ),
                 )
             if stage == "internal_review":
-                target = (
-                    RunState.IMPLEMENTING
-                    if result.status == "failed"
-                    else RunState.REVIEW_DECISION_REQUIRED
-                )
+                if result.status == "failed":
+                    return self._request_internal_review_fix(
+                        run,
+                        config,
+                        result,
+                        references,
+                        reviewed_tree_sha,
+                    )
+                target = RunState.REVIEW_DECISION_REQUIRED
                 self.repository.transition_with_evidence(
                     run.run_id,
                     run.state,
@@ -533,11 +544,7 @@ class Orchestrator:
                 )
                 return StepOutcome(
                     state=target,
-                    action=(
-                        "review_changes_requested"
-                        if target is RunState.IMPLEMENTING
-                        else "review_decision_required"
-                    ),
+                    action="review_decision_required",
                     blocked_reason="internal review did not pass",
                     evidence_ids=tuple(
                         reference.evidence_id for reference in references
@@ -604,6 +611,126 @@ class Orchestrator:
             action=f"{stage}_passed",
             evidence_ids=tuple(
                 ref.evidence_id for ref in transition_references
+            ),
+        )
+
+    def _request_internal_review_fix(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        result: StageResult,
+        references: tuple[object, ...],
+        reviewed_tree_sha: str | None,
+    ) -> StepOutcome:
+        if reviewed_tree_sha is None:
+            raise ValueError("internal review tree identity is missing")
+        actionable = tuple(
+            finding for finding in result.findings if finding.actionable
+        )
+        if not actionable:
+            self.repository.transition_with_evidence(
+                run.run_id,
+                RunState.INTERNAL_REVIEW,
+                RunState.REVIEW_DECISION_REQUIRED,
+                "INTERNAL_REVIEW_ACTION_REQUIRED",
+                references,
+            )
+            return StepOutcome(
+                state=RunState.REVIEW_DECISION_REQUIRED,
+                action="review_decision_required",
+                blocked_reason="internal review failed without actionable findings",
+                evidence_ids=tuple(
+                    reference.evidence_id for reference in references
+                ),
+            )
+        attempts: list[int] = []
+        for evidence in self.repository.list_evidence(run.run_id):
+            if evidence.kind != "internal_review_fix_request":
+                continue
+            payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(
+                evidence.sha256,
+                sha256_payload(payload),
+            ):
+                raise ValueError("internal review fix request digest mismatch")
+            if (
+                type(payload) is not dict
+                or set(payload) != {
+                    "attempt",
+                    "expected_parent_sha",
+                    "findings",
+                    "reviewed_tree_sha",
+                }
+                or type(payload["attempt"]) is not int
+                or payload["attempt"] < 1
+                or payload["expected_parent_sha"] != run.head_sha
+                or not isinstance(payload["reviewed_tree_sha"], str)
+                or type(payload["findings"]) is not list
+                or not payload["findings"]
+            ):
+                raise ValueError("internal review fix request is invalid")
+            attempts.append(payload["attempt"])
+        previous_attempt = max(attempts, default=0)
+        attempt = previous_attempt + 1
+        if attempt > config.max_internal_review_fix_attempts:
+            limit = self.repository.register_evidence(
+                run.run_id,
+                f"internal-review-fix-limit:{run.run_id}:{run.head_sha}",
+                "internal_review_fix_limit_reached",
+                {
+                    "attempts": previous_attempt,
+                    "expected_parent_sha": run.head_sha,
+                    "reviewed_tree_sha": reviewed_tree_sha,
+                },
+            )
+            transition_evidence = (*references, limit)
+            self.repository.transition_with_evidence(
+                run.run_id,
+                RunState.INTERNAL_REVIEW,
+                RunState.REVIEW_DECISION_REQUIRED,
+                "INTERNAL_REVIEW_FIX_LIMIT_REACHED",
+                transition_evidence,
+            )
+            return StepOutcome(
+                state=RunState.REVIEW_DECISION_REQUIRED,
+                action="internal_review_fix_limit_reached",
+                blocked_reason=(
+                    "internal review remained unresolved after the configured "
+                    "automatic fix limit"
+                ),
+                evidence_ids=tuple(
+                    reference.evidence_id
+                    for reference in transition_evidence
+                ),
+            )
+        request = self.repository.register_evidence(
+            run.run_id,
+            f"internal-review-fix-request:{run.run_id}:{attempt}",
+            "internal_review_fix_request",
+            {
+                "attempt": attempt,
+                "expected_parent_sha": run.head_sha,
+                "findings": [
+                    finding.model_dump(mode="json")
+                    for finding in actionable
+                ],
+                "reviewed_tree_sha": reviewed_tree_sha,
+            },
+        )
+        transition_evidence = (*references, request)
+        self.repository.transition_with_evidence(
+            run.run_id,
+            RunState.INTERNAL_REVIEW,
+            RunState.FIXING_INTERNAL_REVIEW,
+            "INTERNAL_REVIEW_CHANGES_REQUIRED",
+            transition_evidence,
+        )
+        return StepOutcome(
+            state=RunState.FIXING_INTERNAL_REVIEW,
+            action="internal_review_changes_required",
+            blocked_reason="internal review requires bounded changes",
+            evidence_ids=tuple(
+                reference.evidence_id for reference in transition_evidence
             ),
         )
 

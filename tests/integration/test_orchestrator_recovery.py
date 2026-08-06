@@ -28,6 +28,7 @@ from change_delivery.config import load_project_config
 from change_delivery.domain import (
     EvidenceRef,
     CommandSpec,
+    Finding,
     ProjectConfig,
     RunState,
     StageResult,
@@ -254,9 +255,11 @@ class FakeStageExecutor:
         repository: RunRepository,
         *,
         status: str = "passed",
+        findings: tuple[Finding, ...] = (),
     ) -> None:
         self.repository = repository
         self.status = status
+        self.findings = findings
         self.calls: list[str] = []
 
     def execute(
@@ -298,7 +301,7 @@ class FakeStageExecutor:
             status=self.status,
             summary=f"{stage} passed",
             evidence=(reference,),
-            findings=(),
+            findings=self.findings,
             next_action="continue",
         )
 
@@ -819,10 +822,11 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
     source_root = Path(cli_module.__file__).resolve().parents[2]
     skills_root = source_root / "plugin" / "change-delivery-plugin" / "skills"
     for name in (
-        "delivery-planning",
-        "delivery-implement",
-        "delivery-review",
-        "project-test-acceptance",
+            "delivery-planning",
+            "delivery-implement",
+            "delivery-review",
+            "delivery-review-fix",
+            "project-test-acceptance",
     ):
         assert (skills_root / name / "SKILL.md").is_file()
 
@@ -840,10 +844,11 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
     }
     assert bundled_names == {
         "change-delivery",
-        "delivery-planning",
-        "delivery-implement",
-        "delivery-review",
-        "project-test-acceptance",
+            "delivery-planning",
+            "delivery-implement",
+            "delivery-review",
+            "delivery-review-fix",
+            "project-test-acceptance",
         "production-release",
     }
     assert bundled_names.isdisjoint(globally_existing_names)
@@ -955,7 +960,7 @@ def test_runtime_codex_stage_replaces_untrusted_model_evidence(
     [
         ("implementation", "delivery-implement", "writer"),
         ("internal_review", "delivery-review", "read_only"),
-        ("review_fix", "delivery-implement", "writer"),
+        ("review_fix", "delivery-review-fix", "writer"),
         (
             "acceptance",
             "project-test-acceptance",
@@ -1877,6 +1882,207 @@ def test_internal_review_records_tree_bound_attestation(
     payload = json.loads(attestations[0].payload_json)
     assert payload["reviewed_tree_sha"] == TREE_SHA
     assert payload["source_evidence_ids"] == [f"internal_review-proof:{run_id}"]
+
+
+def test_failed_internal_review_enters_bounded_fix_stage(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    finding = Finding(
+        severity="important",
+        title="缺少回归测试",
+        evidence="准确代码树缺少失败路径覆盖",
+        actionable=True,
+    )
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    executor.status = "failed"
+    executor.findings = (finding,)
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.FIXING_INTERNAL_REVIEW
+    requests = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "internal_review_fix_request"
+    ]
+    assert len(requests) == 1
+    payload = json.loads(requests[0].payload_json)
+    assert payload == {
+        "attempt": 1,
+        "expected_parent_sha": SHA,
+        "findings": [finding.model_dump(mode="json")],
+        "reviewed_tree_sha": TREE_SHA,
+    }
+
+
+def test_internal_review_fix_returns_to_validation_then_review(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    finding = Finding(
+        severity="important",
+        title="修复边界条件",
+        evidence="边界输入会返回错误结果",
+        actionable=True,
+    )
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    executor.status = "failed"
+    executor.findings = (finding,)
+    assert orchestrator.step(run_id).state is RunState.FIXING_INTERNAL_REVIEW
+    executor.status = "passed"
+    executor.findings = ()
+
+    assert orchestrator.step(run_id).state is RunState.LOCAL_VALIDATION
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    assert orchestrator.step(run_id).state is RunState.COMMITTING
+    assert executor.calls == [
+        "local_validation",
+        "internal_review",
+        "internal_review_fix",
+        "local_validation",
+        "internal_review",
+    ]
+
+
+def test_runtime_internal_review_fix_receives_only_bound_feedback(
+    fixture: Fixture,
+) -> None:
+    run_id, _ = approve_fixture_run(fixture)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET state = ? WHERE run_id = ?",
+            (RunState.LOCAL_VALIDATION.value, run_id),
+        )
+    finding = Finding(
+        severity="important",
+        title="补充失败路径测试",
+        evidence="当前准确树未覆盖失败路径",
+        actionable=True,
+    )
+    stage = FakeStageExecutor(fixture.repository)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=stage,
+        commit_port=FakeCommitPort(),
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    stage.status = "failed"
+    stage.findings = (finding,)
+    assert orchestrator.step(run_id).state is RunState.FIXING_INTERNAL_REVIEW
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+    captured: list[object] = []
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            captured.append(request)
+            return StageResult(
+                status="blocked",
+                summary="bounded handoff",
+                evidence=(),
+                findings=(),
+                next_action="host decides",
+            )
+
+    runtime = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        codex_factory=lambda: FakeCodex(),
+    )
+    runtime.execute(
+        "internal_review_fix",
+        fixture.repository.get_run(run_id),
+        config(fixture.root),
+        fixture.root / "runs" / run_id,
+    )
+
+    request = captured[0]
+    assert request.expected_skill == "delivery-review-fix"  # type: ignore[attr-defined]
+    scope = json.loads(request.approval_scope)  # type: ignore[attr-defined]
+    assert scope["actionable_feedback"] == {
+        "attempt": 1,
+        "expected_parent_sha": SHA,
+        "findings": [finding.model_dump(mode="json")],
+        "reviewed_tree_sha": TREE_SHA,
+    }
+    assert set(scope) == {"approved_artifacts", "actionable_feedback"}
+
+
+def test_internal_review_fourth_fix_requires_user_decision(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    finding = Finding(
+        severity="critical",
+        title="重复问题",
+        evidence="三轮修改后问题仍然存在",
+        actionable=True,
+    )
+    executor = FakeStageExecutor(fixture.repository)
+    commit = FakeCommitPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=commit,
+    )
+    assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+    for _ in range(3):
+        executor.status = "failed"
+        executor.findings = (finding,)
+        assert orchestrator.step(run_id).state is RunState.FIXING_INTERNAL_REVIEW
+        executor.status = "passed"
+        executor.findings = ()
+        assert orchestrator.step(run_id).state is RunState.LOCAL_VALIDATION
+        assert orchestrator.step(run_id).state is RunState.INTERNAL_REVIEW
+
+    executor.status = "failed"
+    executor.findings = (finding,)
+    stopped = orchestrator.step(run_id)
+
+    assert stopped.state is RunState.REVIEW_DECISION_REQUIRED
+    assert stopped.action == "internal_review_fix_limit_reached"
+    assert len(
+        [
+            evidence
+            for evidence in fixture.repository.list_evidence(run_id)
+            if evidence.kind == "internal_review_fix_request"
+        ]
+    ) == 3
 
 
 def test_commit_derives_review_evidence_for_new_head(

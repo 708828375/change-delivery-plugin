@@ -42,7 +42,8 @@ _STAGE_SKILLS = {
     "design": "delivery-planning",
     "implementation": "delivery-implement",
     "internal_review": "delivery-review",
-    "review_fix": "delivery-implement",
+    "internal_review_fix": "delivery-review-fix",
+    "review_fix": "delivery-review-fix",
     "acceptance": "project-test-acceptance",
 }
 
@@ -96,9 +97,11 @@ class RuntimeStageExecutor:
             if stage == "design"
             else self._worktree(run.run_id)
         )
-        review_fix_scope = (
-            self._review_fix_scope(run) if stage == "review_fix" else None
-        )
+        review_fix_scope = None
+        if stage == "review_fix":
+            review_fix_scope = self._review_fix_scope(run)
+        elif stage == "internal_review_fix":
+            review_fix_scope = self._internal_review_fix_scope(run)
         review_fix_attempt = 1
         if review_fix_scope is not None:
             actionable_feedback = review_fix_scope["actionable_feedback"]
@@ -431,6 +434,10 @@ class RuntimeStageExecutor:
             "review_fix": (
                 "Apply only actionable CI and review fixes within approved scope."
             ),
+            "internal_review_fix": (
+                "Apply only the current actionable internal review findings "
+                "within approved scope."
+            ),
             "acceptance": (
                 "Verify ExampleProject test acceptance for the exact current head. "
                 "Use only approved public API data and exact cleanup."
@@ -498,6 +505,76 @@ class RuntimeStageExecutor:
         )
         if len(scope) > 20_000:
             raise ValueError("approved artifacts exceed Codex scope limit")
+        return scope
+
+    def _internal_review_fix_scope(
+        self,
+        run: RunRecord,
+    ) -> dict[str, object]:
+        if run.state is not RunState.FIXING_INTERNAL_REVIEW:
+            raise ValueError(
+                "internal review fix stage requires its dedicated run state"
+            )
+        entering = next(
+            (
+                event
+                for event in reversed(self._repository.list_events(run.run_id))
+                if event.to_state is RunState.FIXING_INTERNAL_REVIEW
+                and event.from_state is RunState.INTERNAL_REVIEW
+            ),
+            None,
+        )
+        if entering is None:
+            raise ValueError("internal review fix request event is missing")
+        requests = []
+        for evidence_id in entering.evidence_ids:
+            evidence = self._repository.get_evidence(evidence_id)
+            if evidence.kind == "internal_review_fix_request":
+                requests.append(evidence)
+        if len(requests) != 1:
+            raise ValueError(
+                "internal review fix request evidence is missing or ambiguous"
+            )
+        payload = json.loads(requests[0].payload_json)
+        if not hmac.compare_digest(
+            requests[0].sha256,
+            sha256_payload(payload),
+        ):
+            raise ValueError("internal review fix request digest mismatch")
+        if (
+            type(payload) is not dict
+            or set(payload) != {
+                "attempt",
+                "expected_parent_sha",
+                "findings",
+                "reviewed_tree_sha",
+            }
+            or type(payload["attempt"]) is not int
+            or payload["attempt"] < 1
+            or payload["expected_parent_sha"] != run.head_sha
+            or not isinstance(payload["reviewed_tree_sha"], str)
+            or type(payload["findings"]) is not list
+            or not payload["findings"]
+        ):
+            raise ValueError("internal review fix request evidence is invalid")
+        artifacts = {
+            name: contents.decode("utf-8")
+            for name, contents in self._repository.get_approved_artifacts(
+                run.run_id
+            ).items()
+        }
+        scope = {
+            "approved_artifacts": artifacts,
+            "actionable_feedback": payload,
+        }
+        encoded = json.dumps(
+            scope,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(encoded) > 20_000:
+            raise ValueError("internal review fix scope exceeds Codex scope limit")
         return scope
 
     def _review_fix_scope(self, run: RunRecord) -> dict[str, object]:

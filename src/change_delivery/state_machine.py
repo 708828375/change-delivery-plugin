@@ -53,7 +53,11 @@ _TERMINAL_STATES = frozenset(
     }
 )
 _NORMAL_ACTIVE_STATES = frozenset(
-    (*_HAPPY_PATH[:-1], RunState.FIXING_CI_REVIEW)
+    (
+        *_HAPPY_PATH[:-1],
+        RunState.FIXING_INTERNAL_REVIEW,
+        RunState.FIXING_CI_REVIEW,
+    )
 )
 _DECISION_STATES = frozenset(
     {
@@ -61,6 +65,7 @@ _DECISION_STATES = frozenset(
         RunState.IMPLEMENTING,
         RunState.LOCAL_VALIDATION,
         RunState.INTERNAL_REVIEW,
+        RunState.FIXING_INTERNAL_REVIEW,
         RunState.COMMITTING,
         RunState.PR_DRAFT,
         RunState.ACCEPTANCE_TESTING,
