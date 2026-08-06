@@ -1,7 +1,7 @@
 interface:
-  display_name: "Change Delivery"
-  short_description: "Safely advance approved work to a merge-ready PR"
-  default_prompt: "Use $change-delivery to start or resume a delivery run."
+  display_name: "变更交付"
+  short_description: "安全推进已批准工作，直到 PR 可合并"
+  default_prompt: "使用 $change-delivery 启动或恢复一次交付运行。"
 
 policy:
   allow_implicit_invocation: false

@@ -1,43 +1,25 @@
 ---
 name: delivery-review
-description: Use when an exact pending change-delivery tree needs internal review against its approved requirement, design, plan, and validation evidence.
+description: 当需要依据已批准的需求、设计、计划和验证证据，对准确的待处理 change-delivery 树进行内部 review 时使用。
 ---
 
-# Delivery Review
+# 交付 Review
 
-Perform a read-only review of the exact pending tree supplied by the host.
-Review authority does not include implementation authority.
+对运行主机提供的准确待处理树执行只读 review。review 权限不包含实现权限。
 
-## Review
+## Review 步骤
 
-1. Bind the review to the supplied tree identity and expected parent. If the
-   tree changes, stop; the replacement requires a fresh review.
-2. Compare the exact pending tree with the approved requirement, design, and
-   implementation plan.
-3. Inspect correctness, regressions, security, concurrency, error handling,
-   tests, and scope compliance. Distinguish actionable findings from
-   non-actionable observations.
-4. Classify actionable findings by severity. A `critical` or `important`
-   finding prevents `passed`.
-5. Return only JSON conforming exactly to the complete authoritative
-   `StageResult` schema and status policy injected by the host. Its only top-level fields
-   are `status, summary, evidence, findings, next_action`; represent
-   observations as findings rather than adding a field.
+1. 将 review 绑定到提供的树标识和预期父节点。如果树发生变化，立即停止；替换后的树必须重新 review。
+2. 将准确待处理树与已批准的需求、设计和实施计划进行比较。
+3. 检查正确性、回归、安全性、并发、错误处理、测试和范围合规性。区分可执行发现和不可执行观察。
+4. 按严重程度划分可执行发现。存在 `critical` 或 `important` 发现时，结果不能为 `passed`。
+5. 只能返回与运行主机注入的完整且权威的 `StageResult` schema 和状态策略准确一致的 JSON。顶层字段只能是 `status, summary, evidence, findings, next_action`；观察项应表示为 finding，不得增加字段。
 
-## Hard boundaries
+## 强制边界
 
-- Do not modify any file, even for a comment, spelling, formatting, or
-  supposedly harmless fix.
-- Do not stage, commit, push, deploy, change a PR, merge, or write runtime
-  state.
-- Do not run commands that mutate the worktree. Use only read-only inspection
-  and evidence already supplied by the host.
-- Do not invent evidence or turn narrative claims into an `EvidenceRef`. If
-  the complete schema, status mapping, or evidence placeholders are absent,
-  do not guess JSON. Return a plain-text blocked handoff requesting the
-  missing host contract.
-- Do not mark an actionable finding resolved because the user accepts it or
-  time is short. Review a new exact tree after the implementation stage fixes
-  it.
-- Do not return `passed` while any actionable `critical` or `important`
-  finding remains. Return `failed` or `blocked` with a precise next action.
+- 不得修改任何文件，即使只是评论、拼写、格式或所谓无害的修复也不允许。
+- 不得 stage、commit、push、部署、修改 PR、合并或写入运行时状态。
+- 不得运行会改变 worktree 的命令。只能执行只读检查，并使用运行主机已提供的证据。
+- 不得编造证据，也不得把叙述性说法转为 `EvidenceRef`。如果缺少完整 schema、状态映射或证据占位符，不得猜测 JSON。返回纯文本的 blocked 交接信息，请求补充缺失的运行主机契约。
+- 不得将用户接受问题或时间紧迫视为可执行发现已解决。实现阶段修复后，必须 review 新的准确树。
+- 只要仍有任何可执行的 `critical` 或 `important` 发现，就不得返回 `passed`。返回 `failed` 或 `blocked`，并给出准确的下一步操作。

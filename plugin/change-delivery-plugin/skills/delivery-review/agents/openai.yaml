@@ -1,7 +1,7 @@
 interface:
-  display_name: "Delivery Review"
-  short_description: "Review the approved pending tree without modifying it"
-  default_prompt: "Use $delivery-review to review the exact pending delivery tree."
+  display_name: "交付 Review"
+  short_description: "在不修改文件的前提下 review 已批准的待处理树"
+  default_prompt: "使用 $delivery-review review 准确的待处理交付树。"
 
 policy:
   allow_implicit_invocation: false

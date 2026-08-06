@@ -1,7 +1,7 @@
 interface:
-  display_name: "Delivery Planning"
-  short_description: "Create an approved-scope delivery design and plan"
-  default_prompt: "Use $delivery-planning to create the delivery design and plan."
+  display_name: "交付方案设计"
+  short_description: "在已批准范围内创建设计和实施计划"
+  default_prompt: "使用 $delivery-planning 创建交付设计和实施计划。"
 
 policy:
   allow_implicit_invocation: false

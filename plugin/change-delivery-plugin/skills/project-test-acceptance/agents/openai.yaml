@@ -1,7 +1,7 @@
 interface:
-  display_name: "ExampleProject Test Acceptance"
-  short_description: "Verify ExampleProject test behavior against one exact SHA"
-  default_prompt: "Use $project-test-acceptance to verify the deployed ExampleProject test SHA."
+  display_name: "ExampleProject 测试验收"
+  short_description: "针对一个准确 SHA 验证 ExampleProject 测试环境行为"
+  default_prompt: "使用 $project-test-acceptance 验证已部署的 ExampleProject 测试环境 SHA。"
 
 policy:
   allow_implicit_invocation: false

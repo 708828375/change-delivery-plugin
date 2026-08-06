@@ -1,52 +1,33 @@
 ---
 name: project-test-acceptance
-description: Use when a change-delivery run must verify ExampleProject test-environment behavior for one exact deployed Git SHA using bounded temporary data.
+description: 当 change-delivery 运行必须使用有边界的临时数据，对某个准确部署的 Git SHA 验证 ExampleProject 测试环境行为时使用。
 ---
 
-# ExampleProject Test Acceptance
+# ExampleProject 测试验收
 
-Accept behavior only while both the shared test branch and deployed version
-remain bound to the run's expected SHA.
+只有在共享测试分支和已部署版本都持续绑定到本次运行的预期 SHA 时，才能接受验收结果。
 
-Before acting, read [references/checklist.md](references/checklist.md) completely
-and apply it to the approved acceptance scope.
+执行前，完整读取 [references/checklist.md](references/checklist.md)，并将其应用于已批准的验收范围。
 
-## Execute
+## 执行步骤
 
-1. Obtain the run ID, expected SHA, registered version endpoint and SHA field,
-   approved scenarios, and allowed credentials from the host.
-2. Verify the remote test branch and version endpoint both equal the expected
-   SHA before creating data.
-3. Create temporary data only through public API operations, tagged with the
-   exact run prefix. Record every returned resource type and ID immediately.
-4. Execute only approved deterministic assertions. Recheck both SHA facts
-   before and after consequential steps.
-5. If either SHA differs at any time, stop and map
-   `ENVIRONMENT_PREEMPTED` to `status=blocked`; do not claim partial results
-   as acceptance.
-6. Clean up only the exact resource IDs recorded by this run, through their
-   public API. Verify deletion without widening the selector.
-7. Treat this Skill's result as advisory. The host must independently run the
-   registered fixed-argv `acceptance_check` and validate its SHA-bound JSON
-   output, resource ledger, and cleanup fact.
-8. Return only JSON conforming exactly to the complete authoritative
-   `StageResult` schema and status policy injected by the host. A pass must
-   reference authoritative SHA, assertion, and cleanup evidence.
+1. 从运行主机获取 run ID、预期 SHA、已登记的版本端点和 SHA 字段、已批准场景以及允许使用的凭据。
+2. 创建数据前，验证远程测试分支和版本端点都等于预期 SHA。
+3. 只能通过 public API 操作创建临时数据，并使用准确运行前缀进行标记。立即记录每个返回资源的类型和 ID。
+4. 只执行已批准且结果确定的断言。在每个关键步骤前后，重新检查两个 SHA 事实。
+5. 任一 SHA 在任何时候出现差异，都必须停止，并将 `ENVIRONMENT_PREEMPTED` 映射为 `status=blocked`；不得把部分结果声称为验收通过。
+6. 只能通过相应的 public API 清理本次运行已记录的准确资源 ID。验证删除结果时不得扩大选择条件。
+7. 将本 Skill 的结果视为参考性结果。运行主机必须独立执行已登记的固定参数 `acceptance_check`，并验证其绑定 SHA 的 JSON 输出、资源台账和清理事实。
+8. 只能返回与运行主机注入的完整且权威的 `StageResult` schema 和状态策略准确一致的 JSON。通过结果必须引用权威的 SHA、断言和清理证据。
 
-If the host did not inject the complete schema, status mapping, and evidence
-placeholders, do not guess JSON. Return a plain-text blocked handoff requesting
-the missing host contract.
+如果运行主机没有注入完整 schema、状态映射和证据占位符，不得猜测 JSON。返回纯文本的 blocked 交接信息，请求补充缺失的运行主机契约。
 
-## Hard boundaries
+## 强制边界
 
-- Do not deploy, push, reacquire the shared environment, or continue after
-  preemption.
-- Do not write the database, container filesystem, queue, or runtime state.
-- Do not send real email, make payment, call production-priced models, or
-  perform irreversible third-party actions.
-- Do not delete by a broad prefix, guessed ID, shared account, or time range.
-- Do not use narrative claims as evidence or invent `StageResult` fields.
-- Never claim that model output is authoritative API evidence. A missing
-  `acceptance_check`, `version_endpoint`, or SHA field is `blocked`.
-- If cleanup is incomplete or the SHA binding is uncertain, return `blocked`
-  or `failed`, never `passed`.
+- 不得部署、push、重新获取共享环境，也不得在环境被抢占后继续执行。
+- 不得写入数据库、容器文件系统、队列或运行时状态。
+- 不得发送真实邮件、执行付款、调用按生产价格计费的模型，或执行不可逆的第三方操作。
+- 不得按宽泛前缀、猜测的 ID、共享账户或时间范围删除数据。
+- 不得使用叙述性说法作为证据，也不得编造 `StageResult` 字段。
+- 绝不能声称模型输出是权威 API 证据。缺少 `acceptance_check`、`version_endpoint` 或 SHA 字段时，结果为 `blocked`。
+- 如果清理不完整或 SHA 绑定不确定，返回 `blocked` 或 `failed`，绝不能返回 `passed`。

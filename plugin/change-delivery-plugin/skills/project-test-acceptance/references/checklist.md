@@ -1,55 +1,44 @@
-# ExampleProject Acceptance Checklist
+# ExampleProject 验收检查清单
 
-Use this checklist for the current run only.
+此检查清单仅用于当前运行。
 
-## Preconditions
+## 前置条件
 
-- Confirm the project registration, approved scenarios, run ID, and exact run
-  prefix `codex-<run-id>`.
-- Record the expected 40-character Git SHA.
-- Read the remote test branch through the registered Git adapter.
-- Read the registered version endpoint and configured SHA field.
-- Require both facts to equal the expected SHA before any temporary write.
-- Confirm every planned write uses a public API and is inside approved scope.
+- 确认项目登记信息、已批准场景、run ID 和准确运行前缀 `codex-<run-id>`。
+- 记录预期的 40 字符 Git SHA。
+- 通过已登记的 Git 适配器读取远程测试分支。
+- 读取已登记的版本端点和已配置的 SHA 字段。
+- 执行任何临时写操作前，要求两个事实都等于预期 SHA。
+- 确认每个计划写操作都使用 public API，并位于已批准范围内。
 
-## Temporary data ledger
+## 临时数据台账
 
-- Attach the exact run prefix to each created object.
-- After every successful create response, record the resource type, exact
-  resource ID, exact returned marker, parent ID, and creation result.
-- Never infer created resource IDs from names, list position, timestamps, or a
-  database query.
-- Permit cleanup only when the returned marker equals the exact run prefix or
-  uses its unambiguous `--` child suffix.
+- 为每个已创建对象附加准确运行前缀。
+- 每次创建请求成功后，记录资源类型、准确资源 ID、返回的准确标记、父 ID 和创建结果。
+- 绝不能根据名称、列表位置、时间戳或数据库查询推断已创建资源 ID。
+- 只有当返回标记等于准确运行前缀，或使用无歧义的 `--` 子级后缀时，才允许清理。
 
-## Assertions and continuity
+## 断言与连续性
 
-- Recheck the remote test branch and version endpoint before and after each
-  consequential scenario.
-- Stop with `ENVIRONMENT_PREEMPTED` when either no longer equals the expected
-  SHA. The other source still matching does not preserve acceptance.
-- Record deterministic API or WebSocket assertions and bounded polling results.
-- Treat logs and database results as read-only corroboration, not as a route
-  for setup or mutation.
-- Prohibit real email, real payment, costly production-model calls, and
-  irreversible third-party actions.
+- 每个关键场景前后都重新检查远程测试分支和版本端点。
+- 任一事实不再等于预期 SHA 时，以 `ENVIRONMENT_PREEMPTED` 停止。即使另一个来源仍然匹配，也不能继续认可验收结果。
+- 记录结果确定的 API 或 WebSocket 断言，以及有边界的轮询结果。
+- 日志和数据库结果只能作为只读旁证，不能用于准备数据或执行变更。
+- 禁止发送真实邮件、执行真实付款、调用昂贵的生产模型，以及执行不可逆的第三方操作。
 
-## Cleanup
+## 清理
 
-- Delete children before parents using public API operations.
-- Address only created resource IDs from this run's ledger.
-- Before each delete, verify the fetched resource still carries the exact run
-  prefix; stop on an ownership mismatch.
-- Record the delete result for each ID and verify each exact ID is absent.
-- Never use `startsWith`, wildcard, time-window, account-wide, or global cleanup.
-- Prohibit direct database writes, SSH deletion, container mutation, and queue
-  purges.
-- Report incomplete cleanup as blocked or failed; preserve the remaining exact
-  IDs for authorized follow-up.
+- 使用 public API 操作，先删除子资源，再删除父资源。
+- 只能处理本次运行台账中的已创建资源 ID。
+- 每次删除前，验证获取到的资源仍带有准确运行前缀；所有权不匹配时停止。
+- 记录每个 ID 的删除结果，并验证每个准确 ID 均已不存在。
+- 绝不使用 `startsWith`、通配符、时间窗口、账户级或全局清理。
+- 禁止直接写入数据库、通过 SSH 删除、修改容器和清空队列。
+- 清理不完整时报告 blocked 或 failed；保留剩余准确 ID，供获得授权后的后续处理使用。
 
-## Evidence
+## 证据
 
-- Include the expected SHA and start/end facts for both SHA sources.
-- Include assertion evidence and the temporary-data ledger.
-- Include cleanup requests and exact-ID absence checks.
-- Redact credentials, tokens, cookies, message bodies, and personal data.
+- 包含预期 SHA，以及两个 SHA 来源在开始和结束时的事实。
+- 包含断言证据和临时数据台账。
+- 包含清理请求和准确 ID 不存在的检查结果。
+- 对凭据、token、cookie、消息正文和个人数据进行脱敏。

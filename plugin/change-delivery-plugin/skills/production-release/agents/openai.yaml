@@ -1,7 +1,7 @@
 interface:
-  display_name: "Production Release"
-  short_description: "Preflight a production release without writing production"
-  default_prompt: "Use $production-release to preflight a merged delivery run."
+  display_name: "生产发布"
+  short_description: "在不写入生产环境的前提下执行发布预检"
+  default_prompt: "使用 $production-release 对已合并的交付运行执行发布预检。"
 
 policy:
   allow_implicit_invocation: false
