@@ -312,6 +312,20 @@ class Orchestrator:
             if run.state is RunState.COMMITTING:
                 return self._commit(run, config)
             if run.state is RunState.DEPLOYING_TEST:
+                gate = self._run_stage_gate(
+                    run,
+                    config,
+                    "test_deploy_skill",
+                    {
+                        "expected_sha": run.head_sha,
+                        "remote": config.remote,
+                        "test_branch": config.test_branch,
+                        "test_push_strategy": config.test_push_strategy,
+                    },
+                    "test_deploy_gate_passed",
+                )
+                if isinstance(gate, StepOutcome):
+                    return gate
                 return self._run_reconciled_port(
                     run,
                     config,
@@ -571,6 +585,38 @@ class Orchestrator:
                         "this execution"
                     ),
                 )
+        additional_references: tuple[object, ...] = ()
+        if stage == "local_validation" and result.status == "passed":
+            gate = self._run_stage_gate(
+                run,
+                config,
+                "local_validation_skill",
+                {
+                    "checks_identity": checks_identity,
+                    "expected_parent_sha": run.head_sha,
+                    "tested_tree_sha": tested_tree_sha,
+                },
+                "local_validation_gate_passed",
+            )
+            if isinstance(gate, StepOutcome):
+                gate_references = tuple(
+                    self.repository.get_evidence(evidence_id).reference
+                    for evidence_id in gate.evidence_ids
+                )
+                self.repository.transition_with_evidence(
+                    run.run_id,
+                    run.state,
+                    RunState.IMPLEMENTING,
+                    "LOCAL_VALIDATION_SKILL_NOT_PASSED",
+                    (*references, *gate_references),
+                )
+                return gate.model_copy(
+                    update={
+                        "state": RunState.IMPLEMENTING,
+                        "action": "validation_changes_required",
+                    }
+                )
+            additional_references = gate
         if result.status != "passed":
             if stage == "local_validation":
                 self.repository.transition_with_evidence(
@@ -618,7 +664,7 @@ class Orchestrator:
                 action=f"{stage}_blocked",
                 blocked_reason=f"{stage} did not pass",
             )
-        transition_references = references
+        transition_references = (*references, *additional_references)
         if stage == "local_validation":
             assert tested_tree_sha is not None
             assert validation_operation_identity is not None
@@ -639,7 +685,11 @@ class Orchestrator:
                     ],
                 },
             )
-            transition_references = (*references, validation_attestation)
+            transition_references = (
+                *references,
+                *additional_references,
+                validation_attestation,
+            )
         if stage == "internal_review":
             assert reviewed_tree_sha is not None
             assert validation_attestation is not None
@@ -676,6 +726,74 @@ class Orchestrator:
                 ref.evidence_id for ref in transition_references
             ),
         )
+
+    def _run_stage_gate(
+        self,
+        run: RunRecord,
+        config: ProjectConfig,
+        stage: str,
+        input_facts: dict[str, object],
+        evidence_kind: str,
+    ) -> tuple[object, ...] | StepOutcome:
+        if self.stage_executor is None:
+            return ()
+        input_sha256 = sha256_payload(input_facts)
+        candidates = []
+        for evidence in self.repository.list_evidence(run.run_id):
+            if evidence.kind != evidence_kind:
+                continue
+            payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(evidence.sha256, sha256_payload(payload)):
+                raise ValueError("stage gate evidence digest mismatch")
+            if (
+                type(payload) is dict
+                and payload.get("head_sha") == run.head_sha
+                and payload.get("input_sha256") == input_sha256
+                and payload.get("passed") is True
+                and type(payload.get("source_evidence_ids")) is list
+            ):
+                candidates.append(evidence.reference)
+        if len(candidates) > 1:
+            raise ValueError("stage gate evidence is ambiguous")
+        if candidates:
+            return (candidates[0],)
+        result = self.stage_executor.execute(
+            stage,
+            run,
+            config,
+            self._run_root(run.run_id),
+        )
+        references = self.repository.rebind_primary_stage_result(
+            run.run_id,
+            result,
+            primary=True,
+        )
+        if result.status != "passed":
+            return StepOutcome(
+                state=run.state,
+                action=f"{stage}_blocked",
+                blocked_reason=f"{stage} did not pass",
+                evidence_ids=tuple(
+                    reference.evidence_id for reference in references
+                ),
+            )
+        binding = hashlib.sha256(
+            f"{run.run_id}:{stage}:{input_sha256}".encode("utf-8")
+        ).hexdigest()
+        gate = self.repository.register_evidence(
+            run.run_id,
+            f"stage-gate:{binding}",
+            evidence_kind,
+            {
+                "head_sha": run.head_sha,
+                "input_sha256": input_sha256,
+                "passed": True,
+                "source_evidence_ids": [
+                    reference.evidence_id for reference in references
+                ],
+            },
+        )
+        return (*references, gate)
 
     def _request_internal_review_fix(
         self,
@@ -2285,6 +2403,45 @@ class Orchestrator:
                 blocked_reason="current head SHA does not satisfy all merge gates",
                 evidence_ids=tuple(reference.evidence_id for reference in refs),
             )
+        gate_input = {
+            "head_sha": run.head_sha,
+            "merge_gates": [
+                {
+                    "evidence_id": by_kind[kind].evidence_id,
+                    "kind": kind,
+                    "sha256": by_kind[kind].sha256,
+                }
+                for kind in sorted(READY_TO_MERGE_EVIDENCE)
+            ],
+        }
+        ready_gate = self._run_stage_gate(
+            run,
+            config,
+            "ready_check_skill",
+            gate_input,
+            "ready_check_gate_passed",
+        )
+        if isinstance(ready_gate, StepOutcome):
+            return ready_gate
+        by_kind = {}
+        for evidence in self.repository.list_evidence(run.run_id):
+            payload = json.loads(evidence.payload_json)
+            if not hmac.compare_digest(
+                evidence.sha256, sha256_payload(payload)
+            ):
+                raise ValueError("merge gate evidence digest mismatch")
+            if (
+                type(payload) is dict
+                and payload.get("sha") == run.head_sha
+                and payload.get("passed") is True
+            ):
+                by_kind[evidence.kind] = evidence
+        if not READY_TO_MERGE_EVIDENCE <= by_kind.keys():
+            return StepOutcome(
+                state=run.state,
+                action="monitoring",
+                blocked_reason="merge gates changed during ready check",
+            )
         gate_refs = tuple(
             by_kind[kind].reference for kind in sorted(READY_TO_MERGE_EVIDENCE)
         )
@@ -2293,12 +2450,14 @@ class Orchestrator:
             RunState.MONITORING_CI_REVIEW,
             RunState.READY_TO_MERGE,
             "MERGE_GATES_PASSED",
-            gate_refs,
+            (*gate_refs, *ready_gate),
         )
         return StepOutcome(
             state=RunState.READY_TO_MERGE,
             action="ready_to_merge",
-            evidence_ids=tuple(ref.evidence_id for ref in gate_refs),
+            evidence_ids=tuple(
+                ref.evidence_id for ref in (*gate_refs, *ready_gate)
+            ),
         )
 
     @staticmethod

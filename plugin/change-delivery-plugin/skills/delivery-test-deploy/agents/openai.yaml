@@ -1,0 +1,7 @@
+interface:
+  display_name: "测试环境部署预检"
+  short_description: "只读核对已登记测试分支推送事实"
+  default_prompt: "使用 $delivery-test-deploy 预检当前准确 SHA 的测试环境部署事实。"
+
+policy:
+  allow_implicit_invocation: false

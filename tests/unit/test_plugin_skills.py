@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -170,6 +171,55 @@ def test_delivery_pr_only_generates_custom_title_and_body_json() -> None:
         "凭据",
     ):
         assert required in body
+
+
+@pytest.mark.parametrize(
+    ("name", "required"),
+    [
+        (
+            "delivery-local-validation",
+            (
+                "权威命令事实",
+                "准确 SHA",
+                "StageResult",
+                "不得改写",
+                "不得修改文件",
+            ),
+        ),
+        (
+            "delivery-test-deploy",
+            (
+                "remote",
+                "test_branch",
+                "test_push_strategy",
+                "预期 SHA",
+                "StageResult",
+                "不得手动执行",
+                "git push -f",
+            ),
+        ),
+        (
+            "delivery-ready-check",
+            (
+                "合并门禁",
+                "准确 SHA",
+                "StageResult",
+                "不得 merge",
+                "不得修改 PR",
+            ),
+        ),
+    ],
+)
+def test_delivery_read_only_gate_skills_are_chinese_and_bounded(
+    name: str,
+    required: tuple[str, ...],
+) -> None:
+    body, metadata = _skill(name)
+
+    assert metadata["policy"]["allow_implicit_invocation"] is False
+    assert f"${name}" in metadata["interface"]["default_prompt"]
+    for text in required:
+        assert text in body
 
 
 def test_project_acceptance_binds_sha_and_scopes_temporary_data() -> None:

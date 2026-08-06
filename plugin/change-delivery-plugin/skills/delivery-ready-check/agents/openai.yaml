@@ -1,0 +1,7 @@
+interface:
+  display_name: "可合并前补充检查"
+  short_description: "只读汇总准确 SHA 的合并门禁与剩余风险"
+  default_prompt: "使用 $delivery-ready-check 检查当前准确 SHA 的合并门禁证据。"
+
+policy:
+  allow_implicit_invocation: false

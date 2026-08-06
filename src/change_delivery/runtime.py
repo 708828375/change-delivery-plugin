@@ -46,6 +46,9 @@ _STAGE_SKILLS = {
     "internal_review": "delivery-review",
     "internal_review_fix": "delivery-review-fix",
     "review_fix": "delivery-review-fix",
+    "local_validation_skill": "delivery-local-validation",
+    "test_deploy_skill": "delivery-test-deploy",
+    "ready_check_skill": "delivery-ready-check",
     "acceptance": "project-test-acceptance",
 }
 _CONTENT_SKILLS = {"delivery-commit", "delivery-pr"}
@@ -148,7 +151,7 @@ class RuntimeStageExecutor:
                     sort_keys=True,
                 )
                 if review_fix_scope is not None
-                else self._approval_scope(stage, run, run_root)
+                else self._approval_scope(stage, run, config, run_root)
             ),
             automation_limit="Stop at READY_TO_MERGE; never merge or release.",
             allowed_actions=self._allowed_actions(stage),
@@ -163,7 +166,12 @@ class RuntimeStageExecutor:
             status_policy=self._status_policy(stage),
             role=(
                 "read_only"
-                if stage == "internal_review"
+                if stage in {
+                    "internal_review",
+                    "local_validation_skill",
+                    "test_deploy_skill",
+                    "ready_check_skill",
+                }
                 else "writer"
             ),
             attempt=review_fix_attempt,
@@ -576,6 +584,18 @@ class RuntimeStageExecutor:
                 "Apply only the current actionable internal review findings "
                 "within approved scope."
             ),
+            "local_validation_skill": (
+                "Review the authoritative local command facts and apply only "
+                "additional project validation requirements."
+            ),
+            "test_deploy_skill": (
+                "Perform a read-only preflight for the exact registered test "
+                "deployment facts."
+            ),
+            "ready_check_skill": (
+                "Summarize current merge-gate evidence without merging or "
+                "changing any gate."
+            ),
             "acceptance": (
                 "Verify ExampleProject test acceptance for the exact current head. "
                 "Use only approved public API data and exact cleanup."
@@ -584,7 +604,12 @@ class RuntimeStageExecutor:
 
     @staticmethod
     def _allowed_actions(stage: str) -> tuple[str, ...]:
-        if stage == "internal_review":
+        if stage in {
+            "internal_review",
+            "local_validation_skill",
+            "test_deploy_skill",
+            "ready_check_skill",
+        }:
             return ("read files", "inspect diff", "run read-only checks")
         if stage == "design":
             return (
@@ -625,10 +650,63 @@ class RuntimeStageExecutor:
         self,
         stage: str,
         run: RunRecord,
+        config: ProjectConfig,
         run_root: Path,
     ) -> str:
         if stage == "design":
             return "Draft artifacts only; explicit approval is still required."
+        if stage == "test_deploy_skill":
+            scope = json.dumps(
+                {
+                    "expected_sha": run.head_sha,
+                    "remote": config.remote,
+                    "test_branch": config.test_branch,
+                    "test_push_strategy": config.test_push_strategy,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return scope
+        if stage == "ready_check_skill":
+            facts = []
+            for evidence in self._repository.list_evidence(run.run_id):
+                payload = json.loads(evidence.payload_json)
+                if (
+                    type(payload) is dict
+                    and payload.get("sha") == run.head_sha
+                    and payload.get("passed") is True
+                ):
+                    facts.append(
+                        {
+                            "evidence_id": evidence.evidence_id,
+                            "kind": evidence.kind,
+                            "sha256": evidence.sha256,
+                        }
+                    )
+            return json.dumps(
+                {"head_sha": run.head_sha, "merge_gate_facts": facts},
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        if stage == "local_validation_skill":
+            facts = [
+                {
+                    "evidence_id": evidence.evidence_id,
+                    "kind": evidence.kind,
+                    "payload": json.loads(evidence.payload_json),
+                    "sha256": evidence.sha256,
+                }
+                for evidence in self._repository.list_evidence(run.run_id)
+                if evidence.kind == "local_validation_passed"
+            ]
+            return json.dumps(
+                {"authoritative_command_facts": facts, "head_sha": run.head_sha},
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         artifacts = {
             name: contents.decode("utf-8")
             for name, contents in self._repository.get_approved_artifacts(

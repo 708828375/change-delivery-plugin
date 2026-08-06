@@ -773,7 +773,7 @@ def test_pr_content_with_credentials_never_reaches_github(
                 "e" * 64,
             )
 
-    outcome = Orchestrator(
+    orchestrator = Orchestrator(
         repository=fixture.repository,
         plugin_root=fixture.root,
         config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
@@ -781,11 +781,87 @@ def test_pr_content_with_credentials_never_reaches_github(
         github_factory=lambda project: fixture.github,
         approval_validator=lambda run, project, root: True,
         content_generator=UnsafeGenerator(fixture.repository),
-    ).step(run_id)
+    )
+    outcome = orchestrator.step(run_id)
 
     assert outcome.state is RunState.PR_DRAFT
     assert fixture.github.ensure_calls == 0
     assert "ValueError" in (outcome.blocked_reason or "")
+
+
+def test_test_deploy_skill_runs_before_authoritative_push(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DEPLOYING_TEST)
+    executor = FakeStageExecutor(fixture.repository)
+    environment = FakeReconciledPort()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        test_environment=environment,
+    )
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.ACCEPTANCE_TESTING
+    assert executor.calls == ["test_deploy_skill"]
+    assert environment.execute_calls == 1
+
+
+def test_test_deploy_skill_cannot_override_or_repeat_pending_push(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DEPLOYING_TEST)
+    executor = FakeStageExecutor(fixture.repository)
+
+    class UncertainEnvironment(FakeReconciledPort):
+        def execute(self, run: object, project: object) -> dict[str, object]:
+            self.execute_calls += 1
+            raise TimeoutError("uncertain")
+
+    environment = UncertainEnvironment()
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        test_environment=environment,
+    )
+
+    assert orchestrator.step(run_id).action == "deploy_test_reconciliation_pending"
+    assert orchestrator.step(run_id).action == "deploy_test_reconciliation_pending"
+    assert executor.calls == ["test_deploy_skill"]
+    assert environment.execute_calls == 1
+
+
+def test_test_deploy_skill_failure_prevents_authoritative_push(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DEPLOYING_TEST)
+    executor = FakeStageExecutor(fixture.repository, status="failed")
+    environment = FakeReconciledPort()
+
+    outcome = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        test_environment=environment,
+    ).step(run_id)
+
+    assert outcome.state is RunState.DEPLOYING_TEST
+    assert outcome.action == "test_deploy_skill_blocked"
+    assert environment.execute_calls == 0
 
 
 def test_pending_pr_only_queries_and_never_replays_create(fixture: Fixture) -> None:
@@ -981,9 +1057,12 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
             "delivery-planning",
             "delivery-implement",
             "delivery-commit",
+            "delivery-local-validation",
             "delivery-pr",
+            "delivery-ready-check",
             "delivery-review",
             "delivery-review-fix",
+            "delivery-test-deploy",
             "project-test-acceptance",
     ):
         assert (skills_root / name / "SKILL.md").is_file()
@@ -1005,9 +1084,12 @@ def test_default_runtime_skills_are_bundled_with_plugin() -> None:
             "delivery-planning",
             "delivery-implement",
             "delivery-commit",
+            "delivery-local-validation",
             "delivery-pr",
+            "delivery-ready-check",
             "delivery-review",
             "delivery-review-fix",
+            "delivery-test-deploy",
             "project-test-acceptance",
         "production-release",
     }
@@ -1059,6 +1141,114 @@ def test_runtime_local_validation_registers_host_bound_source(
     assert payload["commands"] == [
         {"command_id": "1" * 16, "exit_code": 0}
     ]
+
+
+def test_local_validation_skill_runs_after_authoritative_commands(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    worktree = fixture.root / "worktrees" / run_id
+    worktree.mkdir(parents=True)
+    order: list[str] = []
+    requests: list[object] = []
+
+    class PassingRunner:
+        def run(self, spec: object) -> ProcessResult:
+            order.append("host-check")
+            return ProcessResult(
+                command_id="1" * 16,
+                exit_code=0,
+                stdout="",
+                stderr="",
+                duration_ms=1,
+            )
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            order.append("skill")
+            requests.append(request)
+            return StageResult(
+                status="passed",
+                summary="补充要求通过",
+                evidence=(
+                    EvidenceRef(
+                        evidence_id="placeholder",
+                        kind="placeholder",
+                        sha256="0" * 64,
+                    ),
+                ),
+                findings=(),
+                next_action="continue",
+            )
+
+    executor = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        runner=PassingRunner(),  # type: ignore[arg-type]
+        codex_factory=lambda: FakeCodex(),
+    )
+    local_orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=FakeCommitPort(),
+    )
+    outcome = local_orchestrator.step(run_id)
+
+    assert outcome.state is RunState.INTERNAL_REVIEW
+    assert order == ["host-check", "skill"]
+    request = requests[0]
+    assert request.expected_skill == "delivery-local-validation"  # type: ignore[attr-defined]
+    scope = json.loads(request.approval_scope)  # type: ignore[attr-defined]
+    assert scope["authoritative_command_facts"]
+    assert scope["head_sha"] == SHA
+
+
+def test_failed_authoritative_local_validation_never_calls_skill(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.LOCAL_VALIDATION)
+    (fixture.root / "worktrees" / run_id).mkdir(parents=True)
+    calls: list[object] = []
+
+    class FailingRunner:
+        def run(self, spec: object) -> ProcessResult:
+            return ProcessResult(
+                command_id="2" * 16,
+                exit_code=1,
+                stdout="",
+                stderr="failed",
+                duration_ms=1,
+            )
+
+    class FakeCodex:
+        def run_stage(self, request: object) -> StageResult:
+            calls.append(request)
+            raise AssertionError("failed authority must stop before Skill")
+
+    executor = RuntimeStageExecutor(
+        fixture.repository,
+        fixture.root,
+        runner=FailingRunner(),  # type: ignore[arg-type]
+        codex_factory=lambda: FakeCodex(),
+    )
+    outcome = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+        commit_port=FakeCommitPort(),
+    ).step(run_id)
+
+    assert outcome.state is RunState.IMPLEMENTING
+    assert calls == []
 
 
 def test_runtime_codex_stage_replaces_untrusted_model_evidence(
@@ -1935,7 +2125,11 @@ def test_stage_handlers_call_once_rebind_and_advance(
     outcome = orchestrator.step(run_id)
 
     assert outcome.state is target
-    assert executor.calls == [stage]
+    assert executor.calls == (
+        [stage, "local_validation_skill"]
+        if stage == "local_validation"
+        else [stage]
+    )
 
 
 def test_local_validation_rejects_tree_change_during_stage(
@@ -2060,7 +2254,7 @@ def test_internal_review_rejects_validation_attestation_for_old_tree(
 
     assert outcome.state is RunState.INTERNAL_REVIEW
     assert "changed after local validation" in (outcome.blocked_reason or "")
-    assert executor.calls == ["local_validation"]
+    assert executor.calls == ["local_validation", "local_validation_skill"]
 
 
 def test_internal_review_records_tree_bound_attestation(
@@ -2174,6 +2368,7 @@ def test_internal_review_fix_returns_to_validation_then_review(
     assert orchestrator.step(run_id).state is RunState.COMMITTING
     assert executor.calls == [
         "local_validation",
+        "local_validation_skill",
         "internal_review",
         "internal_review_fix",
         "local_validation",
@@ -3057,9 +3252,10 @@ def test_cli_start_prepare_and_approve_lifecycle_is_hash_bound(
     executor = RuntimeStageExecutor(fixture.repository, fixture.root)
     scope = json.loads(
         executor._approval_scope(  # type: ignore[attr-defined]
-            "implementation",
-            fixture.repository.get_run(run_id),
-            fixture.root / "runs" / run_id,
+                "implementation",
+                fixture.repository.get_run(run_id),
+                config(fixture.root),
+                fixture.root / "runs" / run_id,
         )
     )
     assert scope["design.md"] == original_design.decode("utf-8")
@@ -3135,9 +3331,10 @@ def test_same_hash_reapprove_backfills_legacy_missing_artifacts_in_later_state(
     executor = RuntimeStageExecutor(fixture.repository, fixture.root)
     scope = json.loads(
         executor._approval_scope(  # type: ignore[attr-defined]
-            "implementation",
-            fixture.repository.get_run(run_id),
-            run_root,
+                "implementation",
+                fixture.repository.get_run(run_id),
+                config(fixture.root),
+                run_root,
         )
     )
     assert scope["design.md"] == "design.md"
@@ -3300,6 +3497,79 @@ def test_monitor_requires_all_six_gates_for_current_head(fixture: Fixture) -> No
 
     assert ready.state is RunState.READY_TO_MERGE
     assert len(ready.evidence_ids) == 6
+
+
+def test_ready_check_skill_runs_after_host_gates_and_is_cached(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
+            (run_id,),
+        )
+    fixture.github.snapshot_result = Snapshot(SHA)
+    for kind in ("acceptance_passed", "internal_review_passed"):
+        fixture.repository.register_evidence(
+            run_id,
+            f"current-{kind}",
+            kind,
+            {"sha": SHA, "passed": True},
+        )
+    executor = FakeStageExecutor(fixture.repository)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.READY_TO_MERGE
+    assert executor.calls == ["ready_check_skill"]
+    cached = [
+        evidence
+        for evidence in fixture.repository.list_evidence(run_id)
+        if evidence.kind == "ready_check_gate_passed"
+    ]
+    assert len(cached) == 1
+
+
+def test_ready_check_skill_failure_cannot_authorize_ready_state(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
+            (run_id,),
+        )
+    fixture.github.snapshot_result = Snapshot(SHA)
+    for kind in ("acceptance_passed", "internal_review_passed"):
+        fixture.repository.register_evidence(
+            run_id,
+            f"current-{kind}",
+            kind,
+            {"sha": SHA, "passed": True},
+        )
+    executor = FakeStageExecutor(fixture.repository, status="failed")
+
+    outcome = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+    ).step(run_id)
+
+    assert outcome.state is RunState.MONITORING_CI_REVIEW
+    assert outcome.action == "ready_check_skill_blocked"
 
 
 @pytest.mark.parametrize(

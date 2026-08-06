@@ -1,0 +1,7 @@
+interface:
+  display_name: "交付本地验证补充检查"
+  short_description: "依据权威命令事实执行项目只读补充验证"
+  default_prompt: "使用 $delivery-local-validation 检查当前准确 SHA 的本地验证事实。"
+
+policy:
+  allow_implicit_invocation: false
