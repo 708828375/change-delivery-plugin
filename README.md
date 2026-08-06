@@ -107,6 +107,8 @@ max_internal_review_fix_attempts: 3
 
 内置 `references/` 已按阶段整理团队开发、接口测试、中文 commit/PR、ExampleProject 异步 Review、测试部署和功能验收规则。项目专项规则必须带明确触发条件，例如只有改动涉及 Celery、Outbox 或 Watchdog 时才读取 ExampleProject 异步 Review 清单，不能把专项要求无条件应用到其他项目。
 
+阶段 `SKILL.md` 应优先描述目标、完成/退出判据、所需证据和不可逆权限边界，不重复运行主机已经注入的 JSON Schema、状态映射和动作白名单。模型能够从当前仓库直接判断的通用开发步骤不必逐条罗列；只有团队约定、项目陷阱和验收口径进入 `references/`，并通过明确条件按需加载。
+
 Skill 及其 `references/` 只能定制阶段内容或收紧检查，不能改变固定状态、remote、分支、push 策略、主机权限和副作用边界，也不能直接执行 commit、push、创建 PR 或 merge。个人 SSH 路径、密钥、密码和服务器连接信息不得写入引用文件，应由项目配置或运行主机批准的凭据名称提供。
 
 修改 Skill 后需要重新运行 `install-shared-plugin.ps1`，并新建 Codex CLI 会话；旧会话和未重新安装的发布副本不会自动获得修改。

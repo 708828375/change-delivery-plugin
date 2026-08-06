@@ -1,14 +1,12 @@
 ---
 name: delivery-planning
-description: 当 change-delivery 运行进入设计阶段，需要把 requirement.md 转换为限定在已批准范围内的 design.md 和 implementation-plan.md 时使用。
+description: 当 change-delivery 需要把批准的 requirement.md 转换为 design.md 和 implementation-plan.md 时使用。
 ---
 
-# 交付方案设计
+# 方案设计
 
-完整读取 `requirement.md`。仅当仓库上下文位于允许的工作目录内时才检查它。
+目标是在批准范围内产出可实施、可验证、可审查的 `design.md` 与 `implementation-plan.md`。先阅读 `references/project-analysis-and-test-strategy.md`，再按当前仓库事实选择分析深度。
 
-完整读取 [references/project-analysis-and-test-strategy.md](references/project-analysis-and-test-strategy.md)，将其中的项目分析、业务链路和测试策略要求应用到设计产物。
+完成判据：方案明确行为边界、关键取舍、受影响接口或数据、验证策略、实施顺序与风险；计划中的每项任务都有可观察结果。未知决策如实列为待确认项。
 
-只能写入 `design.md` 和 `implementation-plan.md`。明确记录需求、成功标准、受影响组件、风险、测试策略、回滚方案和有序的实现任务。对于尚未确定的产品或架构决策，应如实记录，不得猜测。
-
-不得编辑产品代码。不得批准设计、commit、push、部署、合并、执行网络写操作或扩大需求范围。返回运行主机要求的结构化阶段结果，并将这两个已写入产物列为证据。
+本阶段只写入上述设计产物，不修改产品代码。产物写入后返回路径与摘要，交由运行主机生成审批快照；只有用户对准确的 `approval_sha256` 显式批准后才能进入开发。
