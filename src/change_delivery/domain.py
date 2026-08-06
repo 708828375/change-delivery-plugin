@@ -483,6 +483,21 @@ class StepOutcome(FrozenModel):
         return self
 
 
+class RunOutcome(FrozenModel):
+    state: RunState
+    action: str = Field(min_length=1, pattern=NON_BLANK_PATTERN)
+    steps_processed: int = Field(ge=0, le=32)
+    step_actions: tuple[str, ...]
+    evidence_ids: tuple[str, ...] = Field(default_factory=tuple)
+    blocked_reason: str | None = None
+
+    @model_validator(mode="after")
+    def require_one_action_per_processed_step(self) -> Self:
+        if len(self.step_actions) != self.steps_processed:
+            raise ValueError("每个已处理步骤必须有且仅有一个 action")
+        return self
+
+
 class EvidenceRecord(FrozenModel):
     evidence_id: str = Field(pattern=EVIDENCE_IDENTIFIER_PATTERN)
     run_id: str

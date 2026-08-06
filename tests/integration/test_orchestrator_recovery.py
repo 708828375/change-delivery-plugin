@@ -734,7 +734,7 @@ def test_blocked_without_source_fails_closed(fixture: Fixture) -> None:
     assert "source" in (outcome.blocked_reason or "")
 
 
-def test_cli_help_lists_all_nine_commands() -> None:
+def test_cli_help_lists_all_commands() -> None:
     stdout = StringIO()
     assert main(["--help"], stdout=stdout, stderr=StringIO()) == 0
     output = stdout.getvalue()
@@ -744,6 +744,7 @@ def test_cli_help_lists_all_nine_commands() -> None:
         "approve",
         "status",
         "resume",
+        "run",
         "cancel",
         "doctor",
         "tick",
@@ -1519,6 +1520,7 @@ required_pre_pr_checks:
         ["approve", "run", "--approval-file", "missing", "--json"],
         ["status", "--json"],
         ["resume", "run", "--json"],
+        ["run", "run", "--json"],
         ["cancel", "run", "--json"],
         ["doctor", "--json"],
         ["tick", "--json"],
@@ -1628,6 +1630,57 @@ def test_draft_calls_design_stage_once_before_awaiting(fixture: Fixture) -> None
 
     assert outcome.state is RunState.AWAITING_DESIGN_APPROVAL
     assert executor.calls == ["design"]
+
+
+def test_run_advances_until_design_approval(fixture: Fixture) -> None:
+    run_id = fixture.create(RunState.DRAFT)
+    executor = FakeStageExecutor(fixture.repository)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (config(fixture.root), CONFIG_HASH),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+        approval_validator=lambda run, project, root: True,
+        stage_executor=executor,
+    )
+
+    outcome = orchestrator.run(run_id, max_steps=32)
+
+    assert outcome.state is RunState.AWAITING_DESIGN_APPROVAL
+    assert outcome.action == "design_artifacts_ready"
+    assert outcome.steps_processed == 1
+    assert outcome.step_actions == ("design_artifacts_ready",)
+
+
+def test_run_stops_at_external_wait_without_busy_loop(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.MONITORING_CI_REVIEW)
+    with fixture.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE runs SET pr_number = 42 WHERE run_id = ?",
+            (run_id,),
+        )
+    fixture.github.snapshot_result = Snapshot(SHA)
+
+    outcome = fixture.orchestrator().run(run_id, max_steps=32)
+
+    assert outcome.state is RunState.MONITORING_CI_REVIEW
+    assert outcome.steps_processed == 1
+    assert outcome.step_actions == (outcome.action,)
+
+
+def test_run_has_hard_step_limit(fixture: Fixture) -> None:
+    run_id = fixture.create(RunState.APPROVED)
+
+    outcome = fixture.orchestrator().run(run_id, max_steps=1)
+
+    assert outcome.state is RunState.PREPARING_WORKTREE
+    assert outcome.action == "step_limit_reached"
+    assert outcome.steps_processed == 1
+    assert outcome.step_actions == ("approval_scope_accepted",)
+    assert "1" in (outcome.blocked_reason or "")
 
 
 def test_draft_empty_design_does_not_advance(fixture: Fixture) -> None:

@@ -1,8 +1,11 @@
 import os
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
+from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +14,7 @@ from change_delivery.cli import (
     CliUsageError,
     _github_executable_binding,
     _github_fixed_environment,
+    main,
 )
 
 
@@ -24,6 +28,47 @@ def test_python_module_help_is_available() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Change Delivery" in result.stdout
+
+
+def test_run_command_returns_continuous_progress_json(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    class FakeOrchestrator:
+        def run(self, run_id: str) -> object:
+            calls.append(run_id)
+            return SimpleNamespace(
+                model_dump=lambda **kwargs: {
+                    "state": "READY_TO_MERGE",
+                    "action": "ready_to_merge",
+                    "steps_processed": 7,
+                    "step_actions": ["implementation_passed", "ready_to_merge"],
+                    "evidence_ids": ["ready-proof"],
+                    "blocked_reason": None,
+                }
+            )
+
+    stdout = StringIO()
+    result = main(
+        ["run", "run-123", "--json"],
+        services=CliServices(
+            plugin_root=tmp_path,
+            orchestrator=FakeOrchestrator(),
+        ),
+        stdout=stdout,
+        stderr=StringIO(),
+    )
+
+    assert result == 0
+    assert calls == ["run-123"]
+    assert json.loads(stdout.getvalue()) == {
+        "ok": True,
+        "state": "READY_TO_MERGE",
+        "action": "ready_to_merge",
+        "steps_processed": 7,
+        "step_actions": ["implementation_passed", "ready_to_merge"],
+        "evidence_ids": ["ready-proof"],
+        "blocked_reason": None,
+    }
 
 
 def test_github_config_is_pinned_under_trusted_userprofile(

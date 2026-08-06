@@ -26,6 +26,7 @@ from change_delivery.adapters.github import (
 )
 from change_delivery.domain import (
     ProjectConfig,
+    RunOutcome,
     RunRecord,
     RunState,
     StageResult,
@@ -389,6 +390,64 @@ class Orchestrator:
             )
 
     resume = step
+
+    def run(self, run_id: str, *, max_steps: int = 32) -> RunOutcome:
+        if type(max_steps) is not int or not 1 <= max_steps <= 32:
+            raise ValueError("max_steps must be an integer from 1 to 32")
+        stop_states = {
+            RunState.AWAITING_DESIGN_APPROVAL,
+            RunState.BLOCKED,
+            RunState.REVIEW_DECISION_REQUIRED,
+            RunState.READY_TO_MERGE,
+            RunState.COMPLETED,
+            RunState.FAILED_TERMINAL,
+            RunState.CANCELLED,
+        }
+        wait_actions = {
+            "awaiting_review_update",
+            "blocked",
+            "blocked_dependency",
+            "monitoring",
+            "process_timeout",
+            "waiting_approval",
+        }
+        actions: list[str] = []
+        evidence_ids: list[str] = []
+        last: StepOutcome | None = None
+
+        for _ in range(max_steps):
+            before = self.repository.get_run(run_id).state
+            last = self.step(run_id)
+            actions.append(last.action)
+            for evidence_id in last.evidence_ids:
+                if evidence_id not in evidence_ids:
+                    evidence_ids.append(evidence_id)
+            persisted = self.repository.get_run(run_id).state
+            if (
+                persisted in stop_states
+                or last.action in wait_actions
+                or persisted is before
+            ):
+                return RunOutcome(
+                    state=persisted,
+                    action=last.action,
+                    steps_processed=len(actions),
+                    step_actions=tuple(actions),
+                    evidence_ids=tuple(evidence_ids),
+                    blocked_reason=last.blocked_reason,
+                )
+
+        assert last is not None
+        return RunOutcome(
+            state=self.repository.get_run(run_id).state,
+            action="step_limit_reached",
+            steps_processed=len(actions),
+            step_actions=tuple(actions),
+            evidence_ids=tuple(evidence_ids),
+            blocked_reason=(
+                f"continuous delivery stopped after the {max_steps}-step limit"
+            ),
+        )
 
     def _blocked_dependency(
         self,

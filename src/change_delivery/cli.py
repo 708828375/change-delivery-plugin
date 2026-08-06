@@ -586,6 +586,8 @@ def _parser() -> JsonArgumentParser:
     status.add_argument("--run-id")
     resume = command("resume")
     resume.add_argument("run_id")
+    run = command("run")
+    run.add_argument("run_id")
     cancel = command("cancel")
     cancel.add_argument("run_id")
     pin = command("pin")
@@ -1079,6 +1081,8 @@ def _execute(args: argparse.Namespace, services: CliServices) -> dict[str, Any]:
         return _approve(args, services)
     if args.command == "resume":
         return _orchestrator_action("resume", args.run_id, services)
+    if args.command == "run":
+        return _orchestrator_action("run", args.run_id, services)
     if args.command == "cancel":
         return _orchestrator_action("cancel", args.run_id, services)
     if args.command == "pin":

@@ -23,8 +23,8 @@ $deliveryLauncher = Join-Path (
 2. 在全局注册表中识别项目。如果项目尚未登记，不得编辑项目或隐式登记；只能生成 dry-run 接入报告，并请求显式登记。
 3. 将需求写入绝对路径文件，然后运行 `& $deliveryLauncher start --project <project-id> --requirement-file <absolute-path> --json` 启动。使用 `& $deliveryLauncher resume <run-id> --json` 推进设计阶段。
 4. 到达 `AWAITING_DESIGN_APPROVAL` 时，运行 `& $deliveryLauncher prepare-approval <run-id> --json`。向用户展示返回的准确审批文件、产物范围和 `approval_sha256`。暂停，直到用户显式确认该 hash。
-5. 只有确认后，才能运行 `& $deliveryLauncher approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json`。文件或 hash 发生变化时，必须重新确认。
-6. 使用 `& $deliveryLauncher resume <run-id> --json` 推进流程；使用 `& $deliveryLauncher status --run-id <run-id> --json` 检查状态；计划性协调只能通过 `& $deliveryLauncher tick --json` 执行。不得模拟状态转换、跳过状态，或把文字描述当作状态证据。
+5. 只有确认后，才能运行 `& $deliveryLauncher approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json`。文件或 hash 发生变化时，必须重新确认。审批成功后，立即调用一次 `& $deliveryLauncher run <run-id> --json` 连续推进。
+6. 使用 `& $deliveryLauncher run <run-id> --json` 连续推进到人工关卡、外部等待、阻塞或 `READY_TO_MERGE`；仅在需要诊断单步行为时使用 `resume`。使用 `& $deliveryLauncher status --run-id <run-id> --json` 检查状态；计划性协调只能通过 `& $deliveryLauncher tick --json` 执行。不得模拟状态转换、跳过状态，或把文字描述当作状态证据。
 7. 实现阶段必须显式使用 `$delivery-implement`；内部 review 阶段必须显式使用 `$delivery-review`；ExampleProject 验收必须显式使用 `$project-test-acceptance`。
 8. 根据返回的结构化阶段结果报告阻塞项和证据。
 9. 到达 `READY_TO_MERGE` 时停止，并报告 PR 和证据。不得合并、发布或编造后续状态，即使之前的授权要求完成整个交付流程也不例外。

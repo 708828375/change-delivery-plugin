@@ -41,6 +41,7 @@ def test_change_delivery_is_explicit_and_enforces_public_entry_gates() -> None:
         "prepare-approval <run-id> --json",
         "approve <run-id> --approval-file <absolute-approval-file> --confirm-hash <approval_sha256> --json",
         "resume <run-id> --json",
+        "run <run-id> --json",
         "status --run-id <run-id> --json",
         "acceptance_check",
         "BLOCKED",
