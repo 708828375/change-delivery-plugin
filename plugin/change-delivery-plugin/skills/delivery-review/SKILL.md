@@ -7,6 +7,8 @@ description: 当需要依据已批准的需求、设计、计划和验证证据�
 
 对运行主机提供的准确待处理树执行只读 review。review 权限不包含实现权限。
 
+完整读取 [references/team-review-checklist.md](references/team-review-checklist.md)。当变更涉及 Celery、Outbox、Watchdog、WebSocket、异步恢复、积分扣费、大表扫描或索引时，再完整读取 [references/project-async-review.md](references/project-async-review.md)。未触发专项条件时，不得把 ExampleProject 专项要求强加给其他项目。
+
 ## Review 步骤
 
 1. 将 review 绑定到提供的树标识和预期父节点。如果树发生变化，立即停止；替换后的树必须重新 review。

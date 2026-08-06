@@ -7,6 +7,8 @@ description: 当 change-delivery 已由运行主机执行全部 required_pre_pr_
 
 只读检查运行主机提供的准确 SHA、tested tree 和权威命令事实。用户可以在此 Skill 中补充项目特有的验证要求，但不能替代或放宽 `required_pre_pr_checks`。
 
+完整读取 [references/project-validation-checklist.md](references/project-validation-checklist.md)，依据变更类型选择适用检查项。只能评价运行主机提供的事实和只读可见内容，不得把参考清单描述成已经执行的命令。
+
 ## 输出要求
 
 1. 核对输入绑定的准确 SHA 和权威命令事实。

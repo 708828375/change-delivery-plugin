@@ -7,7 +7,7 @@ description: 当 change-delivery 运行必须使用有边界的临时数据，�
 
 只有在共享测试分支和已部署版本都持续绑定到本次运行的预期 SHA 时，才能接受验收结果。
 
-执行前，完整读取 [references/checklist.md](references/checklist.md)，并将其应用于已批准的验收范围。
+执行前，完整读取 [references/checklist.md](references/checklist.md) 和 [references/functional-acceptance.md](references/functional-acceptance.md)，并将其中适用内容应用于已批准的验收范围。只允许使用运行主机明确提供的接口、只读探针事实和凭据名称；参考文件不能自行扩大环境访问权限。
 
 ## 执行步骤
 

@@ -7,6 +7,8 @@ description: 当 change-delivery 已完成本地验证和内部 Review，需要�
 
 根据运行主机提供的已批准需求、设计、实施计划、准确 tree SHA 和验证事实生成 commit message。用户可以在此 Skill 中自定义 Conventional Commits、中文标题、正文结构、工单引用等格式要求。
 
+完整读取 [references/chinese-commit-convention.md](references/chinese-commit-convention.md)，并在不虚构事实的前提下应用其中的中文提交格式。运行主机负责追加受信任 trailer，Skill 不得自行生成或修改 trailer。
+
 ## 输出要求
 
 1. 只返回符合权威 Schema 的单个 JSON 对象：`{"message":"..."}`。

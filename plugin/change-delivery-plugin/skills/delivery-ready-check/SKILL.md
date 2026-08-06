@@ -7,6 +7,8 @@ description: 当 change-delivery 已收集当前准确 SHA 的全部权威合并
 
 只读检查当前准确 SHA 的合并门禁证据，并生成补充风险汇总。此 Skill 只能收紧流程；最终 `READY_TO_MERGE` 仍由运行主机重新读取全部权威证据后判断。
 
+完整读取 [references/merge-readiness.md](references/merge-readiness.md)，核对开发记录、验证、Review、测试环境验收、资源清理和残留风险是否已被当前 SHA 的证据覆盖。
+
 ## 输出要求
 
 1. 核对每项合并门禁是否绑定同一准确 SHA。

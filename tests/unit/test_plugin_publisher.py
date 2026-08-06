@@ -51,6 +51,11 @@ def make_plugin_source(root: Path, skill_text: str = "new skill") -> Path:
         (source / "skills" / skill / "SKILL.md").write_text(
             skill_text, encoding="utf-8"
         )
+    review_references = source / "skills" / "delivery-review" / "references"
+    review_references.mkdir()
+    (review_references / "team-review.md").write_text(
+        "review reference", encoding="utf-8"
+    )
     return source
 
 
@@ -104,6 +109,9 @@ Install-CleanPluginStage $stage '{target}' '{source}'
     } == set(EXPECTED_SKILLS)
     assert not list(target.rglob("__pycache__"))
     assert not list(target.rglob("*.pyc"))
+    assert (
+        target / "skills" / "delivery-review" / "references" / "team-review.md"
+    ).read_text(encoding="utf-8") == "review reference"
 
 
 def test_regular_update_replaces_the_managed_plugin_tree(tmp_path: Path) -> None:

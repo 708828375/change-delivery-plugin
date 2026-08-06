@@ -10,6 +10,42 @@ ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_ROOT = ROOT / "plugin" / "change-delivery-plugin"
 LAUNCHER_FRAGMENT = ".codex\\change-delivery\\bin\\change-delivery.ps1"
 
+STAGE_REFERENCE_FILES = {
+    "delivery-planning": (
+        "project-analysis-and-test-strategy.md",
+    ),
+    "delivery-implement": (
+        "team-development-rules.md",
+        "test-assets.md",
+    ),
+    "delivery-local-validation": (
+        "project-validation-checklist.md",
+    ),
+    "delivery-review": (
+        "team-review-checklist.md",
+        "project-async-review.md",
+    ),
+    "delivery-review-fix": (
+        "review-feedback-triage.md",
+    ),
+    "delivery-commit": (
+        "chinese-commit-convention.md",
+    ),
+    "delivery-pr": (
+        "chinese-pr-template.md",
+    ),
+    "delivery-test-deploy": (
+        "project-deploy-preflight.md",
+    ),
+    "project-test-acceptance": (
+        "checklist.md",
+        "functional-acceptance.md",
+    ),
+    "delivery-ready-check": (
+        "merge-readiness.md",
+    ),
+}
+
 
 def _skill(name: str) -> tuple[str, dict[str, object]]:
     skill_root = PLUGIN_ROOT / "skills" / name
@@ -318,3 +354,113 @@ def test_builtin_skill_user_facing_content_is_chinese() -> None:
                 skill_file,
                 field,
             )
+
+
+def test_stage_skills_route_to_packaged_chinese_references() -> None:
+    for skill_name, reference_names in STAGE_REFERENCE_FILES.items():
+        skill_root = PLUGIN_ROOT / "skills" / skill_name
+        body = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+        for reference_name in reference_names:
+            relative = f"references/{reference_name}"
+            reference = skill_root / relative
+            assert relative in body, (skill_name, relative)
+            text = reference.read_text(encoding="utf-8")
+            assert any("\u4e00" <= char <= "\u9fff" for char in text), reference
+            assert "C:\\Users\\JoySun" not in text, reference
+            assert "PRIVATE KEY" not in text, reference
+
+
+def test_stage_references_preserve_host_side_effect_boundaries() -> None:
+    all_reference_text = "\n".join(
+        reference.read_text(encoding="utf-8")
+        for skill_name in STAGE_REFERENCE_FILES
+        for reference in (
+            PLUGIN_ROOT / "skills" / skill_name / "references"
+        ).glob("*.md")
+    )
+
+    for forbidden in (
+        "git push origin HEAD:test -f",
+        "gh pr create",
+        "gh pr merge",
+        "git commit -m",
+        "直接写入数据库完成验收",
+    ):
+        assert forbidden not in all_reference_text
+
+
+def test_split_references_cover_the_local_team_workflow_rules() -> None:
+    expected_content = {
+        "delivery-planning/project-analysis-and-test-strategy.md": (
+            "以代码为准",
+            "业务链路",
+            "外部依赖",
+        ),
+        "delivery-implement/team-development-rules.md": (
+            "复用",
+            "N+1",
+            "字段注释",
+            "UTF-8",
+        ),
+        "delivery-implement/test-assets.md": (
+            "变量契约",
+            "mock",
+            "seed",
+            "清理",
+        ),
+        "delivery-local-validation/project-validation-checklist.md": (
+            "聚焦验证",
+            "批量",
+            "未覆盖项",
+        ),
+        "delivery-review/team-review-checklist.md": (
+            "必须修复",
+            "建议修改",
+            "仅供参考",
+        ),
+        "delivery-review/project-async-review.md": (
+            "Outbox",
+            "幂等",
+            "Watchdog",
+            "扣费",
+        ),
+        "delivery-review-fix/review-feedback-triage.md": (
+            "问题是否存在",
+            "最小修复",
+            "重新验证",
+        ),
+        "delivery-commit/chinese-commit-convention.md": (
+            "Conventional Commits",
+            "变更背景",
+            "取舍",
+        ),
+        "delivery-pr/chinese-pr-template.md": (
+            "变更说明",
+            "测试情况",
+            "部署注意事项",
+        ),
+        "delivery-test-deploy/project-deploy-preflight.md": (
+            "只读",
+            "预期 SHA",
+            "版本端点",
+        ),
+        "project-test-acceptance/functional-acceptance.md": (
+            "public API",
+            "WebSocket",
+            "Docker 日志",
+            "只读 SQL",
+        ),
+        "delivery-ready-check/merge-readiness.md": (
+            "开发记录",
+            "残留风险",
+            "资源清理",
+        ),
+    }
+
+    for relative, required_values in expected_content.items():
+        skill_name, reference_name = relative.split("/", 1)
+        text = (
+            PLUGIN_ROOT / "skills" / skill_name / "references" / reference_name
+        ).read_text(encoding="utf-8")
+        for required in required_values:
+            assert required in text, (relative, required)

@@ -103,7 +103,11 @@ max_internal_review_fix_attempts: 3
 | 测试环境验收 | `project-test-acceptance` | 测试场景、资源和清理要求 |
 | 合并前检查 | `delivery-ready-check` | 合并门禁汇总和补充风险检查 |
 
-可以直接修改仓库中对应 Skill 的中文提示词来保留个人或团队习惯。Skill 只能定制阶段内容或收紧检查，不能改变固定状态、remote、分支、push 策略、主机权限和副作用边界，也不能直接执行 commit、push、创建 PR 或 merge。
+当前版本每个阶段仍只调用一个固定 Skill，不包含追加 Skill 调度。可以直接修改仓库中对应 Skill 的中文提示词来保留个人或团队习惯；复杂规则优先放入该 Skill 自己的 `references/`，再由 `SKILL.md` 明确说明始终读取或按变更类型读取。这样不会增加阶段调用次数，也不会形成多个实现写入者。
+
+内置 `references/` 已按阶段整理团队开发、接口测试、中文 commit/PR、ExampleProject 异步 Review、测试部署和功能验收规则。项目专项规则必须带明确触发条件，例如只有改动涉及 Celery、Outbox 或 Watchdog 时才读取 ExampleProject 异步 Review 清单，不能把专项要求无条件应用到其他项目。
+
+Skill 及其 `references/` 只能定制阶段内容或收紧检查，不能改变固定状态、remote、分支、push 策略、主机权限和副作用边界，也不能直接执行 commit、push、创建 PR 或 merge。个人 SSH 路径、密钥、密码和服务器连接信息不得写入引用文件，应由项目配置或运行主机批准的凭据名称提供。
 
 修改 Skill 后需要重新运行 `install-shared-plugin.ps1`，并新建 Codex CLI 会话；旧会话和未重新安装的发布副本不会自动获得修改。
 

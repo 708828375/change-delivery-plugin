@@ -7,6 +7,8 @@ description: 当需要在运行主机提供的隔离 worktree 中，实现已批
 
 作为本阶段的唯一写入者。只能修改运行主机提供的当前 worktree。其他 agent 可以检查或提供建议，但不得并发写入。
 
+开始实现前，完整读取 [references/team-development-rules.md](references/team-development-rules.md)。当已批准计划包含接口测试集合、mock、seed、cleanup、异步测试编排或其他测试资产时，再完整读取 [references/test-assets.md](references/test-assets.md)。参考文件只能补充已批准实现要求，不能扩大范围。
+
 ## 执行步骤
 
 1. 编辑前，读取已批准的需求、设计和实施计划。确认当前 worktree 和计划中的文件范围。

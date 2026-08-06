@@ -7,6 +7,8 @@ description: 当 change-delivery 已推送准确功能分支，需要依据批�
 
 根据运行主机提供的已批准需求、设计、实施计划、准确 head SHA、diff 摘要以及测试和 Review 事实，生成适合当前项目的 Draft PR 内容。用户可以直接在此 Skill 中自定义章节、检查清单、关联工单和团队模板。
 
+完整读取 [references/chinese-pr-template.md](references/chinese-pr-template.md)，根据实际变更裁剪章节。模板中的检查项只有存在权威事实时才能标记为完成。
+
 ## 输出要求
 
 1. 只返回符合权威 Schema 的单个 JSON 对象：`{"title":"...","body":"..."}`。

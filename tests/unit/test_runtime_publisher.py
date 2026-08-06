@@ -55,6 +55,18 @@ def make_runtime_source(root: Path, value: str = "new") -> Path:
             f"---\nname: {skill}\n---\n",
             encoding="utf-8",
         )
+    review_references = (
+        source
+        / "plugin"
+        / "change-delivery-plugin"
+        / "skills"
+        / "delivery-review"
+        / "references"
+    )
+    review_references.mkdir()
+    (review_references / "team-review.md").write_text(
+        f"review-reference:{value}", encoding="utf-8"
+    )
     (source / "src" / "change_delivery" / "__init__.py").write_text(
         f"VALUE = {value!r}\n", encoding="utf-8"
     )
@@ -132,6 +144,9 @@ Install-CleanRuntimeHostStage $stage '{ps_literal(host)}'
     } == set(EXPECTED_SKILLS)
     assert not list(host.rglob("__pycache__"))
     assert not list(host.rglob("*.pyc"))
+    assert (
+        host / "skills" / "delivery-review" / "references" / "team-review.md"
+    ).read_text(encoding="utf-8") == "review-reference:new"
 
 
 def test_unmanaged_host_is_preserved(tmp_path: Path) -> None:
