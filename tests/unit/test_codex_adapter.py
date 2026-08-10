@@ -244,6 +244,7 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
         "allow_login_shell=false",
         "agents.enabled=false",
         "sandbox_workspace_write.network_access=false",
+        'windows.sandbox="elevated"',
     ):
         index = command.args.index(setting)
         assert command.args[index - 1] == "-c"

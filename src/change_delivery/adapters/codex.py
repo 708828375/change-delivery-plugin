@@ -47,6 +47,7 @@ FIXED_CONFIG = (
     "allow_login_shell=false",
     "agents.enabled=false",
     "sandbox_workspace_write.network_access=false",
+    'windows.sandbox="elevated"',
 )
 
 
