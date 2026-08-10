@@ -9,7 +9,12 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 from pydantic import ValidationError
 
-from change_delivery.domain import EvidenceRef, Finding, StageResult
+from change_delivery.domain import (
+    EvidenceRef,
+    Finding,
+    StageResult,
+    stage_result_schema_json,
+)
 from change_delivery.evidence import build_evidence_ref, sha256_payload
 
 
@@ -187,6 +192,18 @@ def test_stage_result_schema_is_valid_and_matches_committed_file() -> None:
     schema_path = Path(__file__).parents[2] / "schemas" / "stage-result.schema.json"
 
     assert json.loads(schema_path.read_text(encoding="utf-8")) == schema
+
+
+def test_codex_stage_result_schema_avoids_unsupported_allof() -> None:
+    """The Codex response-format API rejects schemas containing ``allOf``."""
+
+    schema = json.loads(stage_result_schema_json())
+
+    Draft202012Validator.check_schema(schema)
+    assert "allOf" not in schema
+    Draft202012Validator(schema).validate(
+        StageResult.model_validate(valid_stage_data()).model_dump(mode="json")
+    )
 
 
 def test_schema_and_runtime_accept_and_reject_same_examples() -> None:

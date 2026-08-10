@@ -969,7 +969,11 @@ class CodexAdapter:
             Draft202012Validator.check_schema(schema)
         except (OSError, UnicodeError, json.JSONDecodeError, SchemaValidationError) as error:
             raise ValueError("invalid stage schema") from error
-        if schema != StageResult.model_json_schema():
+        accepted_schemas = (
+            StageResult.model_json_schema(),
+            json.loads(stage_result_schema_json()),
+        )
+        if schema not in accepted_schemas:
             raise ValueError("stage schema does not match StageResult")
         return stage_schema_path.resolve()
 
