@@ -244,12 +244,12 @@ def test_read_only_exec_uses_exact_safe_flags_and_fixed_prompt(tmp_path: Path) -
         "allow_login_shell=false",
         "agents.enabled=false",
         "sandbox_workspace_write.network_access=false",
-        "sandbox_workspace_write.writable_roots=[]",
     ):
         index = command.args.index(setting)
         assert command.args[index - 1] == "-c"
     assert 'shell_environment_policy.inherit="none"' not in command.args
     assert "shell_environment_policy.include_only=[]" not in command.args
+    assert "sandbox_workspace_write.writable_roots=[]" not in command.args
     assert command.args[-1] == "-"
     assert command.args[command.args.index("--sandbox") + 1] == "read-only"
     assert command.workdir == tmp_path
