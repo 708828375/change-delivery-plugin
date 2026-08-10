@@ -35,6 +35,7 @@ from change_delivery.domain import (
     StageResult,
 )
 from change_delivery.evidence import sha256_payload
+from change_delivery.errors import BlockedError
 from change_delivery.notifications import NotificationService
 from change_delivery.orchestrator import Orchestrator
 from change_delivery.process import ProcessResult
@@ -4321,6 +4322,27 @@ def test_orchestrator_error_reason_does_not_echo_exception_secrets(
     assert secret not in reason
     assert "password" not in reason
     assert "response-body" not in reason
+
+
+def test_orchestrator_preserves_safe_blocked_error_reason(
+    fixture: Fixture,
+) -> None:
+    run_id = fixture.create(RunState.DRAFT)
+    orchestrator = Orchestrator(
+        repository=fixture.repository,
+        plugin_root=fixture.root,
+        config_loader=lambda project_id: (_ for _ in ()).throw(
+            BlockedError("Codex stage process failed")
+        ),
+        git_factory=lambda project: fixture.git,
+        github_factory=lambda project: fixture.github,
+    )
+
+    outcome = orchestrator.step(run_id)
+
+    assert outcome.state is RunState.DRAFT
+    assert outcome.action == "blocked"
+    assert outcome.blocked_reason == "Codex stage process failed"
 
 
 def test_cli_approve_rejects_path_escape(fixture: Fixture) -> None:

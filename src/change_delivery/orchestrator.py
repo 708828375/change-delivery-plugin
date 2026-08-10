@@ -35,6 +35,7 @@ from change_delivery.domain import (
 from change_delivery.redaction import redact_text
 from change_delivery.stage_content import CommitDraft, PullRequestDraft
 from change_delivery.evidence import sha256_payload
+from change_delivery.errors import BlockedError
 from change_delivery.repository import RunRepository
 from change_delivery.process import ProcessTimeoutError
 from change_delivery.state_machine import READY_TO_MERGE_EVIDENCE
@@ -395,6 +396,16 @@ class Orchestrator:
                 state=state,
                 action="blocked_dependency",
                 blocked_reason=f"{type(error).__name__}: dependency unavailable",
+            )
+        except BlockedError as error:
+            try:
+                state = self.repository.get_run(run_id).state
+            except KeyError:
+                state = RunState.BLOCKED
+            return StepOutcome(
+                state=state,
+                action="blocked",
+                blocked_reason=str(error),
             )
         except Exception as error:
             try:
