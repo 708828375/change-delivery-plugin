@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$TrustedHostSecuritySha256 = '1a96fd4f1c2549b43af14128c6706788a8a7e01e358cbd8e183db42fcf5b0c47'
+$TrustedHostSecuritySha256 = '263e8de55b7a6b19e7fc54ef1cfc383ff3b47de647772eb7ec95f60cdbbc627a'
 $TrustedSharedLayoutSha256 = '4e0dc6e7febe6650c9dde5c636b3959a2388f00bcf372411f1ea7fd305f8aff1'
 function Open-StableTrustedHelper([string] $Path, [string] $ExpectedHash) {
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
