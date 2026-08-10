@@ -149,6 +149,41 @@ Install-CleanRuntimeHostStage $stage '{ps_literal(host)}'
     ).read_text(encoding="utf-8") == "review-reference:new"
 
 
+def test_runtime_publish_migrates_the_v020_host_layout(tmp_path: Path) -> None:
+    source = make_runtime_source(tmp_path)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    host = data_root / "host"
+    host.mkdir()
+    for directory in ("schemas", "scripts", "src"):
+        (host / directory).mkdir()
+    (host / "schemas" / "project.schema.json").write_text("{}", encoding="utf-8")
+    (host / "scripts" / "run-tick.ps1").write_text("Write-Output tick\n", encoding="utf-8")
+    (host / "src" / "change_delivery").mkdir()
+    (host / "src" / "change_delivery" / "__init__.py").write_text(
+        "VALUE = 'legacy'\n", encoding="utf-8"
+    )
+    (host / "pyproject.toml").write_text(
+        "[project]\nname='change-delivery'\nversion='0.2.0'\n", encoding="utf-8"
+    )
+
+    result = run_ps(
+        rf"""
+$ErrorActionPreference='Stop'
+. '{ps_literal(PUBLISHER)}'
+$stage = New-CleanRuntimeHostStage '{ps_literal(source)}' '{ps_literal(data_root)}'
+Install-CleanRuntimeHostStage $stage '{ps_literal(host)}'
+"""
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert (host / "skills" / "delivery-review" / "SKILL.md").is_file()
+    assert "new" in (host / "src" / "change_delivery" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert not list(data_root.glob(".host.backup-*"))
+
+
 def test_unmanaged_host_is_preserved(tmp_path: Path) -> None:
     source = make_runtime_source(tmp_path)
     data_root = tmp_path / "data"
