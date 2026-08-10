@@ -33,6 +33,7 @@ from change_delivery.domain import (
     ProjectConfig,
     RunState,
     StageResult,
+    stage_result_schema_json,
 )
 from change_delivery.evidence import sha256_payload
 from change_delivery.errors import BlockedError
@@ -1378,7 +1379,7 @@ def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
     assert request.role == expected_role  # type: ignore[attr-defined]
     assert json.loads(  # type: ignore[attr-defined]
         request.result_schema_json
-    ) == StageResult.model_json_schema()
+    ) == json.loads(stage_result_schema_json())
     assert request.status_policy  # type: ignore[attr-defined]
     prompt = CodexAdapter._render_prompt(request)  # type: ignore[arg-type]
     assert f"${expected_skill}" in prompt

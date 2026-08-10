@@ -406,12 +406,7 @@ class RuntimeStageExecutor:
         result_root = self._safe_directory(runtime_root / "codex-results")
         home_root = self._safe_directory(runtime_root / "codex-homes")
         schema = runtime_root / "stage-result.schema.json"
-        schema_bytes = json.dumps(
-            StageResult.model_json_schema(),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        schema_bytes = stage_result_schema_json().encode("utf-8")
         self._write_runtime_file(schema, schema_bytes)
         executable_text = os.environ.get("CHANGE_DELIVERY_CODEX_EXECUTABLE")
         if executable_text is None:

@@ -383,10 +383,19 @@ class AcceptanceCheckResult(FrozenModel):
 
 
 def stage_result_schema_json() -> str:
-    """Return the one canonical compact schema injected into every stage."""
+    """Return the Codex-compatible schema injected into every stage.
+
+    StageResult's runtime schema retains cross-field ``allOf`` constraints so
+    local validation can reject invalid successful results.  Codex response
+    formats reject ``allOf`` outright, therefore the transport schema omits
+    those constraints and the parsed result is validated again by StageResult.
+    """
+
+    schema = StageResult.model_json_schema()
+    schema.pop("allOf", None)
 
     return json.dumps(
-        StageResult.model_json_schema(),
+        schema,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
