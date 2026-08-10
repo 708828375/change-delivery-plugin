@@ -40,17 +40,33 @@ function Assert-ManagedVirtualEnvironment([string] $Path) {
     }
 }
 
-function Assert-ClosedRuntimeHostTree([string] $Path) {
+function Assert-ClosedRuntimeHostTree {
+    param(
+        [string] $Path,
+        [switch] $AllowLegacyV020Layout
+    )
     Assert-OrdinaryRuntimeDirectory $Path '运行主机根目录'
     $allowed = @('pyproject.toml', 'schemas', 'scripts', 'skills', 'src')
+    $required = @('schemas', 'scripts', 'skills', 'src')
+    if ($AllowLegacyV020Layout) {
+        $legacyAllowed = @('pyproject.toml', 'schemas', 'scripts', 'src')
+        $entryNames = @((Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Name)
+        if (
+            $entryNames.Count -eq $legacyAllowed.Count -and
+            @($entryNames | Where-Object { $_ -cnotin $legacyAllowed }).Count -eq 0
+        ) {
+            $allowed = $legacyAllowed
+            $required = @('schemas', 'scripts', 'src')
+        }
+    }
     $entries = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
     if (@($entries | Where-Object { $_.Name -cnotin $allowed }).Count -ne 0) {
         throw '运行主机包含非预期的顶层内容。'
     }
-    foreach ($required in @('schemas', 'scripts', 'skills', 'src')) {
+    foreach ($directory in $required) {
         Assert-OrdinaryRuntimeDirectory `
-            (Join-Path $Path $required) `
-            "运行主机目录 $required"
+            (Join-Path $Path $directory) `
+            "运行主机目录 $directory"
     }
     $projectFile = Get-Item -LiteralPath (
         Join-Path $Path 'pyproject.toml'
@@ -147,7 +163,7 @@ function Install-CleanRuntimeHostStage {
         '.host.backup-' + [Guid]::NewGuid().ToString('N')
     )
     if (Test-Path -LiteralPath $target) {
-        Assert-ClosedRuntimeHostTree $target
+        Assert-ClosedRuntimeHostTree $target -AllowLegacyV020Layout
         Move-Item -LiteralPath $target -Destination $backup -ErrorAction Stop
     }
     try {
@@ -165,7 +181,7 @@ function Install-CleanRuntimeHostStage {
         throw
     }
     if (Test-Path -LiteralPath $backup) {
-        Assert-ClosedRuntimeHostTree $backup
+        Assert-ClosedRuntimeHostTree $backup -AllowLegacyV020Layout
         [IO.Directory]::Delete($backup, $true)
     }
 }
