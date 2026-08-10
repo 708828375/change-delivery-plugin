@@ -460,6 +460,7 @@ class RuntimeStageExecutor:
 
     def _skill_registry(self, source_root: Path) -> dict[str, Path]:
         candidates = (
+            self._plugin_root / "host" / "skills",
             source_root / "skills",
             source_root / "plugin" / "change-delivery-plugin" / "skills",
         )

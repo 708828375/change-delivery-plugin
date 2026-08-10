@@ -45,6 +45,8 @@ from change_delivery.runtime import (
     RuntimeAcceptancePort,
     RuntimeStageExecutor,
     RuntimeTestEnvironmentPort,
+    _CONTENT_SKILLS,
+    _STAGE_SKILLS,
 )
 from change_delivery.stage_content import CommitDraft, PullRequestDraft
 
@@ -1393,6 +1395,23 @@ def test_runtime_routes_new_explicit_skills_with_authoritative_schema(
         / "change-delivery-plugin"
         / "skills"
         / expected_skill
+    ).resolve()
+
+
+def test_runtime_skill_registry_uses_installed_host_skills(
+    fixture: Fixture,
+) -> None:
+    executor = RuntimeStageExecutor(fixture.repository, fixture.root)
+    skills_root = fixture.root / "host" / "skills"
+    for name in set(_STAGE_SKILLS.values()) | _CONTENT_SKILLS:
+        skill = skills_root / name
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+
+    registry = executor._skill_registry(fixture.root / "site-packages")
+
+    assert registry["delivery-planning"] == (
+        skills_root / "delivery-planning"
     ).resolve()
 
 
