@@ -4,6 +4,12 @@
 
 本仓库为私有分发包，许可证标记为 `UNLICENSED`，仅限获授权团队成员安装和使用。
 
+## 先了解当前版本
+
+当前 MVP 面向 Windows 与 Codex CLI，推进到 `READY_TO_MERGE` 后停止，不自动合并或上线生产环境。
+
+想先理解核心机制，可以运行 [离线交付门禁演示](docs/first-demo.md)：使用合成数据验证批准快照不匹配、缺失验收证据和证据齐全时的状态检查结果。演示不需要安装 Windows 运行主机或连接模型与 GitHub。
+
 ## 环境要求
 
 - Windows PowerShell 5.1 或更高版本。
